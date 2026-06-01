@@ -1163,10 +1163,36 @@ def _patch_cutlass_dsl_core_exports() -> None:
         )
         needs_nullspace = "nullspace" in init_text and "def nullspace" not in core_text
         needs_unwrap = "unwrap" in init_text and "def unwrap" not in tuple_text
-        if not needs_increment_coord and not needs_nullspace and not needs_unwrap:
+        unpack_marker = '''            vals = get_leaves(t, loc=loc, ip=ip)
+            if not isinstance(vals, list):
+                vals = [vals]
+'''
+        needs_unpack_op_result_list = (
+            unpack_marker in core_text and "OpResultList" not in core_text
+        )
+        if (
+            not needs_increment_coord
+            and not needs_nullspace
+            and not needs_unwrap
+            and not needs_unpack_op_result_list
+        ):
             continue
 
         patched = []
+
+        if needs_unpack_op_result_list:
+            core_text = core_text.replace(
+                unpack_marker,
+                '''            vals = get_leaves(t, loc=loc, ip=ip)
+            if not isinstance(vals, list):
+                if vals.__class__.__name__ == "OpResultList":
+                    vals = list(vals)
+                else:
+                    vals = [vals]
+''',
+                1,
+            )
+            patched.append("core._unpack_x_tuple.OpResultList")
 
         if needs_unwrap:
             if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
@@ -1288,6 +1314,8 @@ def nullspace(
             core_path.write_text(
                 core_text.replace(marker, "".join(core_patches) + marker, 1)
             )
+        elif needs_unpack_op_result_list:
+            core_path.write_text(core_text)
         if needs_increment_coord:
             patched.append("core.increment_coord")
         if needs_nullspace:
