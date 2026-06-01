@@ -35,12 +35,22 @@ def _patch_cutlass_dsl_runtime_exports() -> None:
         core_path = cute_dir / "core.py"
         init_path = cute_dir / "__init__.py"
         tuple_path = cute_dir / "tuple.py"
-        if not core_path.exists() or not init_path.exists() or not tuple_path.exists():
+        ffi_provider_path = (
+            Path(root)
+            / "nvidia_cutlass_dsl/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py"
+        )
+        if (
+            not core_path.exists()
+            or not init_path.exists()
+            or not tuple_path.exists()
+            or not ffi_provider_path.exists()
+        ):
             continue
 
         core_text = core_path.read_text()
         init_text = init_path.read_text()
         tuple_text = tuple_path.read_text()
+        ffi_provider_text = ffi_provider_path.read_text()
         needs_increment_coord = (
             "increment_coord" in init_text and "def increment_coord" not in core_text
         )
@@ -60,14 +70,35 @@ def _patch_cutlass_dsl_runtime_exports() -> None:
             proj=proj,
 '''
         needs_local_tile_static_kw = local_tile_marker in core_text
+        global_dtors_marker = '''                global_dtors = llvm.mlir_global_dtors(
+                    dtors=[],
+                    priorities=[],
+                )
+'''
+        needs_global_dtors_data = global_dtors_marker in ffi_provider_text
         if (
             not needs_increment_coord
             and not needs_nullspace
             and not needs_unwrap
             and not needs_unpack_op_result_list
             and not needs_local_tile_static_kw
+            and not needs_global_dtors_data
         ):
             return
+
+        if needs_global_dtors_data:
+            ffi_provider_path.write_text(
+                ffi_provider_text.replace(
+                    global_dtors_marker,
+                    '''                global_dtors = llvm.mlir_global_dtors(
+                    dtors=[],
+                    priorities=[],
+                    data=[],
+                )
+''',
+                    1,
+                )
+            )
 
         if needs_unpack_op_result_list:
             core_text = core_text.replace(
