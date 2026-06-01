@@ -1170,11 +1170,19 @@ def _patch_cutlass_dsl_core_exports() -> None:
         needs_unpack_op_result_list = (
             unpack_marker in core_text and "OpResultList" not in core_text
         )
+        local_tile_marker = '''            tile=tiler_val,
+            static_tile=None,
+            coord=coord_val,
+            static_coord=None,
+            proj=proj,
+'''
+        needs_local_tile_static_kw = local_tile_marker in core_text
         if (
             not needs_increment_coord
             and not needs_nullspace
             and not needs_unwrap
             and not needs_unpack_op_result_list
+            and not needs_local_tile_static_kw
         ):
             continue
 
@@ -1193,6 +1201,17 @@ def _patch_cutlass_dsl_core_exports() -> None:
                 1,
             )
             patched.append("core._unpack_x_tuple.OpResultList")
+
+        if needs_local_tile_static_kw:
+            core_text = core_text.replace(
+                local_tile_marker,
+                '''            tile=tiler_val,
+            coord=coord_val,
+            proj=proj,
+''',
+                1,
+            )
+            patched.append("core.local_tile.static_kwargs")
 
         if needs_unwrap:
             if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
@@ -1314,7 +1333,7 @@ def nullspace(
             core_path.write_text(
                 core_text.replace(marker, "".join(core_patches) + marker, 1)
             )
-        elif needs_unpack_op_result_list:
+        elif needs_unpack_op_result_list or needs_local_tile_static_kw:
             core_path.write_text(core_text)
         if needs_increment_coord:
             patched.append("core.increment_coord")
