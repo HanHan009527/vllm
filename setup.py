@@ -1152,6 +1152,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
         core_path = cute_dir / "core.py"
         init_path = cute_dir / "__init__.py"
         tuple_path = cute_dir / "tuple.py"
+        nvvm_wrappers_path = cute_dir / "arch/nvvm_wrappers.py"
         ffi_provider_path = (
             Path(root)
             / "nvidia_cutlass_dsl/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py"
@@ -1160,6 +1161,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
             not core_path.exists()
             or not init_path.exists()
             or not tuple_path.exists()
+            or not nvvm_wrappers_path.exists()
             or not ffi_provider_path.exists()
         ):
             continue
@@ -1167,6 +1169,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
         core_text = core_path.read_text()
         init_text = init_path.read_text()
         tuple_text = tuple_path.read_text()
+        nvvm_wrappers_text = nvvm_wrappers_path.read_text()
         ffi_provider_text = ffi_provider_path.read_text()
         needs_increment_coord = (
             "increment_coord" in init_text and "def increment_coord" not in core_text
@@ -1187,6 +1190,15 @@ def _patch_cutlass_dsl_core_exports() -> None:
             proj=proj,
 '''
         needs_local_tile_static_kw = local_tile_marker in core_text
+        fmax_marker = '''        nvvm.fmax(
+            T.f32(),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+'''
+        needs_fmax_result_type_arg = fmax_marker in nvvm_wrappers_text
         global_dtors_marker = '''                global_dtors = llvm.mlir_global_dtors(
                     dtors=[],
                     priorities=[],
@@ -1205,6 +1217,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
             and not needs_unwrap
             and not needs_unpack_op_result_list
             and not needs_local_tile_static_kw
+            and not needs_fmax_result_type_arg
             and not needs_global_dtors_data
             and not needs_global_dtors_data_append
         ):
@@ -1265,6 +1278,22 @@ def _patch_cutlass_dsl_core_exports() -> None:
                 1,
             )
             patched.append("core.local_tile.static_kwargs")
+
+        if needs_fmax_result_type_arg:
+            nvvm_wrappers_path.write_text(
+                nvvm_wrappers_text.replace(
+                    fmax_marker,
+                    '''        nvvm.fmax(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+''',
+                    1,
+                )
+            )
+            patched.append("arch.nvvm_wrappers.fmax.result_type")
 
         if needs_unwrap:
             if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
