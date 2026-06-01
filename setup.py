@@ -1129,9 +1129,9 @@ def _patch_cutlass_dsl_core_exports() -> None:
     """Patch a CUTLASS DSL 4.5.2 packaging mismatch seen in cu13 wheels.
 
     nvidia-cutlass-dsl-libs-cu13==4.5.2 exports some symbols from
-    cutlass.cute.__init__, but the bundled cutlass.cute.core module can miss
-    their Python wrappers. Importing cutlass then fails before vLLM can start.
-    Keep this guarded so environments with a fixed CUTLASS package are left
+    cutlass.cute.__init__, but the bundled cutlass.cute modules can miss their
+    Python wrappers. Importing cutlass then fails before vLLM can start. Keep
+    this guarded so environments with a fixed CUTLASS package are left
     untouched.
     """
     import site
@@ -1151,17 +1151,50 @@ def _patch_cutlass_dsl_core_exports() -> None:
         cute_dir = Path(root) / "nvidia_cutlass_dsl/python_packages/cutlass/cute"
         core_path = cute_dir / "core.py"
         init_path = cute_dir / "__init__.py"
-        if not core_path.exists() or not init_path.exists():
+        tuple_path = cute_dir / "tuple.py"
+        if not core_path.exists() or not init_path.exists() or not tuple_path.exists():
             continue
 
         core_text = core_path.read_text()
         init_text = init_path.read_text()
+        tuple_text = tuple_path.read_text()
         needs_increment_coord = (
             "increment_coord" in init_text and "def increment_coord" not in core_text
         )
         needs_nullspace = "nullspace" in init_text and "def nullspace" not in core_text
-        if not needs_increment_coord and not needs_nullspace:
+        needs_unwrap = "unwrap" in init_text and "def unwrap" not in tuple_text
+        if not needs_increment_coord and not needs_nullspace and not needs_unwrap:
             continue
+
+        patched = []
+
+        if needs_unwrap:
+            if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
+                tuple_text = tuple_text.replace(
+                    '"wrap",',
+                    '"unwrap",\n    "wrap",',
+                    1,
+                )
+            tuple_marker = "\n\ndef flatten_to_tuple("
+            if tuple_marker not in tuple_text:
+                print(
+                    "[vllm-source-install] skip CUTLASS DSL tuple export patch: "
+                    f"marker not found in {tuple_path}"
+                )
+                return
+
+            tuple_patch = '''
+
+def unwrap(x: XTuple) -> XTuple:
+    """Unwrap a single-element tuple recursively."""
+    while isinstance(x, tuple) and len(x) == 1:
+        x = x[0]
+    return x
+'''
+            tuple_path.write_text(
+                tuple_text.replace(tuple_marker, tuple_patch + tuple_marker, 1)
+            )
+            patched.append("tuple.unwrap")
 
         if (
             needs_increment_coord
@@ -1185,16 +1218,16 @@ def _patch_cutlass_dsl_core_exports() -> None:
             )
 
         marker = "\n\n@dsl_user_op\ndef recast_layout("
-        if marker not in core_text:
+        if (needs_increment_coord or needs_nullspace) and marker not in core_text:
             print(
                 "[vllm-source-install] skip CUTLASS DSL core export patch: "
                 f"marker not found in {core_path}"
             )
             return
 
-        patches = []
+        core_patches = []
         if needs_increment_coord:
-            patches.append('''
+            core_patches.append('''
 
 @dsl_user_op
 def increment_coord(
@@ -1211,7 +1244,7 @@ def increment_coord(
     return _unpack_x_tuple(res, loc=loc, ip=ip)
 ''')
         if needs_nullspace:
-            patches.append('''
+            core_patches.append('''
 
 @dsl_user_op
 def nullspace(
@@ -1238,23 +1271,30 @@ def nullspace(
     for i in range(1, len(flat_shape)):
         rstride[i] = flat_shape[i - 1] * rstride[i - 1]
 
+    def _unwrap_tuple(value):
+        while isinstance(value, tuple) and len(value) == 1:
+            value = value[0]
+        return value
+
     return make_layout(
-        unwrap(tuple(flat_shape[i] for i in nullspace_indices)),
-        stride=unwrap(tuple(rstride[i] for i in nullspace_indices)),
+        _unwrap_tuple(tuple(flat_shape[i] for i in nullspace_indices)),
+        stride=_unwrap_tuple(tuple(rstride[i] for i in nullspace_indices)),
         loc=loc,
         ip=ip,
     )
 ''')
 
-        core_path.write_text(core_text.replace(marker, "".join(patches) + marker, 1))
-        patched = []
+        if core_patches:
+            core_path.write_text(
+                core_text.replace(marker, "".join(core_patches) + marker, 1)
+            )
         if needs_increment_coord:
-            patched.append("increment_coord")
+            patched.append("core.increment_coord")
         if needs_nullspace:
-            patched.append("nullspace")
+            patched.append("core.nullspace")
         print(
             "[vllm-source-install] patched CUTLASS DSL "
-            f"{', '.join(patched)} in {core_path}"
+            f"{', '.join(patched)} in {cute_dir}"
         )
         return
 
