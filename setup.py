@@ -1125,14 +1125,14 @@ package_data = {
 }
 
 
-def _patch_cutlass_dsl_increment_coord() -> None:
+def _patch_cutlass_dsl_core_exports() -> None:
     """Patch a CUTLASS DSL 4.5.2 packaging mismatch seen in cu13 wheels.
 
-    nvidia-cutlass-dsl-libs-cu13==4.5.2 exports increment_coord from
+    nvidia-cutlass-dsl-libs-cu13==4.5.2 exports some symbols from
     cutlass.cute.__init__, but the bundled cutlass.cute.core module can miss
-    the corresponding Python wrapper. Importing cutlass then fails before vLLM
-    can start. Keep this guarded so environments with a fixed CUTLASS package
-    are left untouched.
+    their Python wrappers. Importing cutlass then fails before vLLM can start.
+    Keep this guarded so environments with a fixed CUTLASS package are left
+    untouched.
     """
     import site
     import sysconfig
@@ -1156,25 +1156,45 @@ def _patch_cutlass_dsl_increment_coord() -> None:
 
         core_text = core_path.read_text()
         init_text = init_path.read_text()
-        if "increment_coord" not in init_text or "def increment_coord" in core_text:
+        needs_increment_coord = (
+            "increment_coord" in init_text and "def increment_coord" not in core_text
+        )
+        needs_nullspace = "nullspace" in init_text and "def nullspace" not in core_text
+        if not needs_increment_coord and not needs_nullspace:
             continue
 
-        if '"idx2crd",' in core_text and '"increment_coord",' not in core_text:
+        if (
+            needs_increment_coord
+            and '"idx2crd",' in core_text
+            and '"increment_coord",' not in core_text
+        ):
             core_text = core_text.replace(
                 '"idx2crd",',
                 '"idx2crd",\n    "increment_coord",',
+                1,
+            )
+        if (
+            needs_nullspace
+            and '"basis_get",' in core_text
+            and '"nullspace",' not in core_text
+        ):
+            core_text = core_text.replace(
+                '"basis_get",',
+                '"basis_get",\n    "nullspace",',
                 1,
             )
 
         marker = "\n\n@dsl_user_op\ndef recast_layout("
         if marker not in core_text:
             print(
-                "[vllm-source-install] skip CUTLASS DSL increment_coord patch: "
+                "[vllm-source-install] skip CUTLASS DSL core export patch: "
                 f"marker not found in {core_path}"
             )
             return
 
-        patch = '''
+        patches = []
+        if needs_increment_coord:
+            patches.append('''
 
 @dsl_user_op
 def increment_coord(
@@ -1189,13 +1209,57 @@ def increment_coord(
     shape_val = _pack_shape(shape, loc=loc, ip=ip)
     res = _cute_ir.increment_coord(coord_val, shape_val, loc=loc, ip=ip)
     return _unpack_x_tuple(res, loc=loc, ip=ip)
-'''
-        core_path.write_text(core_text.replace(marker, patch + marker, 1))
-        print(f"[vllm-source-install] patched CUTLASS DSL increment_coord in {core_path}")
+''')
+        if needs_nullspace:
+            patches.append('''
+
+@dsl_user_op
+def nullspace(
+    layout: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
+    """Compute the nullspace layout for zero-stride modes."""
+    if not isinstance(layout, Layout):
+        raise TypeError(f"expects a Layout, but got {type(layout)}")
+
+    flat_stride = wrap(flatten(layout.stride))
+    nullspace_indices = []
+    for i in range(len(flat_stride)):
+        if is_static(flat_stride[i]) and flat_stride[i] == 0:
+            nullspace_indices.append(i)
+
+    if len(nullspace_indices) == 0:
+        return make_layout(1, stride=0, loc=loc, ip=ip)
+
+    flat_shape = flatten(shape(layout))
+    rstride = [1] * len(flat_shape)
+    for i in range(1, len(flat_shape)):
+        rstride[i] = flat_shape[i - 1] * rstride[i - 1]
+
+    return make_layout(
+        unwrap(tuple(flat_shape[i] for i in nullspace_indices)),
+        stride=unwrap(tuple(rstride[i] for i in nullspace_indices)),
+        loc=loc,
+        ip=ip,
+    )
+''')
+
+        core_path.write_text(core_text.replace(marker, "".join(patches) + marker, 1))
+        patched = []
+        if needs_increment_coord:
+            patched.append("increment_coord")
+        if needs_nullspace:
+            patched.append("nullspace")
+        print(
+            "[vllm-source-install] patched CUTLASS DSL "
+            f"{', '.join(patched)} in {core_path}"
+        )
         return
 
 
-_patch_cutlass_dsl_increment_coord()
+_patch_cutlass_dsl_core_exports()
 
 
 # If using precompiled artifacts, extract and patch package_data in advance.
