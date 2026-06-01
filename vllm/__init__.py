@@ -76,6 +76,12 @@ def _patch_cutlass_dsl_runtime_exports() -> None:
                 )
 '''
         needs_global_dtors_data = global_dtors_marker in ffi_provider_text
+        global_dtors_append_marker = '''        global_dtors.attributes["priorities"] += [
+            ir.IntegerAttr.get(self.i32_type, 65535)
+        ]  # the default priority
+        return current_block
+'''
+        needs_global_dtors_data_append = global_dtors_append_marker in ffi_provider_text
         if (
             not needs_increment_coord
             and not needs_nullspace
@@ -83,22 +89,37 @@ def _patch_cutlass_dsl_runtime_exports() -> None:
             and not needs_unpack_op_result_list
             and not needs_local_tile_static_kw
             and not needs_global_dtors_data
+            and not needs_global_dtors_data_append
         ):
             return
 
         if needs_global_dtors_data:
-            ffi_provider_path.write_text(
-                ffi_provider_text.replace(
-                    global_dtors_marker,
-                    '''                global_dtors = llvm.mlir_global_dtors(
+            ffi_provider_text = ffi_provider_text.replace(
+                global_dtors_marker,
+                '''                global_dtors = llvm.mlir_global_dtors(
                     dtors=[],
                     priorities=[],
                     data=[],
                 )
 ''',
-                    1,
-                )
+                1,
             )
+
+        if needs_global_dtors_data_append:
+            ffi_provider_text = ffi_provider_text.replace(
+                global_dtors_append_marker,
+                '''        global_dtors.attributes["priorities"] += [
+            ir.IntegerAttr.get(self.i32_type, 65535)
+        ]  # the default priority
+        global_dtors.attributes["data"] += [
+            ir.FlatSymbolRefAttr.get(unload_func_wrapper_symbol)
+        ]
+        return current_block
+''',
+                1,
+            )
+        if needs_global_dtors_data or needs_global_dtors_data_append:
+            ffi_provider_path.write_text(ffi_provider_text)
 
         if needs_unpack_op_result_list:
             core_text = core_text.replace(
