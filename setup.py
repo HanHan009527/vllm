@@ -704,8 +704,24 @@ class precompiled_wheel_utils:
                 wheel_path = os.path.join(temp_dir, wheel_filename)
                 print(f"Downloading wheel from {wheel_url_or_path} to {wheel_path}")
                 from urllib.request import urlretrieve
+                import time
 
-                urlretrieve(wheel_url_or_path, filename=wheel_path)
+                for attempt in range(1, 4):
+                    try:
+                        urlretrieve(wheel_url_or_path, filename=wheel_path)
+                        break
+                    except Exception as e:
+                        if attempt == 3:
+                            raise
+                        print(
+                            "Failed to download precompiled wheel "
+                            f"(attempt {attempt}/3): {e}. Retrying..."
+                        )
+                        try:
+                            os.remove(wheel_path)
+                        except OSError:
+                            pass
+                        time.sleep(2 * attempt)
             else:
                 wheel_path = wheel_url_or_path
                 print(f"Using existing wheel at {wheel_path}")
@@ -1107,6 +1123,79 @@ package_data = {
         "third_party/deep_gemm/include/**/*.hpp",
     ]
 }
+
+
+def _patch_cutlass_dsl_increment_coord() -> None:
+    """Patch a CUTLASS DSL 4.5.2 packaging mismatch seen in cu13 wheels.
+
+    nvidia-cutlass-dsl-libs-cu13==4.5.2 exports increment_coord from
+    cutlass.cute.__init__, but the bundled cutlass.cute.core module can miss
+    the corresponding Python wrapper. Importing cutlass then fails before vLLM
+    can start. Keep this guarded so environments with a fixed CUTLASS package
+    are left untouched.
+    """
+    import site
+    import sysconfig
+
+    roots = set()
+    for key in ("purelib", "platlib"):
+        path = sysconfig.get_paths().get(key)
+        if path:
+            roots.add(path)
+    try:
+        roots.update(site.getsitepackages())
+    except AttributeError:
+        pass
+
+    for root in roots:
+        cute_dir = Path(root) / "nvidia_cutlass_dsl/python_packages/cutlass/cute"
+        core_path = cute_dir / "core.py"
+        init_path = cute_dir / "__init__.py"
+        if not core_path.exists() or not init_path.exists():
+            continue
+
+        core_text = core_path.read_text()
+        init_text = init_path.read_text()
+        if "increment_coord" not in init_text or "def increment_coord" in core_text:
+            continue
+
+        if '"idx2crd",' in core_text and '"increment_coord",' not in core_text:
+            core_text = core_text.replace(
+                '"idx2crd",',
+                '"idx2crd",\n    "increment_coord",',
+                1,
+            )
+
+        marker = "\n\n@dsl_user_op\ndef recast_layout("
+        if marker not in core_text:
+            print(
+                "[vllm-source-install] skip CUTLASS DSL increment_coord patch: "
+                f"marker not found in {core_path}"
+            )
+            return
+
+        patch = '''
+
+@dsl_user_op
+def increment_coord(
+    coord: Coord,
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> IntTuple:
+    """Increment a coordinate within a shape using the CUTLASS MLIR op."""
+    coord_val = _pack_coord(coord, loc=loc, ip=ip)
+    shape_val = _pack_shape(shape, loc=loc, ip=ip)
+    res = _cute_ir.increment_coord(coord_val, shape_val, loc=loc, ip=ip)
+    return _unpack_x_tuple(res, loc=loc, ip=ip)
+'''
+        core_path.write_text(core_text.replace(marker, patch + marker, 1))
+        print(f"[vllm-source-install] patched CUTLASS DSL increment_coord in {core_path}")
+        return
+
+
+_patch_cutlass_dsl_increment_coord()
 
 
 # If using precompiled artifacts, extract and patch package_data in advance.
