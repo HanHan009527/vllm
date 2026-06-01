@@ -108,15 +108,11 @@ def increment_coord(
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
 ) -> IntTuple:
-    """Increment a coordinate within a shape."""
-    if has_underscore(coord):
-        raise ValueError("coord cannot contain underscores")
-    if not is_congruent(coord, shape):
-        raise ValueError("coord and shape must be congruent")
-
-    idx = crd2idx(coord, make_layout(shape, loc=loc, ip=ip), loc=loc, ip=ip)
-    next_idx = (idx + 1) % size(shape, loc=loc, ip=ip)
-    return idx2crd(next_idx, shape, loc=loc, ip=ip)
+    """Increment a coordinate within a shape using the CUTLASS MLIR op."""
+    coord_val = _pack_coord(coord, loc=loc, ip=ip)
+    shape_val = _pack_shape(shape, loc=loc, ip=ip)
+    res = _cute_ir.increment_coord(coord_val, shape_val, loc=loc, ip=ip)
+    return _unpack_x_tuple(res, loc=loc, ip=ip)
 ''')
         if needs_nullspace:
             core_patches.append('''
