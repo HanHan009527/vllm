@@ -1153,6 +1153,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
         init_path = cute_dir / "__init__.py"
         tuple_path = cute_dir / "tuple.py"
         nvvm_wrappers_path = cute_dir / "arch/nvvm_wrappers.py"
+        arch_init_path = cute_dir / "arch/__init__.py"
         ffi_provider_path = (
             Path(root)
             / "nvidia_cutlass_dsl/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py"
@@ -1162,6 +1163,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
             or not init_path.exists()
             or not tuple_path.exists()
             or not nvvm_wrappers_path.exists()
+            or not arch_init_path.exists()
             or not ffi_provider_path.exists()
         ):
             continue
@@ -1170,6 +1172,7 @@ def _patch_cutlass_dsl_core_exports() -> None:
         init_text = init_path.read_text()
         tuple_text = tuple_path.read_text()
         nvvm_wrappers_text = nvvm_wrappers_path.read_text()
+        arch_init_text = arch_init_path.read_text()
         ffi_provider_text = ffi_provider_path.read_text()
         needs_increment_coord = (
             "increment_coord" in init_text and "def increment_coord" not in core_text
@@ -1199,6 +1202,15 @@ def _patch_cutlass_dsl_core_exports() -> None:
         )
 '''
         needs_fmax_result_type_arg = fmax_marker in nvvm_wrappers_text
+        fmin_marker = "\n@dsl_user_op\ndef rcp_approx("
+        needs_fmin_wrapper = (
+            "def fmax(" in nvvm_wrappers_text
+            and "def fmin(" not in nvvm_wrappers_text
+            and fmin_marker in nvvm_wrappers_text
+        )
+        needs_fmin_arch_export = (
+            '"fmax",' in arch_init_text and '"fmin",' not in arch_init_text
+        )
         global_dtors_marker = '''                global_dtors = llvm.mlir_global_dtors(
                     dtors=[],
                     priorities=[],
@@ -1218,6 +1230,8 @@ def _patch_cutlass_dsl_core_exports() -> None:
             and not needs_unpack_op_result_list
             and not needs_local_tile_static_kw
             and not needs_fmax_result_type_arg
+            and not needs_fmin_wrapper
+            and not needs_fmin_arch_export
             and not needs_global_dtors_data
             and not needs_global_dtors_data_append
         ):
@@ -1280,20 +1294,52 @@ def _patch_cutlass_dsl_core_exports() -> None:
             patched.append("core.local_tile.static_kwargs")
 
         if needs_fmax_result_type_arg:
-            nvvm_wrappers_path.write_text(
-                nvvm_wrappers_text.replace(
-                    fmax_marker,
-                    '''        nvvm.fmax(
+            nvvm_wrappers_text = nvvm_wrappers_text.replace(
+                fmax_marker,
+                '''        nvvm.fmax(
             Float32(a).ir_value(loc=loc, ip=ip),
             Float32(b).ir_value(loc=loc, ip=ip),
             loc=loc,
             ip=ip,
         )
 ''',
-                    1,
-                )
+                1,
             )
             patched.append("arch.nvvm_wrappers.fmax.result_type")
+        if needs_fmin_wrapper:
+            nvvm_wrappers_text = nvvm_wrappers_text.replace(
+                fmin_marker,
+                '''
+@dsl_user_op
+def fmin(
+    a: Union[float, Float32],
+    b: Union[float, Float32],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Float32:
+
+    return Float32(
+        nvvm.fmin(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+@dsl_user_op
+def rcp_approx(''',
+                1,
+            )
+            patched.append("arch.nvvm_wrappers.fmin")
+        if needs_fmax_result_type_arg or needs_fmin_wrapper:
+            nvvm_wrappers_path.write_text(nvvm_wrappers_text)
+        if needs_fmin_arch_export:
+            arch_init_path.write_text(
+                arch_init_text.replace('"fmax",', '"fmax",\n    "fmin",', 1)
+            )
+            patched.append("arch.fmin")
 
         if needs_unwrap:
             if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
