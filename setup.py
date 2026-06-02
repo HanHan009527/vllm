@@ -704,8 +704,24 @@ class precompiled_wheel_utils:
                 wheel_path = os.path.join(temp_dir, wheel_filename)
                 print(f"Downloading wheel from {wheel_url_or_path} to {wheel_path}")
                 from urllib.request import urlretrieve
+                import time
 
-                urlretrieve(wheel_url_or_path, filename=wheel_path)
+                for attempt in range(1, 4):
+                    try:
+                        urlretrieve(wheel_url_or_path, filename=wheel_path)
+                        break
+                    except Exception as e:
+                        if attempt == 3:
+                            raise
+                        print(
+                            "Failed to download precompiled wheel "
+                            f"(attempt {attempt}/3): {e}. Retrying..."
+                        )
+                        try:
+                            os.remove(wheel_path)
+                        except OSError:
+                            pass
+                        time.sleep(2 * attempt)
             else:
                 wheel_path = wheel_url_or_path
                 print(f"Using existing wheel at {wheel_path}")
@@ -1107,6 +1123,358 @@ package_data = {
         "third_party/deep_gemm/include/**/*.hpp",
     ]
 }
+
+
+def _patch_cutlass_dsl_core_exports() -> None:
+    """Patch a CUTLASS DSL 4.5.2 packaging mismatch seen in cu13 wheels.
+
+    nvidia-cutlass-dsl-libs-cu13==4.5.2 exports some symbols from
+    cutlass.cute.__init__, but the bundled cutlass.cute modules can miss their
+    Python wrappers. Importing cutlass then fails before vLLM can start. Keep
+    this guarded so environments with a fixed CUTLASS package are left
+    untouched.
+    """
+    import site
+    import sysconfig
+
+    roots = set()
+    for key in ("purelib", "platlib"):
+        path = sysconfig.get_paths().get(key)
+        if path:
+            roots.add(path)
+    try:
+        roots.update(site.getsitepackages())
+    except AttributeError:
+        pass
+
+    for root in roots:
+        cute_dir = Path(root) / "nvidia_cutlass_dsl/python_packages/cutlass/cute"
+        core_path = cute_dir / "core.py"
+        init_path = cute_dir / "__init__.py"
+        tuple_path = cute_dir / "tuple.py"
+        nvvm_wrappers_path = cute_dir / "arch/nvvm_wrappers.py"
+        arch_init_path = cute_dir / "arch/__init__.py"
+        ffi_provider_path = (
+            Path(root)
+            / "nvidia_cutlass_dsl/python_packages/cutlass/cutlass_dsl/tvm_ffi_provider.py"
+        )
+        if (
+            not core_path.exists()
+            or not init_path.exists()
+            or not tuple_path.exists()
+            or not nvvm_wrappers_path.exists()
+            or not arch_init_path.exists()
+            or not ffi_provider_path.exists()
+        ):
+            continue
+
+        core_text = core_path.read_text()
+        init_text = init_path.read_text()
+        tuple_text = tuple_path.read_text()
+        nvvm_wrappers_text = nvvm_wrappers_path.read_text()
+        arch_init_text = arch_init_path.read_text()
+        ffi_provider_text = ffi_provider_path.read_text()
+        needs_increment_coord = (
+            "increment_coord" in init_text and "def increment_coord" not in core_text
+        )
+        needs_nullspace = "nullspace" in init_text and "def nullspace" not in core_text
+        needs_unwrap = "unwrap" in init_text and "def unwrap" not in tuple_text
+        unpack_marker = '''            vals = get_leaves(t, loc=loc, ip=ip)
+            if not isinstance(vals, list):
+                vals = [vals]
+'''
+        needs_unpack_op_result_list = (
+            unpack_marker in core_text and "OpResultList" not in core_text
+        )
+        local_tile_marker = '''            tile=tiler_val,
+            static_tile=None,
+            coord=coord_val,
+            static_coord=None,
+            proj=proj,
+'''
+        needs_local_tile_static_kw = local_tile_marker in core_text
+        fmax_marker = '''        nvvm.fmax(
+            T.f32(),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+'''
+        needs_fmax_result_type_arg = fmax_marker in nvvm_wrappers_text
+        fmin_marker = "\n@dsl_user_op\ndef rcp_approx("
+        needs_fmin_wrapper = (
+            "def fmax(" in nvvm_wrappers_text
+            and "def fmin(" not in nvvm_wrappers_text
+            and fmin_marker in nvvm_wrappers_text
+        )
+        needs_fmin_arch_export = (
+            '"fmax",' in arch_init_text and '"fmin",' not in arch_init_text
+        )
+        global_dtors_marker = '''                global_dtors = llvm.mlir_global_dtors(
+                    dtors=[],
+                    priorities=[],
+                )
+'''
+        needs_global_dtors_data = global_dtors_marker in ffi_provider_text
+        global_dtors_append_marker = '''        global_dtors.attributes["priorities"] += [
+            ir.IntegerAttr.get(self.i32_type, 65535)
+        ]  # the default priority
+        return current_block
+'''
+        needs_global_dtors_data_append = global_dtors_append_marker in ffi_provider_text
+        if (
+            not needs_increment_coord
+            and not needs_nullspace
+            and not needs_unwrap
+            and not needs_unpack_op_result_list
+            and not needs_local_tile_static_kw
+            and not needs_fmax_result_type_arg
+            and not needs_fmin_wrapper
+            and not needs_fmin_arch_export
+            and not needs_global_dtors_data
+            and not needs_global_dtors_data_append
+        ):
+            continue
+
+        patched = []
+
+        if needs_global_dtors_data:
+            ffi_provider_text = ffi_provider_text.replace(
+                global_dtors_marker,
+                '''                global_dtors = llvm.mlir_global_dtors(
+                    dtors=[],
+                    priorities=[],
+                    data=[],
+                )
+''',
+                1,
+            )
+            patched.append("tvm_ffi_provider.mlir_global_dtors.data")
+        if needs_global_dtors_data_append:
+            ffi_provider_text = ffi_provider_text.replace(
+                global_dtors_append_marker,
+                '''        global_dtors.attributes["priorities"] += [
+            ir.IntegerAttr.get(self.i32_type, 65535)
+        ]  # the default priority
+        global_dtors.attributes["data"] += [
+            ir.FlatSymbolRefAttr.get(unload_func_wrapper_symbol)
+        ]
+        return current_block
+''',
+                1,
+            )
+            patched.append("tvm_ffi_provider.mlir_global_dtors.data_append")
+        if needs_global_dtors_data or needs_global_dtors_data_append:
+            ffi_provider_path.write_text(ffi_provider_text)
+
+        if needs_unpack_op_result_list:
+            core_text = core_text.replace(
+                unpack_marker,
+                '''            vals = get_leaves(t, loc=loc, ip=ip)
+            if not isinstance(vals, list):
+                if vals.__class__.__name__ == "OpResultList":
+                    vals = list(vals)
+                else:
+                    vals = [vals]
+''',
+                1,
+            )
+            patched.append("core._unpack_x_tuple.OpResultList")
+
+        if needs_local_tile_static_kw:
+            core_text = core_text.replace(
+                local_tile_marker,
+                '''            tile=tiler_val,
+            coord=coord_val,
+            proj=proj,
+''',
+                1,
+            )
+            patched.append("core.local_tile.static_kwargs")
+
+        if needs_fmax_result_type_arg:
+            nvvm_wrappers_text = nvvm_wrappers_text.replace(
+                fmax_marker,
+                '''        nvvm.fmax(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+''',
+                1,
+            )
+            patched.append("arch.nvvm_wrappers.fmax.result_type")
+        if needs_fmin_wrapper:
+            nvvm_wrappers_text = nvvm_wrappers_text.replace(
+                fmin_marker,
+                '''
+@dsl_user_op
+def fmin(
+    a: Union[float, Float32],
+    b: Union[float, Float32],
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Float32:
+
+    return Float32(
+        nvvm.fmin(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+@dsl_user_op
+def rcp_approx(''',
+                1,
+            )
+            patched.append("arch.nvvm_wrappers.fmin")
+        if needs_fmax_result_type_arg or needs_fmin_wrapper:
+            nvvm_wrappers_path.write_text(nvvm_wrappers_text)
+        if needs_fmin_arch_export:
+            arch_init_path.write_text(
+                arch_init_text.replace('"fmax",', '"fmax",\n    "fmin",', 1)
+            )
+            patched.append("arch.fmin")
+
+        if needs_unwrap:
+            if '"wrap",' in tuple_text and '"unwrap",' not in tuple_text:
+                tuple_text = tuple_text.replace(
+                    '"wrap",',
+                    '"unwrap",\n    "wrap",',
+                    1,
+                )
+            tuple_marker = "\n\ndef flatten_to_tuple("
+            if tuple_marker not in tuple_text:
+                print(
+                    "[vllm-source-install] skip CUTLASS DSL tuple export patch: "
+                    f"marker not found in {tuple_path}"
+                )
+                return
+
+            tuple_patch = '''
+
+def unwrap(x: XTuple) -> XTuple:
+    """Unwrap a single-element tuple recursively."""
+    while isinstance(x, tuple) and len(x) == 1:
+        x = x[0]
+    return x
+'''
+            tuple_path.write_text(
+                tuple_text.replace(tuple_marker, tuple_patch + tuple_marker, 1)
+            )
+            patched.append("tuple.unwrap")
+
+        if (
+            needs_increment_coord
+            and '"idx2crd",' in core_text
+            and '"increment_coord",' not in core_text
+        ):
+            core_text = core_text.replace(
+                '"idx2crd",',
+                '"idx2crd",\n    "increment_coord",',
+                1,
+            )
+        if (
+            needs_nullspace
+            and '"basis_get",' in core_text
+            and '"nullspace",' not in core_text
+        ):
+            core_text = core_text.replace(
+                '"basis_get",',
+                '"basis_get",\n    "nullspace",',
+                1,
+            )
+
+        marker = "\n\n@dsl_user_op\ndef recast_layout("
+        if (needs_increment_coord or needs_nullspace) and marker not in core_text:
+            print(
+                "[vllm-source-install] skip CUTLASS DSL core export patch: "
+                f"marker not found in {core_path}"
+            )
+            return
+
+        core_patches = []
+        if needs_increment_coord:
+            core_patches.append('''
+
+@dsl_user_op
+def increment_coord(
+    coord: Coord,
+    shape: Shape,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> IntTuple:
+    """Increment a coordinate within a shape using the CUTLASS MLIR op."""
+    coord_val = _pack_coord(coord, loc=loc, ip=ip)
+    shape_val = _pack_shape(shape, loc=loc, ip=ip)
+    res = _cute_ir.increment_coord(coord_val, shape_val, loc=loc, ip=ip)
+    return _unpack_x_tuple(res, loc=loc, ip=ip)
+''')
+        if needs_nullspace:
+            core_patches.append('''
+
+@dsl_user_op
+def nullspace(
+    layout: Layout,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Layout:
+    """Compute the nullspace layout for zero-stride modes."""
+    if not isinstance(layout, Layout):
+        raise TypeError(f"expects a Layout, but got {type(layout)}")
+
+    flat_stride = wrap(flatten(layout.stride))
+    nullspace_indices = []
+    for i in range(len(flat_stride)):
+        if is_static(flat_stride[i]) and flat_stride[i] == 0:
+            nullspace_indices.append(i)
+
+    if len(nullspace_indices) == 0:
+        return make_layout(1, stride=0, loc=loc, ip=ip)
+
+    flat_shape = flatten(shape(layout))
+    rstride = [1] * len(flat_shape)
+    for i in range(1, len(flat_shape)):
+        rstride[i] = flat_shape[i - 1] * rstride[i - 1]
+
+    def _unwrap_tuple(value):
+        while isinstance(value, tuple) and len(value) == 1:
+            value = value[0]
+        return value
+
+    return make_layout(
+        _unwrap_tuple(tuple(flat_shape[i] for i in nullspace_indices)),
+        stride=_unwrap_tuple(tuple(rstride[i] for i in nullspace_indices)),
+        loc=loc,
+        ip=ip,
+    )
+''')
+
+        if core_patches:
+            core_path.write_text(
+                core_text.replace(marker, "".join(core_patches) + marker, 1)
+            )
+        elif needs_unpack_op_result_list or needs_local_tile_static_kw:
+            core_path.write_text(core_text)
+        if needs_increment_coord:
+            patched.append("core.increment_coord")
+        if needs_nullspace:
+            patched.append("core.nullspace")
+        print(
+            "[vllm-source-install] patched CUTLASS DSL "
+            f"{', '.join(patched)} in {cute_dir}"
+        )
+        return
+
+
+_patch_cutlass_dsl_core_exports()
 
 
 # If using precompiled artifacts, extract and patch package_data in advance.
