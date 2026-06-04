@@ -474,6 +474,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def set_xfer_handshake_metadata_pp_aware(
         self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]
     ) -> None:
+        """
+        Set PP-aware KV connector handshake metadata for all sub-connectors.
+        Each child consumes the tuple-keyed dict via its own implementation;
+        children that only support single-PP producers fall back to the base
+        default.
+        """
         for c in self._connectors:
             c.set_xfer_handshake_metadata_pp_aware(metadata)
 

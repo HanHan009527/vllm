@@ -203,7 +203,7 @@ class Executor(ABC):
 
     def get_kv_connector_handshake_metadata(
         self,
-    ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:
+    ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata] | None]:
         return self.collective_rpc("get_kv_connector_handshake_metadata")
 
     @overload
