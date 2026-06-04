@@ -96,6 +96,7 @@ def _run_engine_core_handshake(
     )
 
     vllm_config = SimpleNamespace(
+        max_concurrent_batches=1,
         parallel_config=SimpleNamespace(data_parallel_rank_local=0),
         scheduler_config=SimpleNamespace(
             get_scheduler_cls=lambda: _FakeScheduler,
