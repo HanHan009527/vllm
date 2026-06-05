@@ -180,9 +180,7 @@ def _expand_transfer_regions(
     return regions
 
 
-def _get_region_layer_aliases(
-    aliases: list[list[str]], idx: int
-) -> tuple[str, ...]:
+def _get_region_layer_aliases(aliases: list[list[str]], idx: int) -> tuple[str, ...]:
     if idx < len(aliases) and aliases[idx]:
         return tuple(aliases[idx])
     return ()
@@ -327,8 +325,7 @@ def _regions_have_compatible_layer_indices(
     local_region: TransferRegion, remote_region: TransferRegion
 ) -> bool:
     return bool(
-        set(local_region.match_layer_indices)
-        & set(remote_region.match_layer_indices)
+        set(local_region.match_layer_indices) & set(remote_region.match_layer_indices)
     )
 
 
@@ -348,29 +345,31 @@ def _align_transfer_regions(
         _region_has_aliases(region) for region in local_regions + remote_regions
     )
     if has_aliases:
-        aligned_local: list[TransferRegion] = []
-        aligned_remote: list[TransferRegion] = []
+        alias_aligned_local: list[TransferRegion] = []
+        alias_aligned_remote: list[TransferRegion] = []
         used_remote_indices: set[int] = set()
 
         for local_region in local_regions:
-            index_mismatch_region: TransferRegion | None = None
-            for remote_idx, remote_region in enumerate(remote_regions):
+            alias_index_mismatch_region: TransferRegion | None = None
+            for remote_idx, candidate_remote_region in enumerate(remote_regions):
                 if remote_idx in used_remote_indices:
                     continue
-                if not _regions_share_layer_identity(local_region, remote_region):
+                if not _regions_share_layer_identity(
+                    local_region, candidate_remote_region
+                ):
                     continue
                 if not _regions_have_compatible_layer_indices(
-                    local_region, remote_region
+                    local_region, candidate_remote_region
                 ):
-                    if index_mismatch_region is None:
-                        index_mismatch_region = remote_region
+                    if alias_index_mismatch_region is None:
+                        alias_index_mismatch_region = candidate_remote_region
                     continue
                 used_remote_indices.add(remote_idx)
-                aligned_local.append(local_region)
-                aligned_remote.append(remote_region)
+                alias_aligned_local.append(local_region)
+                alias_aligned_remote.append(candidate_remote_region)
                 break
             else:
-                if index_mismatch_region is not None:
+                if alias_index_mismatch_region is not None:
                     return (
                         [],
                         [],
@@ -378,7 +377,7 @@ def _align_transfer_regions(
                             "Mooncake registered layer index mismatch for "
                             f"{local_region.match_layer_names}: producer="
                             f"{local_region.match_layer_indices}, consumer="
-                            f"{index_mismatch_region.match_layer_indices}."
+                            f"{alias_index_mismatch_region.match_layer_indices}."
                         ),
                     )
                 return (
@@ -394,15 +393,15 @@ def _align_transfer_regions(
         for remote_idx, remote_region in enumerate(remote_regions):
             if remote_idx in used_remote_indices:
                 continue
-            index_mismatch_region: TransferRegion | None = None
+            reverse_index_mismatch_region: TransferRegion | None = None
             for local_region in local_regions:
                 if not _regions_share_layer_identity(local_region, remote_region):
                     continue
                 if not _regions_have_compatible_layer_indices(
                     local_region, remote_region
                 ):
-                    if index_mismatch_region is None:
-                        index_mismatch_region = local_region
+                    if reverse_index_mismatch_region is None:
+                        reverse_index_mismatch_region = local_region
                     continue
                 return (
                     [],
@@ -413,19 +412,20 @@ def _align_transfer_regions(
                         "fewer matching regions than consumer."
                     ),
                 )
-            if index_mismatch_region is not None:
+            if reverse_index_mismatch_region is not None:
                 return (
                     [],
                     [],
                     (
                         "Mooncake registered layer index mismatch for "
                         f"{remote_region.match_layer_names}: producer="
-                        f"{index_mismatch_region.match_layer_indices}, consumer="
+                        f"{reverse_index_mismatch_region.match_layer_indices}, "
+                        "consumer="
                         f"{remote_region.match_layer_indices}."
                     ),
                 )
 
-        return aligned_local, aligned_remote, None
+        return alias_aligned_local, alias_aligned_remote, None
 
     def keyed_regions(
         regions: list[TransferRegion],
@@ -469,11 +469,11 @@ def _align_transfer_regions(
             )
 
     remote_by_key = dict(remote_keyed)
-    aligned_local: list[TransferRegion] = []
-    aligned_remote: list[TransferRegion] = []
+    legacy_aligned_local: list[TransferRegion] = []
+    legacy_aligned_remote: list[TransferRegion] = []
     for key, local_region in local_keyed:
-        remote_region = remote_by_key.get(key)
-        if remote_region is None:
+        matched_remote_region = remote_by_key.get(key)
+        if matched_remote_region is None:
             return (
                 [],
                 [],
@@ -482,7 +482,7 @@ def _align_transfer_regions(
                     f"consumer occurrence: {key[0]} occurrence {key[1]}."
                 ),
             )
-        if local_region.layer_index != remote_region.layer_index:
+        if local_region.layer_index != matched_remote_region.layer_index:
             return (
                 [],
                 [],
@@ -490,13 +490,13 @@ def _align_transfer_regions(
                     "Mooncake registered layer index mismatch for "
                     f"{local_region.layer_name}: producer="
                     f"{local_region.layer_index}, consumer="
-                    f"{remote_region.layer_index}."
+                    f"{matched_remote_region.layer_index}."
                 ),
             )
-        aligned_local.append(local_region)
-        aligned_remote.append(remote_region)
+        legacy_aligned_local.append(local_region)
+        legacy_aligned_remote.append(matched_remote_region)
 
-    return aligned_local, aligned_remote, None
+    return legacy_aligned_local, legacy_aligned_remote, None
 
 
 def _common_group_indices_for_regions(
@@ -1759,7 +1759,7 @@ class MooncakeConnectorWorker:
 
         kv_data_ptrs = []
         kv_data_lens = []
-        seen_base_addresses = []
+        seen_base_addresses: list[int] = []
         base_addr_to_region_idx: dict[int, int] = {}
         region_aliases_by_base: dict[int, list[str]] = defaultdict(list)
         region_index_aliases_by_base: dict[int, list[int]] = defaultdict(list)

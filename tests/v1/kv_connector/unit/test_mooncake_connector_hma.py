@@ -466,13 +466,17 @@ async def test_build_transfer_params_filters_groups_per_shared_region(monkeypatc
                 ),
             ]
 
-            src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = (
-                await worker._build_transfer_params(
-                    [("d-dsv4-shared", send_meta)],
-                    xfer_meta,
-                    local_regions,
-                    remote_regions,
-                )
+            (
+                src_ptrs,
+                dst_ptrs,
+                lengths,
+                err_reqs,
+                err_msg,
+            ) = await worker._build_transfer_params(
+                [("d-dsv4-shared", send_meta)],
+                xfer_meta,
+                local_regions,
+                remote_regions,
             )
 
             assert err_reqs == []
