@@ -832,6 +832,27 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        bootstrap_host, bootstrap_port = get_mooncake_bootstrap_addr(vllm_config)
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER init engine_id=%s host=%s "
+            "dp_rank=%s tp_rank=%s/%s pp_rank=%s/%s kv_role=%s "
+            "is_producer=%s is_consumer=%s local_engines_only=%s "
+            "bootstrap=%s:%s launch_bootstrap=%s",
+            self.engine_id,
+            self.hostname,
+            self.dp_rank,
+            self.tp_rank,
+            self.tp_size,
+            self.pp_rank,
+            self.pp_size,
+            kv_transfer_config.kv_role,
+            self.is_kv_producer,
+            self.is_kv_consumer,
+            parallel_config.local_engines_only,
+            bootstrap_host,
+            bootstrap_port,
+            should_launch_bootstrap_server(vllm_config),
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -961,13 +982,43 @@ class MooncakeConnectorWorker:
         )
         while True:
             try:
+                logger.info(
+                    "MOONCAKE_DEBUG_REGISTER bootstrap POST start url=%s "
+                    "engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s addr=%s",
+                    url,
+                    self.engine_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pp_rank,
+                    worker_addr,
+                )
                 async with httpx.AsyncClient() as client:
                     response = await client.post(url, json=payload.model_dump())
                     response.raise_for_status()
-                logger.debug("Successfully registered with bootstrap server at %s", url)
+                logger.info(
+                    "MOONCAKE_DEBUG_REGISTER bootstrap POST done url=%s "
+                    "status=%s engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s",
+                    url,
+                    response.status_code,
+                    self.engine_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pp_rank,
+                )
                 break
-            except httpx.ConnectError:
+            except httpx.ConnectError as e:
                 # Bootstrap server not ready, wait for a while and retry.
+                logger.warning(
+                    "MOONCAKE_DEBUG_REGISTER bootstrap POST connect failed "
+                    "url=%s engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s "
+                    "error=%s",
+                    url,
+                    self.engine_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pp_rank,
+                    e,
+                )
                 await asyncio.sleep(1)
             except Exception as e:
                 err_msg = (
@@ -984,15 +1035,58 @@ class MooncakeConnectorWorker:
         to a thread pool, and sends acknowledgments upon completion.
         """
 
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender listener start engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s hostname=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            self.hostname,
+        )
         sock = self.async_zmq_ctx.socket(zmq.ROUTER)
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender bind start engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s bind=tcp://%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            self.hostname,
+        )
         self.side_channel_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender bind done engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s port=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            self.side_channel_port,
+        )
         logger.debug(
             "Mooncake sender starting listening on path: tcp://%s:%d",
             self.hostname,
             self.side_channel_port,
         )
 
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender bootstrap register start "
+            "engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+        )
         await self.register_worker_with_bootstrap()
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender bootstrap register done "
+            "engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+        )
 
         # Create async worker tasks that process items from the queue
         sender_tasks = [
@@ -1001,6 +1095,14 @@ class MooncakeConnectorWorker:
         ]
 
         ready_event.set()
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender ready event set engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+        )
 
         try:
             while True:
@@ -1500,7 +1602,34 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr = seen_base_addresses
         self.seen_base_addresses = seen_base_addresses
 
+        total_register_bytes = sum(kv_data_lens)
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER batch_register_memory start engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s ptrs=%s regions=%s "
+            "num_blocks=%s total_bytes=%s block_lens=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            len(kv_data_ptrs),
+            len(self.kv_cache_region_ids),
+            self.num_blocks,
+            total_register_bytes,
+            self.block_len_per_layer,
+        )
+        register_start = time.perf_counter()
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
+        register_duration = time.perf_counter() - register_start
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER batch_register_memory done engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s ret=%s duration_s=%.6f",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            ret_value,
+            register_duration,
+        )
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
@@ -1518,10 +1647,51 @@ class MooncakeConnectorWorker:
             return
 
         ready_event = threading.Event()
-        asyncio.run_coroutine_threadsafe(
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER scheduling sender listener engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s sender_loop_running=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+            self.sender_loop.is_running(),
+        )
+        listener_future = asyncio.run_coroutine_threadsafe(
             self._mooncake_sender_listener(ready_event), self.sender_loop
         )
-        ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+        while not ready_event.wait(timeout=30):
+            if listener_future.done():
+                try:
+                    exc = listener_future.exception(timeout=0)
+                except Exception as e:
+                    exc = e
+                logger.error(
+                    "MOONCAKE_DEBUG_REGISTER sender listener future done before "
+                    "ready engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s "
+                    "exception=%r",
+                    self.engine_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pp_rank,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "MOONCAKE_DEBUG_REGISTER waiting for sender ready "
+                    "engine_id=%s dp_rank=%s tp_rank=%s pp_rank=%s",
+                    self.engine_id,
+                    self.dp_rank,
+                    self.tp_rank,
+                    self.pp_rank,
+                )
+        logger.info(
+            "MOONCAKE_DEBUG_REGISTER sender listener ready engine_id=%s "
+            "dp_rank=%s tp_rank=%s pp_rank=%s",
+            self.engine_id,
+            self.dp_rank,
+            self.tp_rank,
+            self.pp_rank,
+        )
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
