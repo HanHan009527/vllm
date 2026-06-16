@@ -826,6 +826,9 @@ def patch_worker_dependencies():
             return_value=0,
         ),
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.current_platform.set_device"
+        ),
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.should_launch_bootstrap_server",
             return_value=False,
         ),
