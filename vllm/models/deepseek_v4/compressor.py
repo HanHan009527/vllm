@@ -83,6 +83,12 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
 
 
+def _get_compressor_metadata_block_size(
+    mla_spec: SlidingWindowMLASpec | MLAAttentionSpec,
+) -> int:
+    return mla_spec.storage_block_size
+
+
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
@@ -90,7 +96,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
-        self.block_size = mla_spec.block_size
+        self.block_size = _get_compressor_metadata_block_size(mla_spec)
 
         self.token_to_req_indices = torch.zeros(
             self.vllm_config.scheduler_config.max_num_batched_tokens,

@@ -2528,6 +2528,12 @@ def test_unify_hybrid_dsv4_swa_mla_preserves_storage_block_size():
     assert converted.block_size == 256
     assert converted.storage_block_size == c128_compressor_state_spec.block_size
 
+    from vllm.models.deepseek_v4.compressor import (
+        _get_compressor_metadata_block_size,
+    )
+
+    assert _get_compressor_metadata_block_size(converted) == 8
+
 
 def test_hma_not_disabled_when_kv_events_enabled():
     """
