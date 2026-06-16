@@ -1384,17 +1384,30 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowMLASpec):
-                kv_cache_spec[layer_name] = MLAAttentionSpec(
-                    block_size=uniform_block_size
+                block_size = (
+                    uniform_block_size
                     if uniform_block_size is not None
-                    else spec.block_size,
+                    else spec.block_size
+                )
+                compress_ratio = spec.compress_ratio
+                if uniform_block_size is not None:
+                    if block_size % spec.storage_block_size != 0:
+                        raise ValueError(
+                            "Hybrid KV cache manager is disabled but failed to "
+                            "preserve the storage block size for "
+                            f"{layer_name}: block_size={block_size}, "
+                            f"storage_block_size={spec.storage_block_size}"
+                        )
+                    compress_ratio = block_size // spec.storage_block_size
+                kv_cache_spec[layer_name] = MLAAttentionSpec(
+                    block_size=block_size,
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
                     page_size_padded=spec.page_size_padded,
                     cache_dtype_str=spec.cache_dtype_str,
                     alignment=spec.alignment,
-                    compress_ratio=spec.compress_ratio,
+                    compress_ratio=compress_ratio,
                     model_version=spec.model_version,
                 )
             elif isinstance(spec, SlidingWindowSpec):

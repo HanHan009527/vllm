@@ -2499,6 +2499,36 @@ def test_unify_hybrid_kv_cache_specs():
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
 
 
+def test_unify_hybrid_dsv4_swa_mla_preserves_storage_block_size():
+    full_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float8_e4m3fn,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    c128_compressor_state_spec = SlidingWindowMLASpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1024,
+        dtype=torch.float32,
+        sliding_window=128,
+        model_version="deepseek_v4",
+    )
+    kv_cache_spec = {
+        "model.layers.0.attn": full_spec,
+        "model.layers.0.attn.compressor.state_cache": c128_compressor_state_spec,
+    }
+
+    kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    converted = kv_cache_spec["model.layers.0.attn.compressor.state_cache"]
+    assert isinstance(converted, MLAAttentionSpec)
+    assert converted.block_size == 256
+    assert converted.storage_block_size == c128_compressor_state_spec.block_size
+
+
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
