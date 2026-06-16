@@ -692,22 +692,26 @@ def _make_bootstrap_vllm_config(
     (
         "tp_rank",
         "pp_rank",
+        "pcp_rank",
+        "pcp_world_size",
         "local_engines_only",
         "data_parallel_rank_local",
         "data_parallel_index",
         "expected",
     ),
     [
-        (1, 0, False, 0, 0, False),
-        (0, 1, False, 0, 0, False),
-        (0, 0, True, 0, 1, True),
-        (0, 0, True, 1, 0, False),
-        (0, 0, False, 0, 0, True),
-        (0, 0, False, 0, 1, False),
+        (1, 0, 0, 1, False, 0, 0, False),
+        (0, 1, 0, 1, False, 0, 0, False),
+        (0, 0, 1, 2, False, 0, 0, False),
+        (0, 0, 0, 2, True, 0, 1, True),
+        (0, 0, 0, 2, True, 1, 0, False),
+        (0, 0, 0, 2, False, 0, 0, True),
+        (0, 0, 0, 2, False, 0, 1, False),
     ],
     ids=[
         "nonzero_tp_rank",
         "nonzero_pp_rank",
+        "nonzero_pcp_rank",
         "local_engine_rank_zero",
         "local_engine_nonzero_rank",
         "internal_lb_first_dp_engine",
@@ -717,6 +721,8 @@ def _make_bootstrap_vllm_config(
 def test_should_launch_bootstrap_server_selects_single_owner(
     tp_rank: int,
     pp_rank: int,
+    pcp_rank: int,
+    pcp_world_size: int,
     local_engines_only: bool,
     data_parallel_rank_local: int,
     data_parallel_index: int,
@@ -737,8 +743,14 @@ def test_should_launch_bootstrap_server_selects_single_owner(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_pp_group"
         ) as mock_pp_group,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group"
+        ) as mock_pcp_group,
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
+        mock_pcp_group.return_value.rank_in_group = pcp_rank
+        mock_pcp_group.return_value.world_size = pcp_world_size
         assert should_launch_bootstrap_server(vllm_config) is expected
 
 

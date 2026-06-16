@@ -2458,10 +2458,14 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
-    # Only the TP=0, PP=0 worker of the designated engine should launch it.
+    # Only one worker of the designated engine should launch it. PCP can create
+    # multiple workers with the same TP/PP ranks, so include PCP rank as well.
     if get_tensor_model_parallel_rank() != 0:
         return False
     if get_pp_group().rank_in_group != 0:
+        return False
+    pcp_group = get_pcp_group()
+    if pcp_group.world_size > 1 and pcp_group.rank_in_group != 0:
         return False
 
     # In hybrid or external LB mode,
