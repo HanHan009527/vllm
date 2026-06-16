@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import queue
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1269,6 +1270,38 @@ async def test_kv_consumuer(monkeypatch):
 
         # Clean up
         decode_worker.shutdown()
+
+
+def test_process_pulling_result_reports_load_error_blocks():
+    """Failed Mooncake pulls should surface invalid D-side blocks."""
+
+    decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    decode_worker.finished_recving_reqs = set()
+    decode_worker._invalid_block_ids = queue.Queue()
+    decode_worker.xfer_stats = MagicMock()
+
+    pull_metas = {
+        "d-req-1": PullReqMeta(
+            d_req_id="d-req-1",
+            transfer_id="xfer-req-1",
+            local_block_ids=[[100, 101], [200]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+            pull_tasks_count=1,
+        )
+    }
+    response = MooncakeXferResponse(
+        status=MooncakeXferResponseStatus.FINISH,
+        err_reqs=["d-req-1"],
+        err_msg="P num blocks less than D",
+    )
+
+    decode_worker.process_pulling_result(response, pull_metas)
+
+    assert decode_worker.get_block_ids_with_load_errors() == {100, 101, 200}
+    assert decode_worker.get_block_ids_with_load_errors() == set()
+    assert decode_worker.finished_recving_reqs == set()
+    decode_worker.xfer_stats.record_failed_recv.assert_called_once()
 
 
 @pytest.mark.asyncio

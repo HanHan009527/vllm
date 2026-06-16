@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -891,6 +892,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Get block IDs that failed to load via Mooncake."""
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
@@ -1294,6 +1300,7 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -2108,6 +2115,16 @@ class MooncakeConnectorWorker:
             return None
         return self.xfer_stats.clone_and_reset()
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Return and clear D-side block IDs that failed to load."""
+        result: set[int] = set()
+        while not self._invalid_block_ids.empty():
+            try:
+                result.update(self._invalid_block_ids.get_nowait())
+            except queue.Empty:
+                break
+        return result
+
     async def receive_kv_from_single_worker(
         self,
         worker_addr: str,
@@ -2195,6 +2212,21 @@ class MooncakeConnectorWorker:
                 response.err_reqs,
                 response.err_msg,
             )
+            for req_id in response.err_reqs:
+                pull_meta = pull_metas.get(req_id)
+                if pull_meta is None:
+                    logger.warning(
+                        "Mooncake pull failure for unknown request %s", req_id
+                    )
+                    continue
+                failed_blocks = {
+                    block_id
+                    for block_ids in pull_meta.local_block_ids
+                    for block_id in block_ids
+                }
+                if failed_blocks:
+                    self._invalid_block_ids.put(failed_blocks)
+            self.xfer_stats.record_failed_recv()
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"
