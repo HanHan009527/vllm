@@ -306,9 +306,13 @@ class DequantGatherKCacheKernel:
         head_bytes = fp8_dim + (head_dim - fp8_dim) * 2 + 8
 
         out = make_fake_tensor(BFloat16, (num_reqs, cute.sym_int(), head_dim), 16)
+        # Keep the cache block axis dynamic at the FFI boundary. The kernel
+        # still uses the static compile-time block_size for layout and indexing,
+        # but TVM FFI can reject a runtime tensor whose repr already shows the
+        # same concrete size when this axis is constrained in the fake input.
         k_cache = cute.runtime.make_fake_tensor(
             Uint8,
-            (cute.sym_int(), block_size, head_bytes),
+            (cute.sym_int(), cute.sym_int(), head_bytes),
             stride=(cute.sym_int64(divisibility=32), head_bytes, 1),
             assumed_align=32,
         )
