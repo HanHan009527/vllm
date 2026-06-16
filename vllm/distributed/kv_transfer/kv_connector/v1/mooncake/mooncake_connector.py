@@ -2194,18 +2194,6 @@ class MooncakeConnectorWorker:
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
-        ok_reqs: list[ReqId] = response.ok_reqs or []
-
-        for req_id in ok_reqs:
-            pull_meta = pull_metas[req_id]
-            # No race because we are in async loop.
-            pull_meta.pull_tasks_count -= 1
-            if pull_meta.pull_tasks_count == 0:
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
-
-        if ok_reqs:
-            logger.debug("pulling kv_caches for %s finished", ok_reqs)
-
         if response.err_reqs:
             logger.error(
                 "pulling kv_caches for %s failed: %s",
@@ -2219,6 +2207,7 @@ class MooncakeConnectorWorker:
                         "Mooncake pull failure for unknown request %s", req_id
                     )
                     continue
+                self.finished_recving_reqs.discard(pull_meta.d_req_id)
                 failed_blocks = {
                     block_id
                     for block_ids in pull_meta.local_block_ids
@@ -2226,7 +2215,27 @@ class MooncakeConnectorWorker:
                 }
                 if failed_blocks:
                     self._invalid_block_ids.put(failed_blocks)
+                pull_metas.pop(req_id, None)
             self.xfer_stats.record_failed_recv()
+
+        ok_reqs: list[ReqId] = response.ok_reqs or []
+        finished_ok_reqs: list[ReqId] = []
+        for req_id in ok_reqs:
+            pull_meta = pull_metas.get(req_id)
+            if pull_meta is None:
+                logger.debug(
+                    "Skipping Mooncake pull success for failed or unknown request %s",
+                    req_id,
+                )
+                continue
+            # No race because we are in async loop.
+            pull_meta.pull_tasks_count -= 1
+            if pull_meta.pull_tasks_count == 0:
+                self.finished_recving_reqs.add(pull_meta.d_req_id)
+                finished_ok_reqs.append(req_id)
+
+        if finished_ok_reqs:
+            logger.debug("pulling kv_caches for %s finished", finished_ok_reqs)
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
         url = remote_bootstrap_addr + "/query"

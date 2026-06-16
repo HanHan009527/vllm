@@ -50,6 +50,19 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
     return KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
 
 
+def _make_minimal_decode_worker() -> MooncakeConnectorWorker:
+    decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    decode_worker.async_zmq_ctx = MagicMock()
+    decode_worker.is_kv_consumer = True
+    decode_worker.is_kv_producer = False
+    decode_worker.receiver_loop = MagicMock()
+    decode_worker.receiver_loop.is_running.return_value = False
+    decode_worker.finished_recving_reqs = set()
+    decode_worker._invalid_block_ids = queue.Queue()
+    decode_worker.xfer_stats = MagicMock()
+    return decode_worker
+
+
 class FakeMooncakeWrapper:
     """Mock Mooncake TransferEngine for unit testing environments."""
 
@@ -1277,10 +1290,7 @@ async def test_kv_consumuer(monkeypatch):
 def test_process_pulling_result_reports_load_error_blocks():
     """Failed Mooncake pulls should surface invalid D-side blocks."""
 
-    decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
-    decode_worker.finished_recving_reqs = set()
-    decode_worker._invalid_block_ids = queue.Queue()
-    decode_worker.xfer_stats = MagicMock()
+    decode_worker = _make_minimal_decode_worker()
 
     pull_metas = {
         "d-req-1": PullReqMeta(
@@ -1302,6 +1312,54 @@ def test_process_pulling_result_reports_load_error_blocks():
 
     assert decode_worker.get_block_ids_with_load_errors() == {100, 101, 200}
     assert decode_worker.get_block_ids_with_load_errors() == set()
+    assert decode_worker.finished_recving_reqs == set()
+    decode_worker.xfer_stats.record_failed_recv.assert_called_once()
+
+
+def test_process_pulling_result_error_suppresses_later_success():
+    """A request with any failed producer pull must not finish recving."""
+
+    decode_worker = _make_minimal_decode_worker()
+    pull_metas = {
+        "d-req-1": PullReqMeta(
+            d_req_id="d-req-1",
+            transfer_id="xfer-req-1",
+            local_block_ids=[[100, 101]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+            pull_tasks_count=2,
+        )
+    }
+
+    decode_worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.CONTINUE,
+            ok_reqs=["d-req-1"],
+        ),
+        pull_metas,
+    )
+    assert decode_worker.finished_recving_reqs == set()
+    assert pull_metas["d-req-1"].pull_tasks_count == 1
+
+    decode_worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            err_reqs=["d-req-1"],
+            err_msg="P num blocks less than D",
+        ),
+        pull_metas,
+    )
+    assert "d-req-1" not in pull_metas
+    assert decode_worker.finished_recving_reqs == set()
+    assert decode_worker.get_block_ids_with_load_errors() == {100, 101}
+
+    decode_worker.process_pulling_result(
+        MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH,
+            ok_reqs=["d-req-1"],
+        ),
+        pull_metas,
+    )
     assert decode_worker.finished_recving_reqs == set()
     decode_worker.xfer_stats.record_failed_recv.assert_called_once()
 
