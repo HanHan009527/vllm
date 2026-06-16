@@ -1232,7 +1232,9 @@ async def test_kv_consumuer(monkeypatch):
                 pull_tasks_count=1,
             )
         }
-        decode_worker._remote_agents = {"p-engine": {0: {0: "tcp://producer:1234"}}}
+        decode_worker._remote_agents = {
+            "p-engine": {0: {0: {0: "tcp://producer:1234"}}}
+        }
         decode_worker._tp_size["p-engine"] = 1
 
         # Mock the response from the producer.
