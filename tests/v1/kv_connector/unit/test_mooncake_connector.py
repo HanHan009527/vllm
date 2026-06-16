@@ -3,7 +3,6 @@
 
 import asyncio
 import contextlib
-import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -823,6 +822,10 @@ def patch_worker_dependencies():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pp_group"
         ) as mock_pp,
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.torch.accelerator.current_device_index",
+            return_value=0,
+        ),
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.should_launch_bootstrap_server",
             return_value=False,
         ),
@@ -1466,20 +1469,17 @@ def test_register_kv_caches_preserves_dsv4_shared_region_group_aliases():
     assert aligned_remote == regions
 
 
-def test_get_transfer_regions_warns_before_positional_fallback(caplog):
+def test_get_transfer_regions_warns_before_positional_fallback():
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
     worker.is_kv_consumer = True
     worker.is_kv_producer = True
     worker.transfer_topo = SimpleNamespace(virtually_split_kv_in_blocks=False)
 
-    with caplog.at_level(
-        logging.WARNING,
-        logger=(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
-            ".mooncake_connector"
-        ),
-    ):
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
+        ".mooncake_connector.logger.warning"
+    ) as mock_warning:
         regions = worker._get_transfer_regions(
             base_addrs=[0x1000],
             block_lens=[64],
@@ -1487,7 +1487,10 @@ def test_get_transfer_regions_warns_before_positional_fallback(caplog):
             layer_indices=[],
         )
 
-    assert "falling back to positional Mooncake transfer regions" in caplog.text
+    mock_warning.assert_called_once()
+    assert "falling back to positional Mooncake transfer regions" in (
+        mock_warning.call_args.args[0]
+    )
     assert [region.layer_name for region in regions] == ["positional:0"]
 
 
