@@ -40,6 +40,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1225,7 +1226,7 @@ class MooncakeConnectorWorker:
             self.rpc_port,
         )
 
-        self._remote_agents: dict[EngineId, dict[int, dict[int, str]]] = {}
+        self._remote_agents: dict[EngineId, dict[int, dict[int, dict[int, str]]]] = {}
         self._pending_bootstrap_queries: dict[str, asyncio.Event] = {}
         self.side_channel_port: int = 0  # we will bind it in register_kv_caches()
         self.engine_id: EngineId = engine_id
@@ -1247,6 +1248,8 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.pcp_size = get_pcp_group().world_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1371,6 +1374,7 @@ class MooncakeConnectorWorker:
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            pcp_rank=self.pcp_rank,
             addr=worker_addr,
         )
         while True:
@@ -2201,13 +2205,21 @@ class MooncakeConnectorWorker:
                 data: dict = response.json()
                 for _, dp_entry in data.items():
                     remote_engine_id = dp_entry["engine_id"]
-                    self._remote_agents[remote_engine_id] = {
-                        int(tp_rank): {
-                            int(pp_rank): worker_addr
-                            for pp_rank, worker_addr in tp_entry.items()
-                        }
-                        for tp_rank, tp_entry in dp_entry["worker_addr"].items()
-                    }
+                    remote_agents: dict[int, dict[int, dict[int, str]]] = {}
+                    for tp_rank, tp_entry in dp_entry["worker_addr"].items():
+                        pp_agents: dict[int, dict[int, str]] = {}
+                        for pp_rank, pcp_entry in tp_entry.items():
+                            if isinstance(pcp_entry, str):
+                                # Backward compatibility for bootstrap servers
+                                # that only key workers by TP/PP.
+                                pp_agents[int(pp_rank)] = {0: pcp_entry}
+                            else:
+                                pp_agents[int(pp_rank)] = {
+                                    int(pcp_rank): worker_addr
+                                    for pcp_rank, worker_addr in pcp_entry.items()
+                                }
+                        remote_agents[int(tp_rank)] = pp_agents
+                    self._remote_agents[remote_engine_id] = remote_agents
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
         except Exception as e:
             logger.error(
@@ -2231,13 +2243,17 @@ class MooncakeConnectorWorker:
         worker_addrs: list[str] = []
         selected_remote_pp: dict[int, list[int]] = {}
         for remote_tp_rank in remote_tp_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            pp_to_pcp_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
+            if self.pp_size == len(pp_to_pcp_addr) and self.pp_rank in pp_to_pcp_addr:
                 pp_ranks = [self.pp_rank]
             else:
-                pp_ranks = sorted(pp_to_addr)
+                pp_ranks = sorted(pp_to_pcp_addr)
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            for pp_rank in pp_ranks:
+                pcp_to_addr = pp_to_pcp_addr[pp_rank]
+                worker_addrs.extend(
+                    pcp_to_addr[pcp_rank] for pcp_rank in sorted(pcp_to_addr)
+                )
 
         count = len(worker_addrs)
         logger.debug(

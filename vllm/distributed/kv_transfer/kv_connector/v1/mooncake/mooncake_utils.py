@@ -31,14 +31,15 @@ class RegisterWorkerPayload(BaseModel):
     dp_rank: int
     tp_rank: int
     pp_rank: int
+    pcp_rank: int = 0
     addr: WorkerAddr
 
 
 @dataclass
 class EngineEntry:
     engine_id: EngineId
-    # {tp_rank: {pp_rank: worker_addr}}
-    worker_addr: dict[int, dict[int, WorkerAddr]]
+    # {tp_rank: {pp_rank: {pcp_rank: worker_addr}}}
+    worker_addr: dict[int, dict[int, dict[int, WorkerAddr]]]
 
 
 class MooncakeBootstrapServer:
@@ -108,25 +109,32 @@ class MooncakeBootstrapServer:
             dp_entry.worker_addr[payload.tp_rank] = {}
 
         tp_entry = dp_entry.worker_addr[payload.tp_rank]
-        if payload.pp_rank in tp_entry:
+        if payload.pp_rank not in tp_entry:
+            tp_entry[payload.pp_rank] = {}
+
+        pp_entry = tp_entry[payload.pp_rank]
+        if payload.pcp_rank in pp_entry:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Worker with dp_rank={payload.dp_rank}, "
-                    f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank} "
+                    f"tp_rank={payload.tp_rank}, pp_rank={payload.pp_rank}, "
+                    f"pcp_rank={payload.pcp_rank} "
                     f"is already registered at "
-                    f"{tp_entry[payload.pp_rank]}, "
+                    f"{pp_entry[payload.pcp_rank]}, "
                     f"but still want to register at {payload.addr}"
                 ),
             )
 
-        tp_entry[payload.pp_rank] = payload.addr
+        pp_entry[payload.pcp_rank] = payload.addr
         logger.debug(
-            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, pp_rank=%d at %s",
+            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, "
+            "pp_rank=%d, pcp_rank=%d at %s",
             payload.engine_id,
             payload.dp_rank,
             payload.tp_rank,
             payload.pp_rank,
+            payload.pcp_rank,
             payload.addr,
         )
 

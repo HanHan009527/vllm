@@ -603,6 +603,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 0,
+        "pcp_rank": 0,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -615,10 +616,24 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 1,
+        "pcp_rank": 0,
         "addr": "tcp://2.2.2.2:2222",
     }
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{base_url}/register", json=payload2)
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+    payload3 = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 0,
+        "pp_rank": 0,
+        "pcp_rank": 1,
+        "addr": "tcp://1.1.1.2:1111",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{base_url}/register", json=payload3)
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
@@ -629,8 +644,9 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         data = response.json()
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
-        assert data["0"]["worker_addr"]["0"]["0"] == "tcp://1.1.1.1:1111"
-        assert data["0"]["worker_addr"]["0"]["1"] == "tcp://2.2.2.2:2222"
+        assert data["0"]["worker_addr"]["0"]["0"]["0"] == "tcp://1.1.1.1:1111"
+        assert data["0"]["worker_addr"]["0"]["0"]["1"] == "tcp://1.1.1.2:1111"
+        assert data["0"]["worker_addr"]["0"]["1"]["0"] == "tcp://2.2.2.2:2222"
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -644,6 +660,7 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 1,
         "pp_rank": 0,
+        "pcp_rank": 0,
         "addr": "tcp://3.3.3.3:3333",
     }
     async with httpx.AsyncClient() as client:
@@ -822,6 +839,9 @@ def patch_worker_dependencies():
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pp_group"
         ) as mock_pp,
         patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.get_pcp_group"
+        ) as mock_pcp,
+        patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.torch.accelerator.current_device_index",
             return_value=0,
         ),
@@ -841,6 +861,10 @@ def patch_worker_dependencies():
         mock_pp_group = MagicMock()
         mock_pp_group.rank_in_group = 0
         mock_pp.return_value = mock_pp_group
+        mock_pcp_group = MagicMock()
+        mock_pcp_group.world_size = 1
+        mock_pcp_group.rank_in_group = 0
+        mock_pcp.return_value = mock_pcp_group
 
         # Mock ZMQ socket
         mock_socket_object = AsyncMock()
@@ -865,8 +889,24 @@ def patch_worker_dependencies():
 @pytest.mark.parametrize(
     ("local_pp_size", "local_pp_rank", "expected_addrs"),
     [
-        (1, 0, ["tcp://producer-pp0:1234", "tcp://producer-pp1:1234"]),
-        (2, 1, ["tcp://producer-pp1:1234"]),
+        (
+            1,
+            0,
+            [
+                "tcp://producer-pp0-pcp0:1234",
+                "tcp://producer-pp0-pcp1:1234",
+                "tcp://producer-pp1-pcp0:1234",
+                "tcp://producer-pp1-pcp1:1234",
+            ],
+        ),
+        (
+            2,
+            1,
+            [
+                "tcp://producer-pp1-pcp0:1234",
+                "tcp://producer-pp1-pcp1:1234",
+            ],
+        ),
     ],
     ids=["heterogeneous_pp_pulls_all_remote_pp", "matching_pp_pulls_same_rank"],
 )
@@ -877,56 +917,68 @@ async def test_receive_kv_selects_remote_pp_workers(
 ):
     """Decode workers should not hard-code producer pp_rank 0."""
 
-    vllm_config = create_vllm_config(
-        kv_connector="MooncakeConnector", kv_role="kv_consumer"
-    )
+    class SingleTpTransferTopo:
+        def handshake_target_ranks(self, remote_tp_size: int) -> list[int]:
+            assert remote_tp_size == 1
+            return [0]
 
-    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
-        decode_connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
-        decode_worker = decode_connector.connector_worker
-        decode_worker.pp_size = local_pp_size
-        decode_worker.pp_rank = local_pp_rank
-        decode_worker._remote_agents = {
-            "p-engine": {
+    decode_worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    decode_worker.async_zmq_ctx = MagicMock()
+    decode_worker.is_kv_consumer = True
+    decode_worker.is_kv_producer = False
+    decode_worker.receiver_loop = MagicMock()
+    decode_worker.receiver_loop.is_running.return_value = False
+    decode_worker.transfer_topo = SingleTpTransferTopo()
+    decode_worker.finished_recving_reqs = set()
+    decode_worker._tp_size = {}
+    decode_worker.receive_kv_from_single_worker = AsyncMock()
+    decode_worker.receive_kv_from_single_worker.side_effect = None
+    decode_worker.receive_kv_from_single_worker.return_value = None
+    decode_worker.pp_size = local_pp_size
+    decode_worker.pp_rank = local_pp_rank
+    decode_worker._remote_agents = {
+        "p-engine": {
+            0: {
                 0: {
-                    0: "tcp://producer-pp0:1234",
-                    1: "tcp://producer-pp1:1234",
-                }
+                    0: "tcp://producer-pp0-pcp0:1234",
+                    1: "tcp://producer-pp0-pcp1:1234",
+                },
+                1: {
+                    0: "tcp://producer-pp1-pcp0:1234",
+                    1: "tcp://producer-pp1-pcp1:1234",
+                },
             }
         }
-        decode_worker._tp_size["p-engine"] = 1
+    }
+    decode_worker._tp_size["p-engine"] = 1
 
-        pull_metas = {
-            "d-req-1": PullReqMeta(
-                d_req_id="d-req-1",
-                transfer_id="xfer-req-1",
-                local_block_ids=[[100, 101]],
-                remote_engine_id="p-engine",
-                remote_bootstrap_addr="http://bootstrap:33333",
-            )
-        }
-        seen_addrs: list[str] = []
+    pull_metas = {
+        "d-req-1": PullReqMeta(
+            d_req_id="d-req-1",
+            transfer_id="xfer-req-1",
+            local_block_ids=[[100, 101]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+        )
+    }
+    seen_addrs: list[str] = []
 
-        async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
-            seen_addrs.append(worker_addr)
-            for meta in metas.values():
-                meta.pull_tasks_count -= 1
+    async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
+        seen_addrs.append(worker_addr)
+        for meta in metas.values():
+            meta.pull_tasks_count -= 1
 
-        with patch.object(
-            decode_worker,
-            "receive_kv_from_single_worker",
-            side_effect=fake_receive,
-        ):
-            decode_worker.receive_kv("p-engine", pull_metas)
-            await asyncio.sleep(0)
+    with patch.object(
+        decode_worker,
+        "receive_kv_from_single_worker",
+        side_effect=fake_receive,
+    ):
+        decode_worker.receive_kv("p-engine", pull_metas)
+        await asyncio.sleep(0)
 
-        assert seen_addrs == expected_addrs
-        assert pull_metas["d-req-1"].pull_tasks_count == 0
-        decode_worker.shutdown()
+    assert seen_addrs == expected_addrs
+    assert pull_metas["d-req-1"].pull_tasks_count == 0
+    decode_worker.shutdown()
 
 
 def test_resolve_need_send_accounts_for_remote_tp_fanout():
