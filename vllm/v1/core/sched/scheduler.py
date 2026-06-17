@@ -1701,6 +1701,10 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+            if kv_connector_output and kv_connector_output.finished_recving:
+                kv_connector_output.finished_recving.difference_update(
+                    failed_kv_load_req_ids
+                )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
