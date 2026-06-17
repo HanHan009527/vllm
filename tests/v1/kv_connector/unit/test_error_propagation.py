@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import FinishReason, Request, RequestStatus
 
 from .utils import (
@@ -227,3 +228,15 @@ def test_error_propagation_sync_load_ignores_finished_recving_after_failure(
     output = engine_outputs.outputs[0]
     assert output.request_id == request.request_id
     assert output.finish_reason == FinishReason.ERROR
+
+
+def test_error_propagation_ignores_stale_finished_recving_for_missing_request(
+    fail_scheduler: Scheduler,
+):
+    """Ignore recv completions that arrive after the request was removed."""
+
+    fail_scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_recving={"stale-request"})
+    )
+
+    assert "stale-request" not in fail_scheduler.finished_recving_kv_req_ids
