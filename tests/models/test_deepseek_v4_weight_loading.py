@@ -60,12 +60,12 @@ def test_deepseek_v4_load_weights_keeps_missing_expert_weight_strict():
         )
 
 
-def test_deepseek_v4_mapper_uses_forward_expert_scales_for_ue8m0_fp8():
+def test_deepseek_v4_mapper_keeps_fp8_expert_scales_float32_with_ue8m0():
     mapper = deepseek_v4_model._make_deepseek_v4_weights_mapper("fp8", "ue8m0")
 
     assert (
         mapper._map_name("layers.0.ffn.experts.0.w1.scale")
-        == "model.layers.0.ffn.experts.0.w1.weight_scale"
+        == "model.layers.0.ffn.experts.0.w1.weight_scale_inv"
     )
     assert (
         mapper._map_name("layers.0.attn.wq_a.scale")

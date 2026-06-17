@@ -357,14 +357,12 @@ class DeepSeekV4MTP(nn.Module):
                 num_experts=self.config.n_routed_experts,
             )
 
-        # FP8 experts with scale_fmt=ue8m0 store forward scales, while the
-        # older block-FP8 path stores inverse scales.
-        quant_cfg = getattr(self.config, "quantization_config", None) or {}
-        scale_fmt = str(quant_cfg.get("scale_fmt") or "").lower()
+        # FP4 experts store forward scales. FP8-expert checkpoints store
+        # float32 block scales under the historical block-FP8 parameter name;
+        # scale_fmt=ue8m0 controls DeepGEMM runtime formatting elsewhere.
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
-            or scale_fmt == "ue8m0"
             else ".weight_scale_inv"
         )
 

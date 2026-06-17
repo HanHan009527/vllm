@@ -1276,16 +1276,12 @@ def _make_deepseek_v4_weights_mapper(
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
-        # FP8 experts with scale_fmt=ue8m0 store forward scales, while the
-        # older block-FP8 path stores inverse scales.
-        fp8_expert_scale_suffix = (
-            ".weight_scale"
-            if str(scale_fmt or "").lower() == "ue8m0"
-            else ".weight_scale_inv"
-        )
+        # FP8-expert checkpoints store float32 block scales. Keep the historical
+        # block-FP8 parameter name; scale_fmt=ue8m0 is handled by DeepGEMM
+        # runtime formatting, not by remapping checkpoint scale tensors.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): (
-                rf"\1{fp8_expert_scale_suffix}"
+                r"\1.weight_scale_inv"
             ),
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
