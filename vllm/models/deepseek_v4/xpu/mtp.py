@@ -353,12 +353,14 @@ class DeepSeekV4MTP(nn.Module):
                 num_experts=self.config.n_routed_experts,
             )
 
-        # FP8 experts register ``..._weight_scale_inv`` (block_quant) while
-        # FP4/MXFP4 experts register ``..._weight_scale``. Choose the suffix
-        # for the rename below based on the model's expert dtype.
+        # FP8 experts with scale_fmt=ue8m0 store forward scales, while the
+        # older block-FP8 path stores inverse scales.
+        quant_cfg = getattr(self.config, "quantization_config", None) or {}
+        scale_fmt = str(quant_cfg.get("scale_fmt") or "").lower()
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+            or scale_fmt == "ue8m0"
             else ".weight_scale_inv"
         )
 

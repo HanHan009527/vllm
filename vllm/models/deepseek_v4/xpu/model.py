@@ -1263,7 +1263,9 @@ class DeepseekV4Model(nn.Module):
             layer.ffn.finalize_mega_moe_weights()
 
 
-def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
+def _make_deepseek_v4_weights_mapper(
+    expert_dtype: str, scale_fmt: str | None = None
+) -> WeightsMapper:
     if expert_dtype == "fp4":
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
         # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
@@ -1274,10 +1276,17 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
-        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
-        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
+        # FP8 experts with scale_fmt=ue8m0 store forward scales, while the
+        # older block-FP8 path stores inverse scales.
+        fp8_expert_scale_suffix = (
+            ".weight_scale"
+            if str(scale_fmt or "").lower() == "ue8m0"
+            else ".weight_scale_inv"
+        )
         scale_regex = {
+            re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): (
+                rf"\1{fp8_expert_scale_suffix}"
+            ),
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     return WeightsMapper(
@@ -1314,7 +1323,11 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
-            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
+            quant_cfg = getattr(config, "quantization_config", None) or {}
+            scale_fmt = str(quant_cfg.get("scale_fmt") or "").lower()
+            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
+                expert_dtype, scale_fmt
+            )
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

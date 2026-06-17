@@ -510,8 +510,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant: bool = self.weight_block_size is not None
+        self.is_scale_e8m0 = getattr(quant_config, "is_scale_e8m0", False)
         self.weight_scale_name = (
-            "weight_scale_inv" if self.block_quant else "weight_scale"
+            "weight_scale"
+            if self.block_quant and self.is_scale_e8m0
+            else "weight_scale_inv"
+            if self.block_quant
+            else "weight_scale"
         )
 
         # Set weight key and activation key for kernel compatibility
