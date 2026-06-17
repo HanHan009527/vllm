@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import chain, count
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -46,6 +48,30 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 EOS_TOKEN_ID = 50256
+_LOCAL_OPT_MODEL_TMPDIR: tempfile.TemporaryDirectory[str] | None = None
+
+
+def _make_default_local_opt_model() -> str:
+    global _LOCAL_OPT_MODEL_TMPDIR
+    if _LOCAL_OPT_MODEL_TMPDIR is None:
+        _LOCAL_OPT_MODEL_TMPDIR = tempfile.TemporaryDirectory()
+        model_dir = Path(_LOCAL_OPT_MODEL_TMPDIR.name) / "opt-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["OPTForCausalLM"],
+                    "ffn_dim": 32,
+                    "hidden_size": 32,
+                    "max_position_embeddings": 128,
+                    "model_type": "opt",
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 1024,
+                }
+            )
+        )
+    return str(Path(_LOCAL_OPT_MODEL_TMPDIR.name) / "opt-model")
 
 
 def assert_scheduler_empty(scheduler: Scheduler):
@@ -89,7 +115,7 @@ def assert_scheduler_empty(scheduler: Scheduler):
 
 
 def create_vllm_config(
-    model: str = "facebook/opt-125m",
+    model: str | None = None,
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 64,
     block_size: int = 16,
@@ -108,6 +134,9 @@ def create_vllm_config(
     disable_hybrid_kv_cache_manager: bool | None = None,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
+    if model is None:
+        model = _make_default_local_opt_model()
+
     model_config = ModelConfig(
         model=model,
         trust_remote_code=True,
