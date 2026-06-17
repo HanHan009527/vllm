@@ -229,6 +229,14 @@ direct_register_custom_op(
 )
 
 
+def _use_flashinfer_deepgemm_swapab(
+    input: torch.Tensor, use_deep_gemm_e8m0: bool
+) -> bool:
+    # FlashInfer blockscale GEMM consumes float32 weight scales. DeepSeek V4
+    # UE8M0 scales must stay on the DeepGEMM path for both prefill and decode.
+    return not use_deep_gemm_e8m0 and input.shape[0] < 32
+
+
 def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -301,7 +309,7 @@ def _dynamic_flashinfer_deepgemm_blockscale_gemm_impl(
     if envs.VLLM_BATCH_INVARIANT:
         return run_deepgemm(input, weight, weight_scale)
 
-    condition = input.shape[0] < 32
+    condition = _use_flashinfer_deepgemm_swapab(input, use_deep_gemm_e8m0)
 
     # PyTorch's torch.compile cannot handle input-dependent control flow in standard
     # Python conditionals. torch.cond() explicitly registers both code paths in the

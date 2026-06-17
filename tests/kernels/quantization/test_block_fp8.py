@@ -13,6 +13,9 @@ from tests.kernels.quant_utils import (
 )
 from vllm.config import VllmConfig
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
+from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+    _use_flashinfer_deepgemm_swapab,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     w8a8_triton_block_scaled_mm,
@@ -60,6 +63,23 @@ pytest.importorskip("torch.cuda")
 @pytest.fixture(autouse=True)
 def setup_cuda():
     torch.set_default_device("cuda")
+
+
+@pytest.mark.parametrize(
+    "m,use_deep_gemm_e8m0,expected",
+    [
+        (1, False, True),
+        (31, False, True),
+        (32, False, False),
+        (1, True, False),
+        (31, True, False),
+    ],
+)
+def test_dynamic_flashinfer_deepgemm_ue8m0_dispatch(
+    m: int, use_deep_gemm_e8m0: bool, expected: bool
+):
+    input = torch.empty((m, 128), dtype=torch.bfloat16)
+    assert _use_flashinfer_deepgemm_swapab(input, use_deep_gemm_e8m0) is expected
 
 
 @pytest.mark.skipif(
