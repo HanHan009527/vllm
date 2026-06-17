@@ -687,6 +687,30 @@ def _select_region_block_ids(
     return local_block_ids, remote_block_ids, None
 
 
+def _filter_remote_block_ids_for_pcp_rank(
+    remote_block_ids_per_group: BlockIds,
+    pcp_size: int,
+    pcp_rank: int,
+    block_size: int,
+    cp_kv_cache_interleave_size: int,
+) -> BlockIds:
+    if pcp_size <= 1:
+        return remote_block_ids_per_group
+
+    chunks_per_block = block_size // cp_kv_cache_interleave_size
+    return [
+        [
+            block_id
+            for block_idx, block_id in enumerate(remote_group)
+            if any(
+                (block_idx * chunks_per_block + chunk_idx) % pcp_size == pcp_rank
+                for chunk_idx in range(chunks_per_block)
+            )
+        ]
+        for remote_group in remote_block_ids_per_group
+    ]
+
+
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
@@ -1304,7 +1328,11 @@ class MooncakeConnectorWorker:
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
-        self.block_size = vllm_config.cache_config.block_size
+        self.kv_manager_block_size = vllm_config.cache_config.block_size
+        self.block_size = self.kv_manager_block_size
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
@@ -1689,6 +1717,17 @@ class MooncakeConnectorWorker:
 
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
+            remote_block_ids_per_group = _filter_remote_block_ids_for_pcp_rank(
+                remote_block_ids_per_group,
+                pcp_size=getattr(self, "pcp_size", 1),
+                pcp_rank=getattr(self, "pcp_rank", 0),
+                block_size=getattr(
+                    self, "kv_manager_block_size", getattr(self, "block_size", 1)
+                ),
+                cp_kv_cache_interleave_size=getattr(
+                    self, "cp_kv_cache_interleave_size", 1
+                ),
+            )
 
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
