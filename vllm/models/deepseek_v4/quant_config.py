@@ -37,9 +37,11 @@ class DeepseekV4FP8Config(Fp8Config):
     - ``expert_dtype="fp8"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block
       experts with float32 FP8 linear scales.
 
-    The dispatch and the linear scale dtype are both keyed off
-    ``expert_dtype`` from the model's hf_config; missing values default
-    to ``"fp4"`` so existing FP4 checkpoints stay unchanged.
+    MoE dispatch is keyed off ``expert_dtype`` from the model's hf_config;
+    linear scale dtype is keyed off ``quantization_config.scale_fmt`` when
+    present because FP8-expert checkpoints can still store UE8M0 linear scales.
+    Missing values default to ``"fp4"`` / UE8M0 so existing FP4 checkpoints stay
+    unchanged.
 
     NOTE: ``expert_dtype`` is resolved lazily because this config is
     constructed during VllmConfig setup, before ``set_current_vllm_config``
@@ -80,8 +82,18 @@ class DeepseekV4FP8Config(Fp8Config):
 
     @property
     def is_scale_e8m0(self) -> bool:
-        # FP4 checkpoints store FP8 linear scales as e8m0fnu; FP8 expert
-        # checkpoints (Flash-Base) store them as float32.
+        try:
+            hf_config = get_current_vllm_config().model_config.hf_config
+        except Exception:
+            return self.expert_dtype == "fp4"
+
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        scale_fmt = str(quant_cfg.get("scale_fmt") or "").lower()
+        if scale_fmt:
+            return scale_fmt == "ue8m0"
+
+        # Older FP4 checkpoints predate scale_fmt and store FP8 linear scales as
+        # e8m0fnu. FP8-expert checkpoints without scale_fmt use float32 scales.
         return self.expert_dtype == "fp4"
 
     def _resolve_moe_overrides(self) -> None:
