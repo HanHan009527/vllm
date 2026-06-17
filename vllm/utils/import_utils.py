@@ -541,6 +541,8 @@ def has_fbgemm_gpu() -> bool:
 
 def has_cutedsl() -> bool:
     """Whether the optional `cutelass` package is available."""
+    if os.environ.get("VLLM_DISABLE_CUTEDSL", "0") == "1":
+        return False
     return _has_module("cutlass")
 
 
