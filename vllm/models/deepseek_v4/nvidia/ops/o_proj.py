@@ -11,8 +11,6 @@ from vllm.utils.deep_gemm import fp8_einsum
 def get_fp8_weight_scale(layer: nn.Module) -> torch.Tensor | None:
     if hasattr(layer, "weight_scale_inv"):
         return layer.weight_scale_inv
-    if hasattr(layer, "weight_scale"):
-        return layer.weight_scale
     return None
 
 

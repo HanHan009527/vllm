@@ -66,11 +66,11 @@ def test_get_fp8_weight_scale_prefers_weight_scale_inv():
     assert get_fp8_weight_scale(layer) is layer.weight_scale_inv
 
 
-def test_get_fp8_weight_scale_accepts_weight_scale():
+def test_get_fp8_weight_scale_ignores_non_inverse_weight_scale():
     layer = nn.Module()
     layer.weight_scale = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
-    assert get_fp8_weight_scale(layer) is layer.weight_scale
+    assert get_fp8_weight_scale(layer) is None
 
 
 def test_get_fp8_weight_scale_returns_none_without_scale():
@@ -187,6 +187,45 @@ def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_without_scale():
         einsum_recipe=(1, 128, 128),
         tma_aligned_scales=False,
     )
+
+    assert wo_b.input is not None
+    torch.testing.assert_close(
+        wo_b.input, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(out, torch.tensor([[2.0, 3.0]], dtype=torch.bfloat16))
+
+
+class FakePerTensorScaleWoA(FakeSingleGroupWoA):
+    def __init__(self):
+        super().__init__()
+        self.weight_scale = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+
+
+def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_with_non_inverse_scale():
+    wo_b = FakeWoB()
+    original_fused_inv_rope_fp8_quant = o_proj.fused_inv_rope_fp8_quant
+
+    def fail_if_fp8_path_is_used(*args, **kwargs):
+        raise AssertionError("per-tensor weight_scale is not weight_scale_inv")
+
+    o_proj.fused_inv_rope_fp8_quant = fail_if_fp8_path_is_used
+    try:
+        out = deep_gemm_fp8_o_proj(
+            torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            FakePerTensorScaleWoA(),
+            wo_b,
+            n_groups=1,
+            heads_per_group=1,
+            nope_dim=2,
+            rope_dim=2,
+            o_lora_rank=2,
+            einsum_recipe=(1, 128, 128),
+            tma_aligned_scales=False,
+        )
+    finally:
+        o_proj.fused_inv_rope_fp8_quant = original_fused_inv_rope_fp8_quant
 
     assert wo_b.input is not None
     torch.testing.assert_close(
