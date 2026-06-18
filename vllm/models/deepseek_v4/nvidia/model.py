@@ -342,6 +342,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             is_scale = weight_name.endswith("weight_scale_inv") or weight_name.endswith(
                 "weight_scale"
             )
+            expected_layout = "parameter shard"
             if shard_id in ("w1", "w3"):
                 if "w13_" not in weight_name:
                     continue
@@ -352,6 +353,9 @@ class DeepseekV4MegaMoEExperts(nn.Module):
                     shard_size = self._ceil_div_128(self.intermediate_size)
                     shard_offset = 0 if shard_id == "w1" else shard_size
                     expert_data = expert_data.narrow(0, shard_offset, shard_size)
+                    expected_layout = (
+                        "parameter shard or compact FP8 w1/w3 scale layout"
+                    )
                 else:
                     shard_offset = 0 if shard_id == "w1" else self.intermediate_size
                     expert_data = expert_data.narrow(
@@ -360,14 +364,25 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             elif shard_id == "w2":
                 if "w2_" not in weight_name:
                     continue
+                if self.expert_dtype == "fp8" and is_scale:
+                    expected_layout = (
+                        "parameter shard or compact FP8 w2 scale layout"
+                    )
             else:
                 raise ValueError(f"Unsupported expert shard id: {shard_id}")
 
+            if self.expert_dtype == "fp8" and is_scale:
+                loaded_weight = self._expand_fp8_compact_scale_if_needed(
+                    expert_data,
+                    loaded_weight,
+                    shard_id,
+                )
             if expert_data.shape != loaded_weight.shape:
                 raise ValueError(
                     f"DeepSeek V4 MegaMoE expert weight shape mismatch for "
-                    f"{weight_name}: parameter shard {tuple(expert_data.shape)} "
-                    f"vs checkpoint {tuple(loaded_weight.shape)}"
+                    f"{weight_name} shard {shard_id}: expected "
+                    f"{expected_layout} {tuple(expert_data.shape)} vs "
+                    f"checkpoint {tuple(loaded_weight.shape)}"
                 )
             expert_data.copy_(loaded_weight)
             loaded_any = True
@@ -375,6 +390,37 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         if return_success:
             return loaded_any
         return None
+
+    @staticmethod
+    def _expand_fp8_compact_scale_if_needed(
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+    ) -> torch.Tensor:
+        if expert_data.shape == loaded_weight.shape:
+            return loaded_weight
+        if expert_data.ndim != 2 or loaded_weight.ndim != 2:
+            return loaded_weight
+
+        # DeepSeek-V4-Flash-FP8 stores expert weight scales in a compact
+        # checkpoint layout. Broadcast those scales into the block-(128, 128)
+        # layout consumed by the SM90 MegaMoE path.
+        compact_shape = (16, 32) if shard_id in ("w1", "w3") else (32, 16)
+        if tuple(loaded_weight.shape) != compact_shape:
+            return loaded_weight
+
+        if (
+            expert_data.shape[0] % loaded_weight.shape[0] != 0
+            or expert_data.shape[1] % loaded_weight.shape[1] != 0
+        ):
+            return loaded_weight
+
+        row_repeat = expert_data.shape[0] // loaded_weight.shape[0]
+        col_repeat = expert_data.shape[1] // loaded_weight.shape[1]
+        return loaded_weight.repeat_interleave(row_repeat, dim=0).repeat_interleave(
+            col_repeat,
+            dim=1,
+        )
 
     @staticmethod
     def _ue8m0_uint8_to_float(sf: torch.Tensor) -> torch.Tensor:

@@ -10,13 +10,33 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MegaMoEExperts,
     make_deepseek_v4_expert_params_mapping,
 )
-from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
-from vllm.platforms import current_platform
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="DeepSeek V4 MegaMoE requires CUDA",
-)
+
+def _make_vllm_config():
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+
+
+def _make_loader_only_experts(
+    *,
+    expert_dtype: str,
+    hidden_size: int,
+    intermediate_size: int,
+):
+    experts = DeepseekV4MegaMoEExperts.__new__(DeepseekV4MegaMoEExperts)
+    experts.expert_dtype = expert_dtype
+    experts.hidden_size = hidden_size
+    experts.intermediate_size = intermediate_size
+    experts.experts_start_idx = 0
+    experts.experts_end_idx = 1
+    experts.num_logical_experts = 1
+    return experts
+
+
+def _ceil_div_128(value: int) -> int:
+    return (value + 127) // 128
 
 
 def test_deepseek_v4_mega_moe_expert_mapping():
@@ -45,11 +65,8 @@ def test_deepseek_v4_mega_moe_ue8m0_uint8_to_float():
 
 
 def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
-    vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
-    )
     experts = DeepseekV4MegaMoEExperts(
-        vllm_config,
+        _make_vllm_config(),
         num_experts=4,
         num_local_experts=2,
         experts_start_idx=2,
@@ -106,11 +123,105 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     assert torch.count_nonzero(experts.w13_weight[1]) == 0
 
 
+def test_deepseek_v4_mega_moe_weight_loader_expands_fp8_compact_w13_scales():
+    hidden_size = 16_384
+    intermediate_size = 262_144
+    experts = _make_loader_only_experts(
+        expert_dtype="fp8",
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    w13_scale = torch.nn.Parameter(
+        torch.zeros(
+            1,
+            2 * _ceil_div_128(intermediate_size),
+            _ceil_div_128(hidden_size),
+        ),
+        requires_grad=False,
+    )
+
+    compact = torch.arange(16 * 32, dtype=torch.float32).reshape(16, 32)
+
+    assert experts.weight_loader(
+        w13_scale,
+        compact,
+        "layers.0.ffn.experts.w13_weight_scale",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+
+    expanded = compact.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
+    assert torch.equal(w13_scale[0, :2048], expanded)
+    assert torch.count_nonzero(w13_scale[0, 2048:]) == 0
+
+
+def test_deepseek_v4_mega_moe_weight_loader_rejects_unknown_fp8_scale_layout():
+    hidden_size = 16_384
+    intermediate_size = 262_144
+    experts = _make_loader_only_experts(
+        expert_dtype="fp8",
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    w13_scale = torch.nn.Parameter(
+        torch.zeros(
+            1,
+            2 * _ceil_div_128(intermediate_size),
+            _ceil_div_128(hidden_size),
+        ),
+        requires_grad=False,
+    )
+
+    with pytest.raises(ValueError, match="compact FP8 w1/w3 scale layout"):
+        experts.weight_loader(
+            w13_scale,
+            torch.zeros(17, 32),
+            "layers.0.ffn.experts.w13_weight_scale",
+            shard_id="w1",
+            expert_id=0,
+            return_success=True,
+        )
+
+
+def test_deepseek_v4_mega_moe_weight_loader_keeps_fp4_scale_layout():
+    hidden_size = 256
+    intermediate_size = 256
+    experts = _make_loader_only_experts(
+        expert_dtype="fp4",
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    w13_scale = torch.nn.Parameter(
+        torch.zeros(1, 2 * intermediate_size, hidden_size // 2),
+        requires_grad=False,
+    )
+    w1_scale = torch.arange(
+        intermediate_size * (hidden_size // 2),
+        dtype=torch.float32,
+    ).reshape(intermediate_size, hidden_size // 2)
+
+    assert experts.weight_loader(
+        w13_scale,
+        w1_scale,
+        "layers.0.ffn.experts.w13_weight_scale",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+
+    assert torch.equal(w13_scale[0, :intermediate_size], w1_scale)
+    assert torch.count_nonzero(w13_scale[0, intermediate_size:]) == 0
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",
 )
 def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
+    from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import (
+        prepare_megamoe_inputs,
+    )
     from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
 
     device = torch.device("cuda")
