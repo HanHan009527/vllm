@@ -18,7 +18,6 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
-from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
@@ -52,6 +51,10 @@ USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
 USE_PRECOMPILED_RUST_FRONTEND = (
     envs.VLLM_USE_PRECOMPILED or envs.VLLM_USE_PRECOMPILED_RUST
 )
+
+
+def has_setuptools_rust() -> bool:
+    return importlib.util.find_spec("setuptools_rust") is not None
 
 
 def should_require_rust_frontend() -> bool:
@@ -444,34 +447,44 @@ class precompiled_build_ext(build_ext):
         return
 
 
-class precompiled_build_rust(build_rust):
-    """Skips local Rust builds when all precompiled Rust artifacts are present."""
+def make_precompiled_build_rust():
+    from setuptools_rust.build import build_rust
 
-    def run(self) -> None:
-        missing = []
-        if not PRECOMPILED_RUST_FRONTEND_PATH.exists():
-            missing.append(str(PRECOMPILED_RUST_FRONTEND_PATH))
-        missing_rust_extensions = get_missing_precompiled_rust_extension_modules()
-        if missing_rust_extensions:
-            missing.extend(
-                str(ROOT_DIR / "vllm" / f"{module_name}*.so")
-                for module_name in missing_rust_extensions
+    class precompiled_build_rust(build_rust):
+        """Skips local Rust builds when all precompiled Rust artifacts exist."""
+
+        def run(self) -> None:
+            missing = get_missing_precompiled_rust_artifacts()
+
+            if not missing:
+                logger.info(
+                    "Skipping local Rust build: using precompiled %s and %s",
+                    PRECOMPILED_RUST_FRONTEND_PATH,
+                    get_precompiled_rust_extension_paths(),
+                )
+                return
+
+            logger.warning(
+                "Precompiled wheel did not provide all Rust artifacts (%s); "
+                "falling back to local Rust build.",
+                ", ".join(missing),
             )
+            super().run()
 
-        if not missing:
-            logger.info(
-                "Skipping local Rust build: using precompiled %s and %s",
-                PRECOMPILED_RUST_FRONTEND_PATH,
-                get_precompiled_rust_extension_paths(),
-            )
-            return
+    return precompiled_build_rust
 
-        logger.warning(
-            "Precompiled wheel did not provide all Rust artifacts (%s); "
-            "falling back to local Rust build.",
-            ", ".join(missing),
+
+def get_missing_precompiled_rust_artifacts() -> list[str]:
+    missing = []
+    if not PRECOMPILED_RUST_FRONTEND_PATH.exists():
+        missing.append(str(PRECOMPILED_RUST_FRONTEND_PATH))
+    missing_rust_extensions = get_missing_precompiled_rust_extension_modules()
+    if missing_rust_extensions:
+        missing.extend(
+            str(ROOT_DIR / "vllm" / f"{module_name}*.so")
+            for module_name in missing_rust_extensions
         )
-        super().run()
+    return missing
 
 
 class precompiled_wheel_utils:
@@ -1196,13 +1209,28 @@ if (
     or PRECOMPILED_RUST_FRONTEND_PATH.exists()
     or has_precompiled_rust_extensions()
 ):
-    cmdclass["build_rust"] = precompiled_build_rust
+    if has_setuptools_rust():
+        cmdclass["build_rust"] = make_precompiled_build_rust()
 
 # Rust artifacts, built via setuptools-rust and installed into the package
 # directory alongside the Python modules.
-rust_extensions = rust_build.rust_extensions(
-    optional=not should_require_rust_frontend()
-)
+if has_setuptools_rust():
+    rust_extensions = rust_build.rust_extensions(
+        optional=not should_require_rust_frontend()
+    )
+else:
+    if not USE_PRECOMPILED_RUST_FRONTEND:
+        raise RuntimeError(
+            "setuptools-rust is required to build Rust artifacts. "
+            "Install setuptools-rust or set VLLM_USE_PRECOMPILED=1."
+        )
+    missing_rust_artifacts = get_missing_precompiled_rust_artifacts()
+    if missing_rust_artifacts:
+        raise RuntimeError(
+            "setuptools-rust is required to build missing Rust artifacts: "
+            + ", ".join(missing_rust_artifacts)
+        )
+    rust_extensions = []
 
 setup(
     # static metadata should rather go in pyproject.toml
