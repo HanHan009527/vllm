@@ -1086,8 +1086,9 @@ class MooncakeConnectorScheduler:
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
         """
-        For remote prefill, pull all prompt blocks from remote
-        asynchronously relative to engine execution.
+        For remote prefill, pull prompt KV from remote asynchronously relative
+        to engine execution, leaving the final prompt token for local decode
+        logits computation.
 
         Args:
             request (Request): the request object.
@@ -1112,10 +1113,9 @@ class MooncakeConnectorScheduler:
             return 0, False
 
         if params.get("do_remote_prefill"):
-            # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
             token_ids = request.prompt_token_ids or []
-            count = len(token_ids) - num_computed_tokens
+            count = max(len(token_ids) - 1 - num_computed_tokens, 0)
             if count > 0:
                 return count, True
 

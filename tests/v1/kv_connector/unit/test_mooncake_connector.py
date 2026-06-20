@@ -772,6 +772,18 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
+@pytest.mark.cpu_test
+def test_remote_prefill_leaves_last_prompt_token_for_decode_logits():
+    scheduler_connector = MooncakeConnectorScheduler.__new__(MooncakeConnectorScheduler)
+    scheduler_connector.is_kv_producer = False
+
+    request = create_request(request_id=1, num_tokens=8, do_remote_prefill=True)
+
+    assert scheduler_connector.get_num_new_matched_tokens(request, 0) == (7, True)
+    assert scheduler_connector.get_num_new_matched_tokens(request, 3) == (4, True)
+    assert scheduler_connector.get_num_new_matched_tokens(request, 7) == (0, False)
+
+
 @pytest.fixture
 def bootstrap_server():
     """Fixture to launch and cleanup a Mooncake Bootstrap HTTP Server."""
