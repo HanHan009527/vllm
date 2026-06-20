@@ -2072,6 +2072,23 @@ class MooncakeConnectorWorker:
         tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
+            layer_group_indices = layer_group_index_map.get(layer_name, [])
+            if self._is_hma_required and not layer_group_indices:
+                logger.warning(
+                    "Mooncake registered layer %s has no KV cache group mapping "
+                    "(num_groups=%d). Transfer region alignment may fan out to "
+                    "all groups.",
+                    layer_name,
+                    len(self.kv_cache_config.kv_cache_groups)
+                    if self.kv_cache_config is not None
+                    else 0,
+                )
+            else:
+                logger.debug(
+                    "Mooncake registered layer %s maps to KV cache groups %s",
+                    layer_name,
+                    layer_group_indices,
+                )
             speculative_config = self.vllm_config.speculative_config
             speculative_method = getattr(speculative_config, "method", None)
             is_mtp_speculative = speculative_method == "mtp" or (
@@ -2104,9 +2121,9 @@ class MooncakeConnectorWorker:
                     region_aliases_by_base[base_addr].append(layer_name)
                     region_index_aliases_by_base[base_addr].append(layer_index)
                     region_alias_groups_by_base[base_addr].append(
-                        list(layer_group_index_map.get(layer_name, []))
+                        list(layer_group_indices)
                     )
-                for group_idx in layer_group_index_map.get(layer_name, []):
+                for group_idx in layer_group_indices:
                     if group_idx not in region_groups_by_base[base_addr]:
                         region_groups_by_base[base_addr].append(group_idx)
 
