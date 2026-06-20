@@ -2067,13 +2067,17 @@ class MooncakeConnectorWorker:
         self.registered_alias_group_indices = []
         total_num_hidden_layers = self.model_config.get_total_num_hidden_layers()
         layer_group_index_map = self._build_layer_group_index_map()
+        hma_required = self.kv_cache_config is not None and any(
+            not isinstance(group.kv_cache_spec, FullAttentionSpec)
+            for group in self.kv_cache_config.kv_cache_groups
+        )
 
         split_k_and_v = self.transfer_topo.split_k_and_v
         tensor_size_bytes = None
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
             layer_group_indices = layer_group_index_map.get(layer_name, [])
-            if self._is_hma_required and not layer_group_indices:
+            if hma_required and not layer_group_indices:
                 logger.warning(
                     "Mooncake registered layer %s has no KV cache group mapping "
                     "(num_groups=%d). Transfer region alignment may fan out to "
