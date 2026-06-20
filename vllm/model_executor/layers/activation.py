@@ -3,6 +3,7 @@
 """Custom activation functions."""
 
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,47 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.collection_utils import LazyDict
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _silu_and_mul_with_clamp_supports_alpha_beta() -> bool:
+    op = torch.ops._C.silu_and_mul_with_clamp
+    schemas = getattr(op, "_schemas", None)
+    if schemas:
+        schema_text = "\n".join(str(schema) for schema in schemas.values())
+    else:
+        default_overload = getattr(op, "default", None)
+        schema = getattr(default_overload, "_schema", None)
+        schema_text = str(schema) if schema is not None else ""
+
+    if "float alpha" in schema_text and "float beta" in schema_text:
+        return True
+    if "float limit" in schema_text:
+        return False
+    return True
+
+
+def silu_and_mul_with_clamp_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    clamp_limit: float,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> None:
+    if _silu_and_mul_with_clamp_supports_alpha_beta():
+        torch.ops._C.silu_and_mul_with_clamp(
+            output, input, clamp_limit, alpha, beta
+        )
+        return
+
+    if alpha == 1.0 and beta == 0.0:
+        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit)
+        return
+
+    d = input.shape[-1] // 2
+    gate = torch.clamp(input[..., :d], max=clamp_limit)
+    up = torch.clamp(input[..., d:], min=-clamp_limit, max=clamp_limit)
+    output.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
 
 
 @triton.jit
@@ -197,7 +239,9 @@ class SiluAndMulWithClamp(CustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
+        silu_and_mul_with_clamp_out(
+            out, x, self.swiglu_limit, self.alpha, self.beta
+        )
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:

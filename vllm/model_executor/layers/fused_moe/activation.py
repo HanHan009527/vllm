@@ -7,6 +7,8 @@ from enum import Enum
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.activation import silu_and_mul_with_clamp_out
+
 
 class MoEActivation(Enum):
     """Activation functions for MoE layers."""
@@ -139,7 +141,7 @@ def apply_moe_activation(
     if activation == MoEActivation.SILU:
         if clamp_limit is not None:
             # Fused silu(clamp(gate)) * clamp(up); equivalent to swiglu_limit_func.
-            torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
+            silu_and_mul_with_clamp_out(output, input, clamp_limit)
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
@@ -151,7 +153,7 @@ def apply_moe_activation(
     elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
         # SwiGLU-OAI on packed w13 (gate = first half, up = second half).
         assert clamp_limit is not None, "SWIGLUOAI_UNINTERLEAVE requires clamp_limit"
-        torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, alpha, beta)
+        silu_and_mul_with_clamp_out(output, input, clamp_limit, alpha, beta)
     elif activation == MoEActivation.SWIGLUSTEP:
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 
