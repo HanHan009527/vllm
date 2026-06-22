@@ -4285,6 +4285,12 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if self.pcp_world_size > 1:
+                num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+                num_tokens_unpadded = num_scheduled_tokens
+                max_num_scheduled_tokens = int(
+                    num_scheduled_tokens_np[:num_reqs].max()
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)

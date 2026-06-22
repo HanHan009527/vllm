@@ -142,6 +142,36 @@ def test_pcp_manager_dual_chunk_swap_positions_rank1():
     )
 
 
+def test_pcp_restore_idx_length_uses_local_total_for_odd_request():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=1,
+        max_buffer_num_tokens=64,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+    )
+    tokens = np.array([9], dtype=np.int32)
+    arange_np = np.arange(64, dtype=np.int32)
+
+    pcp_tokens, positions = manager.update_tokens_for_pcp(
+        tokens,
+        arange_np,
+        num_reqs=1,
+        reorder_batch_threshold=1,
+    )
+
+    original_total = int(tokens.sum())
+    local_total = int(pcp_tokens.sum())
+    assert original_total == 9
+    assert local_total == 6
+    assert positions.tolist() == [3, 4, 5, 6, 7, 8]
+
+    restore_len = local_total * manager.pcp_world_size
+    restore_idx = manager.pcp_allgather_restore_idx.cpu[:restore_len]
+    assert restore_len == 12
+    assert int(restore_idx.max()) < restore_len
+
+
 def test_get_cp_local_seq_lens_preserves_dcp_helper_behavior():
     seq_lens = torch.tensor([1, 5, 8, 9], dtype=torch.int64)
 
