@@ -521,6 +521,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
+        if envs.VLLM_DSV4_NONFINITE_DIAG:
+            finite_rows = torch.isfinite(out.flatten(1)).all(dim=1)
+            if not finite_rows.all():
+                bad_rows = torch.nonzero(~finite_rows, as_tuple=False).flatten()
+                bad_rows_cpu = bad_rows[:16].detach().cpu().tolist()
+                bad_pos_cpu = (
+                    positions[: out.shape[0]]
+                    .index_select(0, bad_rows[:16])
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                logger.error(
+                    "DeepSeek V4 attention output non-finite before o_proj at "
+                    "%s: bad_rows=%s bad_positions=%s num_bad_rows=%d",
+                    self.prefix,
+                    bad_rows_cpu,
+                    bad_pos_cpu,
+                    bad_rows.numel(),
+                )
 
     def _fused_qnorm_rope_kv_insert(
         self,
