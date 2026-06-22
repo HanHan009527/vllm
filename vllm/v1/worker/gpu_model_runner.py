@@ -2204,11 +2204,12 @@ class GPUModelRunner(
                     self.device, dtype=torch.int64, non_blocking=True
                 )
             )
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        if self.pcp_world_size == 1:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -4120,11 +4121,25 @@ class GPUModelRunner(
                             :pcp_full_tokens
                         ]
                     )
+                    local_valid_mask = (
+                        self.pcp_manager.pcp_local_unpad_mask_gpu_tensor[
+                            :num_tokens_unpadded
+                        ]
+                    )
+                    local_token_indices = (
+                        self.pcp_manager.pcp_local_token_indices_gpu_tensor[
+                            :num_tokens_unpadded
+                        ]
+                    )
+                    local_slot_mapping = torch.index_select(
+                        blk_table.slot_mapping.gpu,
+                        0,
+                        local_token_indices,
+                    )
+                    local_slot_mapping[~local_valid_mask] = -1
                     pcp_group = get_pcp_group()
                     gathered_slot_mapping = pcp_group.all_gather(
-                        blk_table.slot_mapping.gpu[
-                            :num_tokens_unpadded
-                        ].contiguous(),
+                        local_slot_mapping.contiguous(),
                         dim=0,
                     )
                     torch.index_select(

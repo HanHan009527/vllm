@@ -78,6 +78,21 @@ class PCPManager:
         self.pcp_local_unpad_mask_cpu = (
             self.pcp_local_unpad_mask_cpu_tensor.numpy()
         )
+        self.pcp_local_token_indices = CpuGpuBuffer(
+            max_buffer_num_tokens,
+            dtype=torch.int64,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        self.pcp_local_token_indices_cpu_tensor = (
+            self.pcp_local_token_indices.cpu
+        )
+        self.pcp_local_token_indices_gpu_tensor = (
+            self.pcp_local_token_indices.gpu
+        )
+        self.pcp_local_token_indices_cpu = (
+            self.pcp_local_token_indices_cpu_tensor.numpy()
+        )
 
     @staticmethod
     def _get_cumsum_and_arange(
@@ -176,11 +191,21 @@ class PCPManager:
             positions[:num_decode_tokens] = self._get_cumsum_and_arange(
                 tokens[:num_decode_reqs], arange_np
             )[1]
+        original_cu_tokens = np.cumsum(tokens, dtype=np.int64)
+        original_start_loc = np.roll(original_cu_tokens, 1)
+        original_start_loc[0] = 0
         num_local_tokens = positions.shape[0]
-        self.pcp_local_unpad_mask_cpu[:num_local_tokens] = (
-            positions < np.repeat(tokens, pcp_tokens)
-        )
+        local_valid_mask = positions < np.repeat(tokens, pcp_tokens)
+        self.pcp_local_unpad_mask_cpu[:num_local_tokens] = local_valid_mask
         self.pcp_local_unpad_mask.copy_to_gpu(num_local_tokens)
+        self.pcp_local_token_indices_cpu[:num_local_tokens] = (
+            positions.astype(np.int64)
+            + np.repeat(original_start_loc, pcp_tokens)
+        )
+        self.pcp_local_token_indices_cpu[:num_local_tokens][
+            ~local_valid_mask
+        ] = 0
+        self.pcp_local_token_indices.copy_to_gpu(num_local_tokens)
 
         padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
         padded_pos_start_loc[0] = 0
