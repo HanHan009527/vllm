@@ -1062,6 +1062,8 @@ def dequantize_fp8_block_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     block_size: Sequence[int],
+    *,
+    scale_is_inverse: bool = False,
 ) -> torch.Tensor:
     """Dequantize a block-FP8 weight tensor using its raw block scales.
 
@@ -1088,7 +1090,10 @@ def dequantize_fp8_block_weight(
 
     scale = torch.repeat_interleave(scale, block_m, dim=-2)[..., :rows, :]
     scale = torch.repeat_interleave(scale, block_k, dim=-1)[..., :, :cols]
-    return weight.to(torch.float32) * scale
+    weight_float = weight.to(torch.float32)
+    if scale_is_inverse:
+        return weight_float / scale
+    return weight_float * scale
 
 
 def deepgemm_post_process_fp8_weight_block(
