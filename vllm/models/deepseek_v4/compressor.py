@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -27,6 +28,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     MultipleOf,
+)
+from vllm.v1.attention.backends.utils import (
+    get_pcp_max_buffer_num_tokens,
+    pcp_allgather_and_restore,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -82,6 +87,7 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    pcp_allgather_restore_idx: torch.Tensor | None = None
 
 
 def _get_compressor_metadata_block_size(
@@ -98,9 +104,13 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
         self.block_size = _get_compressor_metadata_block_size(mla_spec)
+        self.pcp_world_size = (
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        max_tokens = get_pcp_max_buffer_num_tokens(self.vllm_config)
 
         self.token_to_req_indices = torch.zeros(
-            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            max_tokens,
             dtype=torch.int32,
             device=self.device,
         )
@@ -114,6 +124,8 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_reqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        if common_attn_metadata.pcp_allgather_restore_idx is not None:
+            query_lens = query_lens * self.pcp_world_size
         x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
@@ -122,6 +134,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             slot_mapping=common_attn_metadata.slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
+            pcp_allgather_restore_idx=common_attn_metadata.pcp_allgather_restore_idx,
         )
 
 
@@ -305,6 +318,24 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        if state_metadata.pcp_allgather_restore_idx is not None:
+            restore_idx = state_metadata.pcp_allgather_restore_idx
+            kv_score = pcp_allgather_and_restore(
+                kv_score,
+                kv_score.shape[0],
+                restore_idx,
+                get_pcp_group(),
+            )
+            positions = pcp_allgather_and_restore(
+                positions,
+                positions.shape[0],
+                restore_idx,
+                get_pcp_group(),
+            )
+            kv, score = kv_score.split(
+                [self.coff * self.head_dim, self.coff * self.head_dim],
+                dim=-1,
+            )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache

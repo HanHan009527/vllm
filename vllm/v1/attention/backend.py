@@ -401,6 +401,9 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
+    pcp_allgather_restore_idx: torch.Tensor | None = None
+    """Indices that restore PCP all-gathered tensors to original token order"""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -506,6 +509,7 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
         )
 
@@ -568,7 +572,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         self,
         reorder_batch_threshold: int | None = 1,
         supports_spec_as_decode: bool = False,
-        supports_dcp_with_varlen: bool = False,
+        supports_cp_with_varlen: bool = False,
     ) -> None:
         self.reorder_batch_threshold = reorder_batch_threshold
         if self.reorder_batch_threshold is not None and supports_spec_as_decode:
@@ -592,8 +596,8 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
 
         if (
             self.vllm_config.parallel_config.decode_context_parallel_size > 1
-            and not supports_dcp_with_varlen
-        ):
+            or self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+        ) and not supports_cp_with_varlen:
             self.reorder_batch_threshold = 1
 
     @abstractmethod

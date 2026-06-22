@@ -17,7 +17,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_pcp_max_buffer_num_tokens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -179,6 +182,7 @@ class DeepseekSparseSWAMetadata:
     prefill_window_size: int = 0
     prefill_max_model_len: int = 0
     prefill_max_num_batched_tokens: int = 0
+    pcp_allgather_restore_idx: torch.Tensor | None = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -293,8 +297,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.compress_ratio = mla_spec.compress_ratio
         self.block_size = mla_spec.block_size
         self.max_model_len = self.vllm_config.model_config.max_model_len
-        self.max_num_batched_tokens = (
-            self.vllm_config.scheduler_config.max_num_batched_tokens
+        self.max_num_batched_tokens = get_pcp_max_buffer_num_tokens(
+            self.vllm_config
         )
 
         # Handle MTP: adjust decode_threshold like the indexer does
@@ -322,7 +326,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         for ratio in compress_ratios:
             self._layer_types.add(_layer_type_for(int(ratio)))
 
-        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        max_tokens = self.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
             max_tokens,
             dtype=torch.int32,
@@ -424,6 +428,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc_cpu=query_start_loc_cpu,
             block_table=block_table,
             slot_mapping=slot_mapping,
+            pcp_allgather_restore_idx=(
+                common_attn_metadata.pcp_allgather_restore_idx
+            ),
             is_valid_token=is_valid_token,
             token_to_req_indices=token_to_req_indices,
             decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],

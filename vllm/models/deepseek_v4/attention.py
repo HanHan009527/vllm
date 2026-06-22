@@ -37,7 +37,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -56,6 +56,11 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.utils import (
+    get_pcp_local_indices_after_restore,
+    get_pcp_max_buffer_num_tokens,
+    pcp_allgather_and_restore,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -275,6 +280,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
+        self.pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.pcp_rank = 0
+        if self.pcp_world_size > 1:
+            self.pcp_rank = get_pcp_group().rank_in_group
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
@@ -282,9 +291,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
-        self.max_num_batched_tokens = (
-            vllm_config.scheduler_config.max_num_batched_tokens
-        )
+        self.max_num_batched_tokens = get_pcp_max_buffer_num_tokens(vllm_config)
         self.max_model_len = vllm_config.model_config.max_model_len
 
         # Resolve the kv-cache dtype from this backend's block format (a
@@ -540,6 +547,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             attn_metadata.get(self.swa_cache_layer.prefix),
         )
         assert swa_metadata is not None
+        local_q_indices = None
+        if swa_metadata.pcp_allgather_restore_idx is not None:
+            restore_idx = swa_metadata.pcp_allgather_restore_idx
+            local_q_indices = get_pcp_local_indices_after_restore(
+                q.shape[0],
+                self.pcp_rank,
+                restore_idx,
+            )
+            pcp_group = get_pcp_group()
+            q = pcp_allgather_and_restore(q, q.shape[0], restore_idx, pcp_group)
+            kv = pcp_allgather_and_restore(kv, kv.shape[0], restore_idx, pcp_group)
+            positions = pcp_allgather_and_restore(
+                positions,
+                positions.shape[0],
+                restore_idx,
+                pcp_group,
+            )
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
         # The fused insert ops require int64 position_ids; the runner's positions
@@ -556,7 +580,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -567,6 +591,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
+            if local_q_indices is not None:
+                q = torch.index_select(q, 0, local_q_indices)
+            return q
 
         # FlashInfer full-cache path: the [num_blocks, block_size, 512] cache
         # stores the KV row in its plain dtype (no Q padding). bf16 rewrites q
@@ -585,6 +612,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 block_size,
             )
+            if local_q_indices is not None:
+                q = torch.index_select(q, 0, local_q_indices)
             return q
 
         # per-tensor fp8 (torch.float8_e4m3fn)
@@ -602,6 +631,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
+        if local_q_indices is not None:
+            q_fp8 = torch.index_select(q_fp8, 0, local_q_indices)
         return q_fp8
 
     def get_attn_backend(self) -> type[AttentionBackend]:

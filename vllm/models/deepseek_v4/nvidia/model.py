@@ -66,6 +66,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.utils import get_pcp_max_buffer_num_tokens
 
 _OPTIONAL_SCALE_SUFFIXES = (
     ".weight_scale",
@@ -950,7 +951,7 @@ class DeepseekV4Model(nn.Module):
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            get_pcp_max_buffer_num_tokens(vllm_config),
             config.index_topk,
             dtype=torch.int32,
         )
