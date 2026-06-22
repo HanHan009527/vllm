@@ -744,14 +744,26 @@ def get_config(
         )
         if scale_fmt in ("ue8m0",):
             if skip_auto_enable_e8m0:
-                logger.info_once(
-                    (
-                        "Detected DeepSeek V4 FP8 experts with "
-                        "quantization_config.scale_fmt=%s; not auto-enabling "
-                        "UE8M0 for DeepGEMM."
-                    ),
-                    scale_fmt,
-                )
+                if not envs.is_set("VLLM_USE_DEEP_GEMM_E8M0"):
+                    os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+                    logger.info_once(
+                        (
+                            "Detected DeepSeek V4 FP8 experts with "
+                            "quantization_config.scale_fmt=%s; disabling "
+                            "UE8M0 for DeepGEMM."
+                        ),
+                        scale_fmt,
+                    )
+                elif envs.VLLM_USE_DEEP_GEMM_E8M0:
+                    logger.warning_once(
+                        (
+                            "Detected DeepSeek V4 FP8 experts with "
+                            "quantization_config.scale_fmt=%s, but "
+                            "VLLM_USE_DEEP_GEMM_E8M0=1 is explicitly set; "
+                            "leaving UE8M0 for DeepGEMM enabled."
+                        ),
+                        scale_fmt,
+                    )
             elif not envs.is_set("VLLM_USE_DEEP_GEMM_E8M0"):
                 os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1"
                 logger.info_once(

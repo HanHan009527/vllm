@@ -90,7 +90,9 @@ def test_deepseek_v4_fp8_override_does_not_auto_enable_deepgemm_e8m0(
     A DeepSeek V4 checkpoint may carry ``scale_fmt=ue8m0`` for the FP4 expert
     path on disk while deployment supplies ``expert_dtype=fp8`` via
     ``hf_overrides``. In that case get_config() must not auto-set the global
-    DeepGEMM E8M0 runtime flag before the override is applied.
+    DeepGEMM E8M0 runtime path before the override is applied. Because
+    VLLM_USE_DEEP_GEMM_E8M0 defaults to true, the FP8 expert path must
+    explicitly disable it when the user has not set the environment variable.
     """
 
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
@@ -116,4 +118,4 @@ def test_deepseek_v4_fp8_override_does_not_auto_enable_deepgemm_e8m0(
 
     assert config.expert_dtype == "fp8"
     assert config.quantization_config["scale_fmt"] == "ue8m0"
-    assert "VLLM_USE_DEEP_GEMM_E8M0" not in os.environ
+    assert os.environ["VLLM_USE_DEEP_GEMM_E8M0"] == "0"
