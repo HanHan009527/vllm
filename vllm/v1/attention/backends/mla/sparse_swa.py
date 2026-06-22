@@ -418,6 +418,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            common_attn_metadata.pcp_allgather_restore_idx is not None,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -491,6 +492,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        pcp_enabled: bool,
     ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
@@ -505,7 +507,6 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
             assert seq_lens_cpu is not None
-            pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
             if pcp_enabled:
                 pfx_gather_lens = seq_lens[num_decodes:].contiguous()
                 pfx_gather_lens_cpu = seq_lens_cpu[num_decodes:].to(
