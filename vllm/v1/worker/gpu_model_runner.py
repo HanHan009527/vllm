@@ -136,6 +136,7 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
     get_cp_local_seq_lens,
+    pcp_allgather_and_restore,
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
@@ -3921,6 +3922,23 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _maybe_restore_pcp_hidden_states_for_logits(
+        self,
+        hidden_states: torch.Tensor,
+        num_local_tokens: int,
+    ) -> torch.Tensor:
+        if self.pcp_world_size <= 1:
+            return hidden_states
+
+        pcp_full_tokens = num_local_tokens * self.pcp_world_size
+        restore_idx = self.pcp_manager.pcp_allgather_restore_idx.gpu[:pcp_full_tokens]
+        return pcp_allgather_and_restore(
+            hidden_states,
+            num_local_tokens,
+            restore_idx,
+            get_pcp_group(),
+        )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4539,12 +4557,20 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
+                hidden_states = self._maybe_restore_pcp_hidden_states_for_logits(
+                    hidden_states,
+                    num_scheduled_tokens,
+                )
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
+                hidden_states = self._maybe_restore_pcp_hidden_states_for_logits(
+                    hidden_states,
+                    num_scheduled_tokens,
+                )
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
