@@ -9,6 +9,7 @@ from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
+    combine_topk_swa_indices_with_positions,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
@@ -323,19 +324,36 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
-                self.compress_ratio,
-                top_k,
-                chunk_M,
-                chunk_N,
-            )
+            chunk_query_start_loc = query_start_loc[
+                num_decodes + chunk_start : num_decodes + chunk_end + 1
+            ]
+            if swa_metadata.pcp_allgather_restore_idx is not None:
+                combined_indices, combined_lens = (
+                    combine_topk_swa_indices_with_positions(
+                        topk_indices[query_start:query_end],
+                        positions[query_start:query_end],
+                        chunk_query_start_loc,
+                        seq_lens[chunk_start:chunk_end],
+                        gather_lens[chunk_start:chunk_end],
+                        self.window_size,
+                        self.compress_ratio,
+                        top_k,
+                        chunk_M,
+                        chunk_N,
+                    )
+                )
+            else:
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    chunk_query_start_loc,
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    chunk_M,
+                    chunk_N,
+                )
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
@@ -345,3 +363,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
             )
+            if swa_metadata.pcp_allgather_restore_idx is not None:
+                chunk_output = output[query_start:query_end]
+                chunk_output[combined_lens == 0] = 0

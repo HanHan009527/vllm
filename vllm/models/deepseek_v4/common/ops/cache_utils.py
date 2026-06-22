@@ -521,6 +521,56 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
+def combine_topk_swa_indices_with_positions(
+    topk_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+
+    NUM_WORKERS = 128
+    _combine_topk_swa_indices_with_positions_kernel[(num_reqs, NUM_WORKERS)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        query_positions,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        TOP_K=topk,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+    )
+    return combined_indices, combined_lens
+
+
 @triton.jit
 def _combine_topk_swa_indices_kernel(
     combined_indices_ptr,
@@ -581,6 +631,68 @@ def _combine_topk_swa_indices_kernel(
         # Index into gathered buffer: N + (position - gather_start)
         # For positions [pos - swa_len + 1, pos], the buffer indices are:
         # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
+        tl.store(
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + topk_len
+            + offset,
+            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+            mask=offset < swa_len,
+        )
+
+        combined_len = topk_len + swa_len
+        tl.store(combined_lens_ptr + token_idx, combined_len)
+
+
+@triton.jit
+def _combine_topk_swa_indices_with_positions_kernel(
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_positions_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    M,
+    N,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    gather_start = seq_len - gather_len
+
+    for token_idx in range(query_start + worker_id, query_end, num_workers):
+        pos = tl.load(query_positions_ptr + token_idx)
+        token_valid = (pos >= gather_start) & (pos < seq_len)
+        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+        topk_len = tl.where(token_valid, topk_len, 0)
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        swa_len = tl.where(token_valid, swa_len, 0)
+
+        offset = tl.arange(0, PADDED_TOP_K)
+        mask = offset < topk_len
+        topk_indices = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=mask,
+        )
+        tl.store(
+            combined_indices_ptr + token_idx * combined_indices_stride + offset,
+            topk_indices + M * batch_idx,
+            mask=mask,
+        )
+        offset = tl.arange(0, WINDOW_SIZE)
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride

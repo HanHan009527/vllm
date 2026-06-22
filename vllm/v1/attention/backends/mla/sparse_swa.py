@@ -178,6 +178,7 @@ class DeepseekSparseSWAMetadata:
     prefill_seq_lens: torch.Tensor | None = None
     prefill_seq_lens_cpu: torch.Tensor | None = None
     prefill_gather_lens: torch.Tensor | None = None
+    prefill_gather_lens_cpu: torch.Tensor | None = None
     prefill_query_lens_cpu: torch.Tensor | None = None
     prefill_window_size: int = 0
     prefill_max_model_len: int = 0
@@ -236,6 +237,9 @@ class DeepseekSparseSWAMetadata:
         )
 
         chunk_plan: list[tuple[int, int, int, int]] = []
+        if self.prefill_gather_lens_cpu is not None:
+            gather_lens_cpu = self.prefill_gather_lens_cpu
+
         chunk_start = 0
         while chunk_start < self.num_prefills:
             chunk_max_compressed = int(compressed_lens_cpu[chunk_start].item())
@@ -501,22 +505,31 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
             assert seq_lens_cpu is not None
-            pfx_gather_lens = torch.empty(
-                num_prefills, dtype=torch.int32, device=seq_lens.device
-            )
-            _compute_prefill_metadata_kernel[(1,)](
-                pfx_gather_lens,
-                seq_lens,
-                query_start_loc,
-                num_prefills,
-                num_decodes,
-                self.window_size,
-                BLOCK_SIZE=triton.next_power_of_2(num_prefills),
-            )
+            pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
+            if pcp_enabled:
+                pfx_gather_lens = seq_lens[num_decodes:].contiguous()
+                pfx_gather_lens_cpu = seq_lens_cpu[num_decodes:].to(
+                    dtype=torch.int32
+                )
+            else:
+                pfx_gather_lens = torch.empty(
+                    num_prefills, dtype=torch.int32, device=seq_lens.device
+                )
+                _compute_prefill_metadata_kernel[(1,)](
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                    BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+                )
+                pfx_gather_lens_cpu = None
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
             result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_gather_lens_cpu"] = pfx_gather_lens_cpu
             result["prefill_query_lens_cpu"] = (
                 query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
                 - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
