@@ -3,6 +3,7 @@
 """Test that hf_overrides model_type returns the correct config class."""
 
 import json
+import os
 import tempfile
 
 from transformers import PretrainedConfig
@@ -79,3 +80,40 @@ def test_hf_overrides_model_type_returns_correct_config_class():
         from transformers import AutoConfig, MixtralConfig
 
         AutoConfig.register("mixtral", MixtralConfig, exist_ok=True)
+
+
+def test_deepseek_v4_fp8_override_does_not_auto_enable_deepgemm_e8m0(
+    monkeypatch,
+):
+    """FP8 expert checkpoints keep float32 checkpoint scales.
+
+    A DeepSeek V4 checkpoint may carry ``scale_fmt=ue8m0`` for the FP4 expert
+    path on disk while deployment supplies ``expert_dtype=fp8`` via
+    ``hf_overrides``. In that case get_config() must not auto-set the global
+    DeepGEMM E8M0 runtime flag before the override is applied.
+    """
+
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = {
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "quantization_config": {
+                "quant_method": "fp8",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+            },
+        }
+        with open(f"{tmpdir}/config.json", "w") as f:
+            json.dump(cfg, f)
+
+        config = get_config(
+            tmpdir,
+            trust_remote_code=False,
+            hf_overrides_kw={"expert_dtype": "fp8"},
+        )
+
+    assert config.expert_dtype == "fp8"
+    assert config.quantization_config["scale_fmt"] == "ue8m0"
+    assert "VLLM_USE_DEEP_GEMM_E8M0" not in os.environ

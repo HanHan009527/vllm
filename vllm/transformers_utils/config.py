@@ -735,8 +735,24 @@ def get_config(
         config.quantization_config = quantization_config
         # auto-enable DeepGEMM UE8M0 if model config requests it
         scale_fmt = quantization_config.get("scale_fmt", None)
+        expert_dtype = getattr(config, "expert_dtype", None)
+        if hf_overrides_kw:
+            expert_dtype = hf_overrides_kw.get("expert_dtype", expert_dtype)
+        skip_auto_enable_e8m0 = (
+            getattr(config, "model_type", None) == "deepseek_v4"
+            and expert_dtype == "fp8"
+        )
         if scale_fmt in ("ue8m0",):
-            if not envs.is_set("VLLM_USE_DEEP_GEMM_E8M0"):
+            if skip_auto_enable_e8m0:
+                logger.info_once(
+                    (
+                        "Detected DeepSeek V4 FP8 experts with "
+                        "quantization_config.scale_fmt=%s; not auto-enabling "
+                        "UE8M0 for DeepGEMM."
+                    ),
+                    scale_fmt,
+                )
+            elif not envs.is_set("VLLM_USE_DEEP_GEMM_E8M0"):
                 os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1"
                 logger.info_once(
                     (
