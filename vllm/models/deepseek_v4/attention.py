@@ -379,19 +379,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         o = o_padded[:, : self.n_local_heads, :]
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
+        row_finite = None
+        row_amax = None
         if envs.VLLM_DSV4_NONFINITE_DIAG:
             o_flat = o.flatten(1)
             row_finite = torch.isfinite(o_flat).all(dim=1)
             row_amax = torch.amax(torch.abs(o_flat.float()), dim=1)
-            logger.error(
-                "DeepSeek V4 before o_proj at %s: positions=%s "
-                "row_finite=%s row_zero=%s row_amax=%s",
-                self.prefix,
-                positions[: o.shape[0]].detach().cpu().tolist(),
-                row_finite.detach().cpu().tolist(),
-                (row_amax == 0).detach().cpu().tolist(),
-                row_amax.detach().cpu().tolist(),
-            )
+            if not row_finite.all():
+                bad_input_rows = torch.nonzero(
+                    ~row_finite, as_tuple=False
+                ).flatten()
+                logger.error(
+                    "DeepSeek V4 before o_proj non-finite at %s: "
+                    "bad_rows=%s bad_positions=%s",
+                    self.prefix,
+                    bad_input_rows.detach().cpu().tolist(),
+                    positions[: o.shape[0]]
+                    .index_select(0, bad_input_rows)
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                )
         projected = self._o_proj(o, positions)
         if envs.VLLM_DSV4_NONFINITE_DIAG:
             projected_flat = projected.flatten(1)
@@ -400,9 +408,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 bad_rows = torch.nonzero(
                     ~projected_finite, as_tuple=False
                 ).flatten()
+                assert row_finite is not None
+                assert row_amax is not None
                 logger.error(
                     "DeepSeek V4 o_proj output non-finite at %s: "
-                    "bad_rows=%s bad_positions=%s row_finite=%s",
+                    "bad_rows=%s bad_positions=%s input_row_finite=%s "
+                    "input_row_zero=%s input_row_amax=%s",
                     self.prefix,
                     bad_rows.detach().cpu().tolist(),
                     positions[: projected.shape[0]]
@@ -410,7 +421,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     .detach()
                     .cpu()
                     .tolist(),
-                    projected_finite.detach().cpu().tolist(),
+                    row_finite.index_select(0, bad_rows).detach().cpu().tolist(),
+                    (row_amax.index_select(0, bad_rows) == 0)
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                    row_amax.index_select(0, bad_rows).detach().cpu().tolist(),
                 )
         return projected
 

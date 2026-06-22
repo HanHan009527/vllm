@@ -381,6 +381,11 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             assert seq_lens_cpu is not None
             seq_lens = common_attn_metadata.seq_lens
+            if common_attn_metadata.pcp_allgather_restore_idx is not None:
+                assert common_attn_metadata.pcp_full_seq_lens is not None
+                assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+                seq_lens = common_attn_metadata.pcp_full_seq_lens
+                seq_lens_cpu = common_attn_metadata.pcp_full_seq_lens_cpu
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
             prefill_seq_lens_cpu = seq_lens_cpu[num_decodes:]

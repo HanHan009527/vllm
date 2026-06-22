@@ -481,6 +481,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
+        pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
+        prefill_seq_lens = seq_lens
+        prefill_seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+        if pcp_enabled:
+            assert common_attn_metadata.pcp_full_seq_lens is not None
+            assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+            prefill_seq_lens = common_attn_metadata.pcp_full_seq_lens
+            prefill_seq_lens_cpu = common_attn_metadata.pcp_full_seq_lens_cpu
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
@@ -506,18 +514,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.compressed_slot_mapping_buffer,
             )
             compressed_seq_lens = seq_lens // self.compress_ratio
+        prefill_compressed_seq_lens = prefill_seq_lens
+        if self.compress_ratio > 1:
+            prefill_compressed_seq_lens = prefill_seq_lens // self.compress_ratio
 
         prefill_metadata = None
         if num_prefills > 0:
             # This CPU value is an upper bound for async-spec extend rows.  It
             # is safe for chunking/allocation because CUDA metadata below is
             # built from exact device seq_lens and gather ignores the tail.
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            assert prefill_seq_lens_cpu is not None
             compressed_seq_lens_cpu = (
-                seq_lens_cpu // self.compress_ratio
+                prefill_seq_lens_cpu // self.compress_ratio
                 if self.compress_ratio > 1
-                else seq_lens_cpu
+                else prefill_seq_lens_cpu
             )
             prefill_query_lens_cpu = torch.diff(
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
@@ -525,8 +535,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
             # Upper bound is exact for prefill rows (the `[num_decodes:]`
             # slice below).
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             chunk_specs = split_indexer_prefill_chunks(
                 compressed_seq_lens_cpu[num_decodes:],
                 prefill_query_lens_cpu,
@@ -542,8 +550,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     req_slice.stop,
                     query_start_loc,
                     query_start_loc_cpu,
-                    seq_lens,
-                    compressed_seq_lens,
+                    prefill_seq_lens,
+                    prefill_compressed_seq_lens,
                     compressed_seq_lens_cpu,
                     common_attn_metadata.block_table_tensor,
                     self.compress_ratio,
