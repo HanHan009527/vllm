@@ -210,6 +210,15 @@ class FakeWoB(nn.Module):
         return x + 1
 
 
+class FakeCachedWoB(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._fp8_weight_bf16 = torch.eye(2, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        raise AssertionError("cached BF16 weight should bypass wo_b.forward")
+
+
 def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_without_scale():
     wo_b = FakeWoB()
     out = deep_gemm_fp8_o_proj(
@@ -232,6 +241,26 @@ def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_without_scale():
         wo_b.input, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
     )
     torch.testing.assert_close(out, torch.tensor([[2.0, 3.0]], dtype=torch.bfloat16))
+
+
+def test_deep_gemm_fp8_o_proj_force_bf16_uses_cached_wo_b():
+    out = deep_gemm_fp8_o_proj(
+        torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+        torch.tensor([0], dtype=torch.long),
+        torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        FakeSingleGroupWoA(),
+        FakeCachedWoB(),
+        n_groups=1,
+        heads_per_group=1,
+        nope_dim=2,
+        rope_dim=2,
+        o_lora_rank=2,
+        einsum_recipe=(1, 128, 128),
+        tma_aligned_scales=False,
+        force_bf16=True,
+    )
+
+    torch.testing.assert_close(out, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16))
 
 
 class FakePerTensorScaleWoA(FakeSingleGroupWoA):

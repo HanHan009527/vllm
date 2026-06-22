@@ -442,17 +442,23 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             layer.input_scale = None
 
-        if self.block_quant and getattr(layer, "is_bmm", False):
+        cache_bf16_weight = getattr(layer, "is_bmm", False) or getattr(
+            layer, "cache_bf16_weight", False
+        )
+        if self.block_quant and cache_bf16_weight:
             weight_scale = getattr(layer, "weight_scale_inv", None)
             if weight_scale is None:
                 weight_scale = getattr(layer, "weight_scale", None)
             if weight_scale is not None:
                 assert self.weight_block_size is not None
-                layer._fp8_bmm_weight_bf16 = dequantize_fp8_block_weight(
+                bf16_weight = dequantize_fp8_block_weight(
                     layer.weight,
                     weight_scale,
                     self.weight_block_size,
                 ).to(torch.bfloat16)
+                layer._fp8_weight_bf16 = bf16_weight
+                if getattr(layer, "is_bmm", False):
+                    layer._fp8_bmm_weight_bf16 = bf16_weight
 
         self.fp8_linear.process_weights_after_loading(layer)
 

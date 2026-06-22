@@ -244,6 +244,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
+        self.wo_b.cache_bf16_weight = True
 
         # Initialize rotary embedding before the indexer/compressor consume it.
         self.rotary_emb = build_deepseek_v4_rope(

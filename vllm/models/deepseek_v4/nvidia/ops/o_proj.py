@@ -22,6 +22,13 @@ def maybe_unpack_linear_output(
     return output
 
 
+def apply_bf16_linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    weight = getattr(layer, "_fp8_weight_bf16", None)
+    if weight is None:
+        return maybe_unpack_linear_output(layer(x))
+    return torch.nn.functional.linear(x, weight.to(dtype=x.dtype))
+
+
 def inv_rope_bf16_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -145,7 +152,7 @@ def deep_gemm_fp8_o_proj(
             rope_dim=rope_dim,
             o_lora_rank=o_lora_rank,
         )
-        return wo_b(z.flatten(1))
+        return apply_bf16_linear(wo_b, z.flatten(1))
 
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
