@@ -80,3 +80,24 @@ def test_deepseek_v4_mapper_keeps_inverse_expert_scales_without_ue8m0():
         mapper._map_name("layers.0.ffn.experts.0.w1.scale")
         == "model.layers.0.ffn.experts.0.w1.weight_scale_inv"
     )
+
+
+def test_deepseek_v4_nonfinite_diag_disabled(monkeypatch):
+    monkeypatch.setattr(deepseek_v4_model.envs, "VLLM_DSV4_NONFINITE_DIAG", False)
+
+    deepseek_v4_model._dsv4_check_finite(
+        "stage", torch.tensor([float("nan")], dtype=torch.float32)
+    )
+
+
+def test_deepseek_v4_nonfinite_diag_reports_stage(monkeypatch):
+    monkeypatch.setattr(deepseek_v4_model.envs, "VLLM_DSV4_NONFINITE_DIAG", True)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"stage-x: shape=\\(3,\\).*bad_count=2",
+    ):
+        deepseek_v4_model._dsv4_check_finite(
+            "stage-x",
+            torch.tensor([1.0, float("nan"), float("inf")], dtype=torch.float32),
+        )

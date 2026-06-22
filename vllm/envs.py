@@ -244,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_V2_PREFER_OVERLAP: bool = False
     VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION: bool = False
     VLLM_DBO_COMM_SMS: int = 20
+    VLLM_DSV4_NONFINITE_DIAG: bool = False
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
@@ -696,6 +697,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # Debug DeepSeek V4 runtime NaN/Inf by failing at layer/logit boundaries.
+    "VLLM_DSV4_NONFINITE_DIAG": lambda: bool(
+        int(os.environ.get("VLLM_DSV4_NONFINITE_DIAG", "0"))
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

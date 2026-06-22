@@ -8,6 +8,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -74,6 +75,20 @@ _OPTIONAL_SCALE_SUFFIXES = (
     "_weight_scale_inv",
     "_input_scale",
 )
+
+
+def _dsv4_check_finite(stage: str, tensor: torch.Tensor | None) -> None:
+    if not envs.VLLM_DSV4_NONFINITE_DIAG or tensor is None:
+        return
+    finite = torch.isfinite(tensor)
+    if finite.all():
+        return
+    bad_count = int((~finite).sum().item())
+    raise RuntimeError(
+        "DeepSeek V4 non-finite tensor detected at "
+        f"{stage}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} bad_count={bad_count}"
+    )
 
 
 class DeepseekV4MLP(nn.Module):
@@ -846,6 +861,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
             )
+            _dsv4_check_finite(
+                f"{self.__class__.__name__}.{self.attn.prefix}.mhc_pre", x
+            )
         else:
             residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
                 x,
@@ -865,9 +883,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
             )
+            _dsv4_check_finite(
+                f"{self.__class__.__name__}.{self.attn.prefix}.mhc_attn_post_pre", x
+            )
 
         # attn_norm is fused into mhc_pre_tilelang / mhc_fused_post_pre above.
         x = self.attn(positions, x, None)
+        _dsv4_check_finite(f"{self.__class__.__name__}.{self.attn.prefix}.attn", x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -889,8 +911,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
         )
+        _dsv4_check_finite(
+            f"{self.__class__.__name__}.{self.attn.prefix}.mhc_ffn_post_pre", x
+        )
 
         x = self.ffn(x, input_ids)
+        _dsv4_check_finite(f"{self.__class__.__name__}.{self.ffn.prefix}.ffn", x)
         return x, residual, post_mix, res_mix
 
 
@@ -1342,6 +1368,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        _dsv4_check_finite("DeepseekV4ForCausalLM.compute_logits", logits)
         return logits
 
     def forward(
