@@ -71,6 +71,23 @@ def test_pcp_manager_dual_chunk_swap_positions_rank0():
         ),
     )
     np.testing.assert_array_equal(
+        manager.pcp_local_unpad_mask_cpu[:9],
+        np.array(
+            [
+                True,
+                True,
+                True,
+                False,
+                False,
+                True,
+                True,
+                True,
+                True,
+            ],
+            dtype=np.bool_,
+        ),
+    )
+    np.testing.assert_array_equal(
         manager.pcp_allgather_restore_idx.cpu[:18].numpy(),
         np.array([0, 9, 1, 2, 10, 11, 12, 13, 3, 4, 5, 6, 14, 15, 16, 17, 7, 8]),
     )
@@ -97,6 +114,23 @@ def test_pcp_manager_dual_chunk_swap_positions_rank1():
     np.testing.assert_array_equal(pcp_tokens, np.array([1, 4, 4], dtype=np.int32))
     np.testing.assert_array_equal(
         positions, np.array([0, 2, 3, 4, 5, 2, 3, 4, 5], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(
+        manager.pcp_local_unpad_mask_cpu[:9],
+        np.array(
+            [
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+                True,
+            ],
+            dtype=np.bool_,
+        ),
     )
 
 

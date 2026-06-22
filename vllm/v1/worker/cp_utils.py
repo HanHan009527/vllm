@@ -67,6 +67,17 @@ class PCPManager:
         self.pcp_unpad_mask_cpu_tensor = self.pcp_unpad_mask.cpu
         self.pcp_unpad_mask_gpu_tensor = self.pcp_unpad_mask.gpu
         self.pcp_unpad_mask_cpu = self.pcp_unpad_mask_cpu_tensor.numpy()
+        self.pcp_local_unpad_mask = CpuGpuBuffer(
+            (max_buffer_num_tokens,),
+            dtype=torch.bool,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        self.pcp_local_unpad_mask_cpu_tensor = self.pcp_local_unpad_mask.cpu
+        self.pcp_local_unpad_mask_gpu_tensor = self.pcp_local_unpad_mask.gpu
+        self.pcp_local_unpad_mask_cpu = (
+            self.pcp_local_unpad_mask_cpu_tensor.numpy()
+        )
 
     @staticmethod
     def _get_cumsum_and_arange(
@@ -165,6 +176,11 @@ class PCPManager:
             positions[:num_decode_tokens] = self._get_cumsum_and_arange(
                 tokens[:num_decode_reqs], arange_np
             )[1]
+        num_local_tokens = positions.shape[0]
+        self.pcp_local_unpad_mask_cpu[:num_local_tokens] = (
+            positions < np.repeat(tokens, pcp_tokens)
+        )
+        self.pcp_local_unpad_mask.copy_to_gpu(num_local_tokens)
 
         padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
         padded_pos_start_loc[0] = 0

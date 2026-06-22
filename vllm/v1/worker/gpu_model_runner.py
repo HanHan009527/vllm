@@ -2198,12 +2198,17 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        if self.pcp_world_size == 1:
-            self.input_batch.block_table.compute_slot_mapping(
-                num_reqs,
-                self.query_start_loc.gpu[: num_reqs + 1],
-                self.positions[:total_num_scheduled_tokens],
+        if self.pcp_world_size > 1:
+            self.positions[:total_num_scheduled_tokens].copy_(
+                torch.from_numpy(positions_np).to(
+                    self.device, dtype=torch.int64, non_blocking=True
+                )
             )
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            self.positions[:total_num_scheduled_tokens],
+        )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -4107,19 +4112,34 @@ class GPUModelRunner(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 if self.pcp_world_size > 1 and use_pcp_slot_mapping:
                     pcp_full_tokens = num_tokens_unpadded * self.pcp_world_size
-                    pcp_num_pads = np.sum(
-                        self.pcp_manager.num_pcp_pads_cpu[
-                            : self.input_batch.num_reqs
-                        ]
-                    )
-                    pcp_unpadded_tokens = pcp_full_tokens - int(pcp_num_pads)
                     slot_mapping = self.pcp_manager.pcp_padded_slot_mapping[
                         :pcp_full_tokens
                     ]
-                    slot_mapping.fill_(-1)
-                    slot_mapping[
-                        self.pcp_manager.pcp_unpad_mask_gpu_tensor[:pcp_full_tokens]
-                    ] = blk_table.slot_mapping.gpu[:pcp_unpadded_tokens]
+                    restore_idx = (
+                        self.pcp_manager.pcp_allgather_restore_idx.gpu[
+                            :pcp_full_tokens
+                        ]
+                    )
+                    pcp_group = get_pcp_group()
+                    gathered_slot_mapping = pcp_group.all_gather(
+                        blk_table.slot_mapping.gpu[
+                            :num_tokens_unpadded
+                        ].contiguous(),
+                        dim=0,
+                    )
+                    torch.index_select(
+                        gathered_slot_mapping, 0, restore_idx, out=slot_mapping
+                    )
+                    gathered_valid_mask = pcp_group.all_gather(
+                        self.pcp_manager.pcp_local_unpad_mask_gpu_tensor[
+                            :num_tokens_unpadded
+                        ].contiguous(),
+                        dim=0,
+                    )
+                    valid_mask = torch.index_select(
+                        gathered_valid_mask, 0, restore_idx
+                    )
+                    slot_mapping[~valid_mask] = -1
                     return slot_mapping
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
