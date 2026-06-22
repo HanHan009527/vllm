@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.transformers_utils.utils import parse_safetensors_file_metadata
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -12,6 +16,14 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+_DEEPSEEK_V4_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+_DEEPSEEK_V4_SAFETENSORS_INDEX_FILES = (
+    "model.safetensors.index.json",
+    "consolidated.safetensors.index.json",
+)
 
 
 class VerifyAndUpdateConfig:
@@ -107,27 +119,136 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
 class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
-    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        if quant_config is not None and quant_config.get("quant_method") == "fp8":
-            model_type = getattr(model_config.hf_config, "model_type", None)
-            if model_type == "deepseek_v4":
-                model_config.hf_config.quantization_config["quant_method"] = (
-                    "deepseek_v4_fp8"
-                )
-
-        hf_text_quant_config = getattr(
-            model_config.hf_text_config, "quantization_config", None
-        )
+    def _set_deepseek_v4_quant_method(config: "PretrainedConfig") -> None:
+        quant_config = getattr(config, "quantization_config", None)
         if (
-            hf_text_quant_config is not None
-            and hf_text_quant_config.get("quant_method") == "fp8"
+            quant_config is not None
+            and quant_config.get("quant_method") == "fp8"
+            and getattr(config, "model_type", None) == "deepseek_v4"
         ):
-            model_type = getattr(model_config.hf_text_config, "model_type", None)
-            if model_type == "deepseek_v4":
-                model_config.hf_text_config.quantization_config["quant_method"] = (
-                    "deepseek_v4_fp8"
+            quant_config["quant_method"] = "deepseek_v4_fp8"
+
+    @staticmethod
+    def _read_routed_expert_dtype(
+        shard_path: Path,
+        target_key: str | None = None,
+    ) -> str | None:
+        metadata = parse_safetensors_file_metadata(shard_path)
+
+        if target_key is not None:
+            tensor_metadata = metadata.get(target_key)
+            if isinstance(tensor_metadata, dict):
+                return tensor_metadata.get("dtype")
+            return None
+
+        for key, tensor_metadata in metadata.items():
+            if key == "__metadata__" or not isinstance(tensor_metadata, dict):
+                continue
+            if _DEEPSEEK_V4_ROUTED_EXPERT_KEY_RE.search(key):
+                return tensor_metadata.get("dtype")
+        return None
+
+    @staticmethod
+    def _expert_dtype_from_safetensors_dtype(dtype: str | None) -> str | None:
+        if dtype is None:
+            return None
+        if dtype.startswith("F8_"):
+            return "fp8"
+        if dtype in ("U8", "I8") or dtype.startswith("F4"):
+            return "fp4"
+        logger.warning_once(
+            "Unexpected DeepSeek V4 routed expert safetensors dtype=%s; "
+            "keeping existing expert_dtype behavior.",
+            dtype,
+        )
+        return None
+
+    @classmethod
+    def _probe_routed_expert_dtype(cls, model: str) -> str | None:
+        model_path = Path(model)
+        if not model_path.is_dir():
+            return None
+
+        for index_name in _DEEPSEEK_V4_SAFETENSORS_INDEX_FILES:
+            index_path = model_path / index_name
+            if not index_path.is_file():
+                continue
+            try:
+                index = json.loads(index_path.read_text())
+            except Exception as exc:
+                logger.warning_once(
+                    "Failed to read DeepSeek V4 safetensors index %s: %s",
+                    index_path,
+                    exc,
                 )
+                return None
+
+            weight_map = index.get("weight_map", {}) or {}
+            for key, shard_name in weight_map.items():
+                if not _DEEPSEEK_V4_ROUTED_EXPERT_KEY_RE.search(key):
+                    continue
+                try:
+                    dtype = cls._read_routed_expert_dtype(
+                        model_path / shard_name,
+                        target_key=key,
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "Failed to read DeepSeek V4 routed expert metadata "
+                        "from %s: %s",
+                        model_path / shard_name,
+                        exc,
+                    )
+                    return None
+                return cls._expert_dtype_from_safetensors_dtype(dtype)
+            return None
+
+        for shard_path in sorted(model_path.glob("*.safetensors")):
+            try:
+                dtype = cls._read_routed_expert_dtype(shard_path)
+            except Exception as exc:
+                logger.warning_once(
+                    "Failed to read DeepSeek V4 routed expert metadata "
+                    "from %s: %s",
+                    shard_path,
+                    exc,
+                )
+                return None
+            expert_dtype = cls._expert_dtype_from_safetensors_dtype(dtype)
+            if expert_dtype is not None:
+                return expert_dtype
+        return None
+
+    @classmethod
+    def _maybe_set_expert_dtype(cls, model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        if getattr(hf_config, "model_type", None) != "deepseek_v4":
+            return
+        if getattr(hf_config, "expert_dtype", None) in ("fp4", "fp8"):
+            return
+
+        expert_dtype = cls._probe_routed_expert_dtype(model_config.model)
+        if expert_dtype is None:
+            return
+
+        hf_config.expert_dtype = expert_dtype
+        if getattr(model_config.hf_text_config, "model_type", None) == "deepseek_v4":
+            model_config.hf_text_config.expert_dtype = expert_dtype
+        logger.info_once(
+            "Auto-detected DeepSeek V4 routed expert dtype as %r from "
+            "safetensors metadata.",
+            expert_dtype,
+        )
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        DeepseekV4ForCausalLMConfig._set_deepseek_v4_quant_method(
+            model_config.hf_config
+        )
+        DeepseekV4ForCausalLMConfig._set_deepseek_v4_quant_method(
+            model_config.hf_text_config
+        )
+        DeepseekV4ForCausalLMConfig._maybe_set_expert_dtype(model_config)
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
