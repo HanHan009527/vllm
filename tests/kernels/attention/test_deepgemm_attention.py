@@ -96,7 +96,8 @@ def _ref_fp8_mqa_logits(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
 @pytest.mark.parametrize("clean_logits", [True, False])
-def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
+@pytest.mark.parametrize("kv_use_ue8m0", [False, True])
+def test_deepgemm_fp8_mqa_logits(clean_logits: bool, kv_use_ue8m0: bool):
     torch.manual_seed(0)
     random.seed(0)
     num_heads, head_dim = 32, 128
@@ -126,7 +127,7 @@ def test_deepgemm_fp8_mqa_logits(clean_logits: bool):
                     ks, ke = _generate_cp_test_data(seq_len, seq_len_kv)
 
                 q_fp8 = q.to(torch.float8_e4m3fn)
-                kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+                kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), kv_use_ue8m0)
                 logits = fp8_fp4_mqa_logits(
                     (q_fp8, None), kv_fp8, weights, ks, ke, clean_logits=clean_logits
                 )
