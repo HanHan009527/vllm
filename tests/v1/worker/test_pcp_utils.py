@@ -123,7 +123,7 @@ def test_pcp_manager_dual_chunk_swap_positions_rank1():
                 True,
                 True,
                 True,
-                True,
+                False,
                 True,
                 True,
                 True,
