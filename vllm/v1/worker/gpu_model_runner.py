@@ -4066,6 +4066,7 @@ class GPUModelRunner(
         num_reqs_padded: int,
         num_tokens_unpadded: int,
         ubatch_slices: "UBatchSlices | None" = None,
+        use_pcp_slot_mapping: bool = True,
     ) -> tuple[
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
@@ -4104,7 +4105,7 @@ class GPUModelRunner(
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
-                if self.pcp_world_size > 1:
+                if self.pcp_world_size > 1 and use_pcp_slot_mapping:
                     pcp_full_tokens = num_tokens_unpadded * self.pcp_world_size
                     pcp_num_pads = np.sum(
                         self.pcp_manager.num_pcp_pads_cpu[
@@ -5936,6 +5937,7 @@ class GPUModelRunner(
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
+            use_pcp_slot_mapping=False,
         )
 
         # Dummy runs have no real slot assignments — fill with -1 so
