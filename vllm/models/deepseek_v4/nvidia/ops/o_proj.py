@@ -1,11 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import os
+
 import torch
 import torch.nn as nn
 
 from vllm.models.deepseek_v4.common.ops import fused_inv_rope_fp8_quant
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+
+logger = logging.getLogger(__name__)
+
+
+def dsv4_nonfinite_diag_enabled() -> bool:
+    return os.environ.get("VLLM_DSV4_NONFINITE_DIAG") == "1"
+
+
+def tensor_diag_summary(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "none"
+    detached = tensor.detach()
+    is_finite = torch.isfinite(detached)
+    safe_abs = torch.nan_to_num(
+        detached.float().abs(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    return (
+        f"shape={tuple(detached.shape)} dtype={detached.dtype} "
+        f"bad_count={(~is_finite).sum().item()} "
+        f"finite={bool(is_finite.all().item())} "
+        f"safe_amax={safe_abs.max().item() if safe_abs.numel() else 0.0}"
+    )
+
+
+def log_nonfinite_tensor(label: str, tensor: torch.Tensor, **extra: str) -> None:
+    if not dsv4_nonfinite_diag_enabled():
+        return
+    if torch.isfinite(tensor).all():
+        return
+    extras = " ".join(f"{key}={value}" for key, value in extra.items())
+    logger.error(
+        "DeepSeek V4 o_proj BF16 fallback non-finite %s: %s %s",
+        label,
+        tensor_diag_summary(tensor),
+        extras,
+    )
 
 
 def get_fp8_weight_scale(layer: nn.Module) -> torch.Tensor | None:
@@ -25,8 +64,22 @@ def maybe_unpack_linear_output(
 def apply_bf16_linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     weight = getattr(layer, "_fp8_weight_bf16", None)
     if weight is None:
-        return maybe_unpack_linear_output(layer(x))
-    return torch.nn.functional.linear(x, weight.to(dtype=x.dtype))
+        out = maybe_unpack_linear_output(layer(x))
+        log_nonfinite_tensor(
+            "wo_b_forward_output",
+            out,
+            input=tensor_diag_summary(x),
+            cached_weight="missing",
+        )
+        return out
+    out = torch.nn.functional.linear(x, weight.to(dtype=x.dtype))
+    log_nonfinite_tensor(
+        "wo_b_bf16_linear_output",
+        out,
+        input=tensor_diag_summary(x),
+        cached_weight=tensor_diag_summary(weight),
+    )
+    return out
 
 
 def inv_rope_bf16_o_proj(
@@ -98,9 +151,23 @@ def inv_rope_bf16_o_proj(
             grouped_weight = wo_a_weight.reshape(
                 wo_a_groups, o_lora_rank, wo_a_input_size
             ).to(dtype=wo_a_input.dtype)
-            return torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
+            out = torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
+            log_nonfinite_tensor(
+                "wo_a_bf16_einsum_output",
+                out,
+                input=tensor_diag_summary(wo_a_input),
+                cached_weight=tensor_diag_summary(wo_a_weight),
+            )
+            return out
 
-    return maybe_unpack_linear_output(wo_a(wo_a_input))
+    out = maybe_unpack_linear_output(wo_a(wo_a_input))
+    log_nonfinite_tensor(
+        "wo_a_forward_output",
+        out,
+        input=tensor_diag_summary(wo_a_input),
+        cached_weight="missing_or_unusable",
+    )
+    return out
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -151,6 +218,14 @@ def deep_gemm_fp8_o_proj(
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             o_lora_rank=o_lora_rank,
+        )
+        log_nonfinite_tensor(
+            "wo_a_output_z",
+            z,
+            wo_a_cache=tensor_diag_summary(
+                getattr(wo_a, "_fp8_bmm_weight_bf16", None)
+            ),
+            wo_b_cache=tensor_diag_summary(getattr(wo_b, "_fp8_weight_bf16", None)),
         )
         return apply_bf16_linear(wo_b, z.flatten(1))
 
