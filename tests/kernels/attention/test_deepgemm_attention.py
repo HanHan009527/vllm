@@ -18,12 +18,13 @@ from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
 
 
-def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+def kv_cache_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool = False) -> torch.Tensor:
     # x: (num_blocks, block_size, 1, head_dim)
     num_blocks, block_size, num_heads, head_dim = x.shape
     assert num_heads == 1
     x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
     sf = x_amax / 448.0
+    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
     x_fp8 = torch.empty(
         (num_blocks, block_size * (head_dim + 4)),
@@ -206,7 +207,8 @@ def _ref_fp8_fp4_paged_mqa_logits(
 @pytest.mark.skipif(
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
-def test_deepgemm_fp8_fp4_paged_mqa_logits():
+@pytest.mark.parametrize("kv_use_ue8m0", [False, True])
+def test_deepgemm_fp8_fp4_paged_mqa_logits(kv_use_ue8m0: bool):
     # NOTE: clean_logits=True is incompatible with the 2D context_lens
     # required by csrc/apis/attention.hpp; only the False path is exercised.
     clean_logits = False
@@ -259,7 +261,7 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits():
                         counter += 1
 
                 q_fp8 = q.to(torch.float8_e4m3fn)
-                kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+                kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache, kv_use_ue8m0)
 
                 # deep_gemm paged MQA logits requires 2D context_lens of
                 # shape (B, next_n) (csrc/apis/attention.hpp:332-335);
