@@ -188,6 +188,16 @@ def _make_metadata_with_slice(
         if attn_metadata.seq_lens_cpu_upper_bound is not None
         else None
     )
+    pcp_full_seq_lens = (
+        attn_metadata.pcp_full_seq_lens[request_slice]
+        if attn_metadata.pcp_full_seq_lens is not None
+        else None
+    )
+    pcp_full_seq_lens_cpu = (
+        attn_metadata.pcp_full_seq_lens_cpu[request_slice]
+        if attn_metadata.pcp_full_seq_lens_cpu is not None
+        else None
+    )
     num_computed_tokens_cpu = (
         attn_metadata._num_computed_tokens_cpu[request_slice]
         if attn_metadata._num_computed_tokens_cpu is not None
@@ -245,6 +255,8 @@ def _make_metadata_with_slice(
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        pcp_full_seq_lens=pcp_full_seq_lens,
+        pcp_full_seq_lens_cpu=pcp_full_seq_lens_cpu,
     )
 
 

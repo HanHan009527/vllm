@@ -375,6 +375,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        pcp_enabled = common_attn_metadata.pcp_allgather_restore_idx is not None
+        prefill_seq_lens = seq_lens
+        prefill_seq_lens_cpu = seq_lens_cpu
+        if pcp_enabled:
+            assert common_attn_metadata.pcp_full_seq_lens is not None
+            assert common_attn_metadata.pcp_full_seq_lens_cpu is not None
+            prefill_seq_lens = common_attn_metadata.pcp_full_seq_lens
+            prefill_seq_lens_cpu = common_attn_metadata.pcp_full_seq_lens_cpu
 
         # Split into decode and prefill portions using configurable threshold
         (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
@@ -414,11 +422,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
             num_decodes,
             num_prefills,
-            seq_lens,
-            seq_lens_cpu,
+            prefill_seq_lens,
+            prefill_seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
-            common_attn_metadata.pcp_allgather_restore_idx is not None,
+            pcp_enabled,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta

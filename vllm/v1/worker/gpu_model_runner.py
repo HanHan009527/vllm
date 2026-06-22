@@ -765,6 +765,10 @@ class GPUModelRunner(
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
+        if self.pcp_world_size > 1:
+            self.pcp_full_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
@@ -2464,11 +2468,33 @@ class GPUModelRunner(
                 :num_reqs_padded
             ]
             if self.pcp_world_size > 1:
+                local_scheduled_tokens_cpu = (
+                    self.optimistic_seq_lens_cpu[:num_reqs]
+                    - self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                )
+                torch.add(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    local_scheduled_tokens_cpu * self.pcp_world_size,
+                    out=self.pcp_full_seq_lens.cpu[:num_reqs],
+                )
+                self.pcp_full_seq_lens.cpu[:num_reqs] -= (
+                    self.pcp_manager.num_pcp_pads_cpu_tensor[:num_reqs].to(
+                        dtype=torch.int32
+                    )
+                )
+                self.pcp_full_seq_lens.cpu[num_reqs:].fill_(0)
+                self.pcp_full_seq_lens.copy_to_gpu(num_reqs_padded)
                 cm_base.pcp_allgather_restore_idx = (
                     self.pcp_manager.pcp_allgather_restore_idx.gpu[
                         : num_tokens * self.pcp_world_size
                     ]
                 )
+                cm_base.pcp_full_seq_lens = self.pcp_full_seq_lens.gpu[
+                    :num_reqs_padded
+                ]
+                cm_base.pcp_full_seq_lens_cpu = self.pcp_full_seq_lens.cpu[
+                    :num_reqs_padded
+                ]
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)

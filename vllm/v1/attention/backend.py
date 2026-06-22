@@ -404,6 +404,10 @@ class CommonAttentionMetadata:
     pcp_allgather_restore_idx: torch.Tensor | None = None
     """Indices that restore PCP all-gathered tensors to original token order"""
 
+    pcp_full_seq_lens: torch.Tensor | None = None
+    pcp_full_seq_lens_cpu: torch.Tensor | None = None
+    """Full per-request sequence lengths before PCP splits prefill tokens."""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -510,6 +514,8 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
+            pcp_full_seq_lens=maybe_slice_reqs(self.pcp_full_seq_lens),
+            pcp_full_seq_lens_cpu=maybe_slice_reqs(self.pcp_full_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
         )
 
