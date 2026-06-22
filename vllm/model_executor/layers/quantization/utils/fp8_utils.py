@@ -1058,6 +1058,39 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     return fp32_bits.view(torch.float32)
 
 
+def dequantize_fp8_block_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: Sequence[int],
+) -> torch.Tensor:
+    """Dequantize a block-FP8 weight tensor using its raw block scales.
+
+    The input scale tensor must still be in checkpoint/block layout, before any
+    kernel-specific post-processing such as DeepGEMM scale packing.
+    """
+    block_m, block_k = int(block_size[0]), int(block_size[1])
+    scale = (
+        _upcast_e8m0_to_fp32(weight_scale)
+        if weight_scale.dtype in (torch.float8_e8m0fnu, torch.uint8)
+        else weight_scale.to(torch.float32)
+    )
+
+    rows, cols = weight.shape[-2:]
+    row_blocks, col_blocks = scale.shape[-2:]
+    expected_row_blocks = (rows + block_m - 1) // block_m
+    expected_col_blocks = (cols + block_k - 1) // block_k
+    if (row_blocks, col_blocks) != (expected_row_blocks, expected_col_blocks):
+        raise ValueError(
+            "FP8 block scale shape does not match weight/block size: "
+            f"weight={tuple(weight.shape)} scale={tuple(weight_scale.shape)} "
+            f"block_size=({block_m}, {block_k})"
+        )
+
+    scale = torch.repeat_interleave(scale, block_m, dim=-2)[..., :rows, :]
+    scale = torch.repeat_interleave(scale, block_k, dim=-1)[..., :, :cols]
+    return weight.to(torch.float32) * scale
+
+
 def deepgemm_post_process_fp8_weight_block(
     wq: torch.Tensor,
     ws: torch.Tensor,

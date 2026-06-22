@@ -60,7 +60,9 @@ def inv_rope_bf16_o_proj(
     x1 = rope_pairs[..., 1:2]
     rope_pairs.copy_(torch.cat((x0 * cos + x1 * sin, x1 * cos - x0 * sin), dim=-1))
 
-    wo_a_weight = getattr(wo_a, "weight", None)
+    wo_a_weight = getattr(wo_a, "_fp8_bmm_weight_bf16", None)
+    if wo_a_weight is None:
+        wo_a_weight = getattr(wo_a, "weight", None)
     wo_a_input_size = (
         wo_a_weight.shape[-1]
         if wo_a_weight is not None and wo_a_weight.ndim >= 2
@@ -76,14 +78,20 @@ def inv_rope_bf16_o_proj(
     wo_a_groups = flattened_size // wo_a_input_size
     wo_a_input = projected.reshape(num_tokens, wo_a_groups, wo_a_input_size)
 
-    if (
-        wo_a_weight is not None
-        and wo_a_weight.ndim == 2
-        and wo_a_weight.shape[0] % o_lora_rank == 0
-        and wo_a_weight.shape[0] // o_lora_rank == wo_a_groups
-    ):
-        grouped_weight = wo_a_weight.reshape(wo_a_groups, o_lora_rank, wo_a_input_size)
-        return torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
+    if wo_a_weight is not None and wo_a_weight.ndim in (2, 3):
+        if wo_a_weight.ndim == 3:
+            weight_groups, weight_rank, _ = wo_a_weight.shape
+            can_group = weight_groups == wo_a_groups and weight_rank == o_lora_rank
+        else:
+            can_group = (
+                wo_a_weight.shape[0] % o_lora_rank == 0
+                and wo_a_weight.shape[0] // o_lora_rank == wo_a_groups
+            )
+        if can_group:
+            grouped_weight = wo_a_weight.reshape(
+                wo_a_groups, o_lora_rank, wo_a_input_size
+            ).to(dtype=wo_a_input.dtype)
+            return torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
 
     return maybe_unpack_linear_output(wo_a(wo_a_input))
 

@@ -52,6 +52,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
+    dequantize_fp8_block_weight,
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy,
     process_fp8_weight_tensor_strategy_moe,
@@ -440,6 +441,18 @@ class Fp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "input_scale", input_scale)
         else:
             layer.input_scale = None
+
+        if self.block_quant and getattr(layer, "is_bmm", False):
+            weight_scale = getattr(layer, "weight_scale_inv", None)
+            if weight_scale is None:
+                weight_scale = getattr(layer, "weight_scale", None)
+            if weight_scale is not None:
+                assert self.weight_block_size is not None
+                layer._fp8_bmm_weight_bf16 = dequantize_fp8_block_weight(
+                    layer.weight,
+                    weight_scale,
+                    self.weight_block_size,
+                ).to(torch.bfloat16)
 
         self.fp8_linear.process_weights_after_loading(layer)
 

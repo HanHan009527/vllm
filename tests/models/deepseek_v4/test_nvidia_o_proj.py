@@ -126,6 +126,25 @@ class FakeGroupedWoA(nn.Module):
         )
 
 
+class FakeCachedGroupedWoA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.full((2, 4), float("nan"), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self._fp8_bmm_weight_bf16 = torch.tensor(
+            [
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+                [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]],
+            ],
+            dtype=torch.bfloat16,
+        )
+
+    def forward(self, x):
+        raise AssertionError("cached BF16 BMM weight should bypass wo_a.forward")
+
+
 class FakeSingleGroupWoA(nn.Module):
     def __init__(self):
         super().__init__()
@@ -150,6 +169,26 @@ def test_inv_rope_bf16_o_proj_reshapes_flat_grouped_weight():
         torch.tensor([0], dtype=torch.long),
         torch.tensor([[1.0, 0.0]], dtype=torch.float32),
         FakeGroupedWoA(),
+        n_groups=2,
+        heads_per_group=1,
+        nope_dim=2,
+        rope_dim=2,
+        o_lora_rank=2,
+    )
+
+    expected = torch.tensor([[[1.0, 2.0], [10.0, 12.0]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(out, expected)
+
+
+def test_inv_rope_bf16_o_proj_uses_cached_bmm_weight():
+    o = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]], dtype=torch.bfloat16
+    )
+    out = inv_rope_bf16_o_proj(
+        o,
+        torch.tensor([0], dtype=torch.long),
+        torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        FakeCachedGroupedWoA(),
         n_groups=2,
         heads_per_group=1,
         nope_dim=2,
