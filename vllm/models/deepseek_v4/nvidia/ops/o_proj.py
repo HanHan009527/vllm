@@ -117,6 +117,7 @@ def deep_gemm_fp8_o_proj(
     o_lora_rank: int,
     einsum_recipe: tuple[int, int, int],
     tma_aligned_scales: bool,
+    force_bf16: bool = False,
 ) -> torch.Tensor:
     """O projection: inverse RoPE + FP8 quant + einsum + wo_b.
 
@@ -124,7 +125,7 @@ def deep_gemm_fp8_o_proj(
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
     weight_scale = get_fp8_weight_scale(wo_a)
-    if weight_scale is None:
+    if force_bf16 or weight_scale is None:
         z = inv_rope_bf16_o_proj(
             o,
             positions,

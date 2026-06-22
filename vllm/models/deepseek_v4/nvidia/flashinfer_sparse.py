@@ -84,6 +84,18 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         return 64 if num_heads <= 64 else 128
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        force_bf16 = False
+        attn_metadata = get_forward_context().attn_metadata
+        if isinstance(attn_metadata, dict):
+            swa_metadata = cast(
+                "DeepseekSparseSWAMetadata | None",
+                attn_metadata.get(self.swa_cache_layer.prefix),
+            )
+            force_bf16 = (
+                swa_metadata is not None
+                and swa_metadata.pcp_allgather_restore_idx is not None
+                and swa_metadata.num_prefill_tokens > 0
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -97,6 +109,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
             o_lora_rank=self.o_lora_rank,
             einsum_recipe=self._einsum_recipe,
             tma_aligned_scales=self._tma_aligned_scales,
+            force_bf16=force_bf16,
         )
 
     def __init__(self, *args, **kwargs) -> None:
