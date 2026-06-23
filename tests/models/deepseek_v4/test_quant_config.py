@@ -97,7 +97,7 @@ quant_config = load_quant_config_module()
 DeepseekV4FP8Config = quant_config.DeepseekV4FP8Config
 
 
-def test_deepseek_v4_fp8_keeps_linear_ue8m0_and_expert_float32_scales(monkeypatch):
+def test_deepseek_v4_fp8_keeps_linear_and_expert_float32_scales(monkeypatch):
     hf_config = SimpleNamespace(
         expert_dtype="fp8",
         quantization_config={
@@ -119,7 +119,7 @@ def test_deepseek_v4_fp8_keeps_linear_ue8m0_and_expert_float32_scales(monkeypatc
     )
 
     assert config.expert_dtype == "fp8"
-    assert config.is_scale_e8m0 is True
+    assert config.is_scale_e8m0 is False
     assert config.is_moe_scale_e8m0 is False
 
 
