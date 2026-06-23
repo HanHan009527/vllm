@@ -554,6 +554,55 @@ def _make_cutedsl_global_dtor_data_default(dtors: Any) -> list[Any]:
     return [ir.Attribute.parse("none") for _ in range(num_dtors)]
 
 
+def _patch_cutedsl_global_dtors_data_attr(global_dtors: Any) -> None:
+    """Keep LLVM global-dtor ``data`` attributes aligned with ``dtors``."""
+    try:
+        attrs = global_dtors.attributes
+        dtors = attrs["dtors"]
+        data = attrs["data"]
+        missing_data = len(dtors) - len(data)
+    except (KeyError, TypeError):
+        return
+
+    if missing_data > 0:
+        attrs["data"] += _make_cutedsl_global_dtor_data_default(
+            [None] * missing_data)
+
+
+def _patch_cutedsl_tvm_ffi_global_dtors() -> None:
+    """Patch CuteDSL TVM FFI global-dtor append for newer MLIR verifiers."""
+    try:
+        from cutlass.cutlass_dsl import tvm_ffi_provider
+    except Exception:
+        return
+
+    provider_cls = getattr(tvm_ffi_provider, "TVMFFICuteCallProvider", None)
+    if provider_cls is None:
+        return
+
+    append_unload = getattr(provider_cls, "append_unload_to_global_dtors",
+                           None)
+    if append_unload is None or getattr(append_unload,
+                                        "_vllm_data_attr_patch", False):
+        return
+
+    @wraps(append_unload)
+    def append_unload_with_data_attr(self, current_block, context):
+        current_block = append_unload(self, current_block, context)
+        try:
+            global_dtors_list = self.find_operations_in_module(
+                context.module, "llvm.mlir.global_dtors")
+        except Exception:
+            return current_block
+
+        for global_dtors in global_dtors_list:
+            _patch_cutedsl_global_dtors_data_attr(global_dtors)
+        return current_block
+
+    append_unload_with_data_attr._vllm_data_attr_patch = True
+    provider_cls.append_unload_to_global_dtors = append_unload_with_data_attr
+
+
 def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
     """Patch CuteDSL 4.5.x global-dtor creation across binding revisions.
 
@@ -566,6 +615,8 @@ def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
     """
     if llvm_module is None:
         from cutlass._mlir.dialects import llvm as llvm_module
+
+    _patch_cutedsl_tvm_ffi_global_dtors()
 
     mlir_global_dtors = getattr(llvm_module, "mlir_global_dtors", None)
     if mlir_global_dtors is None or getattr(

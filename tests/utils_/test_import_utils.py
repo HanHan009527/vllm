@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,7 +11,9 @@ from vllm.utils.import_utils import (
     PlaceholderModule,
     _has_module,
     _make_cutedsl_global_dtor_data_default,
+    _patch_cutedsl_global_dtors_data_attr,
     _patch_cutedsl_mlir_global_dtors,
+    _patch_cutedsl_tvm_ffi_global_dtors,
 )
 
 
@@ -144,6 +147,73 @@ def test_patch_cutedsl_mlir_global_dtors_adds_matching_data_default():
 
 def test_make_cutedsl_global_dtor_data_default_empty_without_cutlass():
     assert _make_cutedsl_global_dtor_data_default([]) == []
+
+
+def test_patch_cutedsl_global_dtors_data_attr_extends_to_match_dtors():
+    global_dtors = SimpleNamespace(
+        attributes={
+            "dtors": ["dtor-0", "dtor-1"],
+            "priorities": [65535, 65535],
+            "data": [],
+        })
+
+    with patch(
+            "vllm.utils.import_utils."
+            "_make_cutedsl_global_dtor_data_default",
+            side_effect=lambda dtors: [f"none-{i}"
+                                       for i, _ in enumerate(dtors)],
+    ) as mock_data_default:
+        _patch_cutedsl_global_dtors_data_attr(global_dtors)
+
+    assert global_dtors.attributes["data"] == ["none-0", "none-1"]
+    mock_data_default.assert_called_once_with([None, None])
+
+
+def test_patch_cutedsl_tvm_ffi_global_dtors_repairs_provider_append(monkeypatch):
+    global_dtors = SimpleNamespace(
+        attributes={
+            "dtors": [],
+            "priorities": [],
+            "data": [],
+        })
+
+    class FakeProvider:
+
+        def find_operations_in_module(self, module, name):
+            assert module == "module"
+            assert name == "llvm.mlir.global_dtors"
+            return [global_dtors]
+
+        def append_unload_to_global_dtors(self, current_block, context):
+            global_dtors.attributes["dtors"] += ["dtor"]
+            global_dtors.attributes["priorities"] += [65535]
+            return current_block
+
+    tvm_ffi_provider = SimpleNamespace(TVMFFICuteCallProvider=FakeProvider)
+    cutlass_dsl = SimpleNamespace(tvm_ffi_provider=tvm_ffi_provider)
+    cutlass = SimpleNamespace(cutlass_dsl=cutlass_dsl)
+
+    monkeypatch.setitem(sys.modules, "cutlass", cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass.cutlass_dsl", cutlass_dsl)
+    monkeypatch.setitem(sys.modules, "cutlass.cutlass_dsl.tvm_ffi_provider",
+                        tvm_ffi_provider)
+
+    with patch(
+            "vllm.utils.import_utils."
+            "_make_cutedsl_global_dtor_data_default",
+            return_value=["none"],
+    ):
+        _patch_cutedsl_tvm_ffi_global_dtors()
+
+        provider = FakeProvider()
+        assert provider.append_unload_to_global_dtors(
+            "block", SimpleNamespace(module="module")) == "block"
+
+    assert global_dtors.attributes == {
+        "dtors": ["dtor"],
+        "priorities": [65535],
+        "data": ["none"],
+    }
 
 
 def test_deepseek_v4_cutedsl_leaf_modules_patch_before_quack_import():
