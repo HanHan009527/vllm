@@ -110,6 +110,7 @@ class TestConfig:
     n: int
     num_experts: int
     block_shape: list[int] | None = None
+    normalize_topk_weights: bool = False
 
 
 @dataclasses.dataclass
@@ -138,6 +139,8 @@ class TestTensors:
             low=0, high=config.num_experts, size=(config.m, config.topk), device="cuda"
         ).to(dtype=torch.int64)
         topk_weights = torch.randn(topk.shape, dtype=torch.float32, device="cuda")
+        if config.normalize_topk_weights:
+            topk_weights = torch.softmax(topk_weights, dim=-1)
         return TestTensors(
             rank_tokens=rank_tokens,
             rank_token_scales=rank_token_scales,
@@ -614,6 +617,7 @@ def test_low_latency_deep_ep_moe_block_fp8(workspace_init):
         n=2048,
         num_experts=32,
         block_shape=block_shape,
+        normalize_topk_weights=True,
     )
 
     w1, w2, w1_scale, w2_scale = make_weights(
