@@ -396,6 +396,27 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
+    def _cache_bf16_weight_if_needed(self, layer: RoutedExperts) -> None:
+        cache_bf16_weight = getattr(layer, "is_bmm", False) or getattr(
+            layer, "cache_bf16_weight", False
+        )
+        if self.block_quant and cache_bf16_weight:
+            weight_scale = getattr(layer, "weight_scale_inv", None)
+            scale_is_inverse = weight_scale is not None
+            if weight_scale is None:
+                weight_scale = getattr(layer, "weight_scale", None)
+            if weight_scale is not None:
+                assert self.weight_block_size is not None
+                bf16_weight = dequantize_fp8_block_weight(
+                    layer.weight,
+                    weight_scale,
+                    self.weight_block_size,
+                    scale_is_inverse=scale_is_inverse,
+                ).to(torch.bfloat16)
+                layer._fp8_weight_bf16 = bf16_weight
+                if getattr(layer, "is_bmm", False):
+                    layer._fp8_bmm_weight_bf16 = bf16_weight
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if self.use_marlin:
             if not self.block_quant:
@@ -405,6 +426,7 @@ class Fp8LinearMethod(LinearMethodBase):
             # AttributeError if backend selection changes.
             if hasattr(self.fp8_linear, "marlin_input_dtype"):
                 self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
+            self._cache_bf16_weight_if_needed(layer)
             self.fp8_linear.process_weights_after_loading(layer)
             return
 
@@ -442,25 +464,7 @@ class Fp8LinearMethod(LinearMethodBase):
         else:
             layer.input_scale = None
 
-        cache_bf16_weight = getattr(layer, "is_bmm", False) or getattr(
-            layer, "cache_bf16_weight", False
-        )
-        if self.block_quant and cache_bf16_weight:
-            weight_scale = getattr(layer, "weight_scale_inv", None)
-            scale_is_inverse = weight_scale is not None
-            if weight_scale is None:
-                weight_scale = getattr(layer, "weight_scale", None)
-            if weight_scale is not None:
-                assert self.weight_block_size is not None
-                bf16_weight = dequantize_fp8_block_weight(
-                    layer.weight,
-                    weight_scale,
-                    self.weight_block_size,
-                    scale_is_inverse=scale_is_inverse,
-                ).to(torch.bfloat16)
-                layer._fp8_weight_bf16 = bf16_weight
-                if getattr(layer, "is_bmm", False):
-                    layer._fp8_bmm_weight_bf16 = bf16_weight
+        self._cache_bf16_weight_if_needed(layer)
 
         self.fp8_linear.process_weights_after_loading(layer)
 
