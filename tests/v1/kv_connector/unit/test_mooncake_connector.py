@@ -487,12 +487,12 @@ async def test_build_transfer_params_uses_remote_prefill_start_token_for_pcp(
         remote_region.base_addr + block_id * block_len
         for block_id in expected_remote_blocks
     ]
-    assert lengths == [block_len * 55 // 256] * len(expected_remote_blocks)
+    assert lengths == [block_len] * len(expected_remote_blocks)
 
 
 @pytest.mark.asyncio
-async def test_build_transfer_params_clips_partial_remote_prefill_block():
-    """Do not transfer P-side generated-token slots to the D-side prompt KV."""
+async def test_build_transfer_params_transfers_full_partial_remote_prefill_block():
+    """Partial remote-prefill blocks are sent as full physical KV blocks."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
@@ -566,13 +566,13 @@ async def test_build_transfer_params_clips_partial_remote_prefill_block():
     ]
     assert lengths == [
         block_len,
-        block_len * 44 // 256,
+        block_len,
     ]
 
 
 @pytest.mark.asyncio
-async def test_build_transfer_params_clips_partial_kernel_block():
-    """Partial transfers use the physical kernel block size for byte lengths."""
+async def test_build_transfer_params_transfers_full_partial_kernel_block():
+    """Partial transfers keep full physical blocks for non-uniform KV layouts."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
@@ -639,7 +639,7 @@ async def test_build_transfer_params_clips_partial_kernel_block():
     assert err_msg is None
     assert src_ptrs == [local_region.base_addr + 10 * block_len]
     assert dst_ptrs == [remote_region.base_addr + 20 * block_len]
-    assert lengths == [block_len * 11 // 64]
+    assert lengths == [block_len]
 
 
 @pytest.mark.asyncio

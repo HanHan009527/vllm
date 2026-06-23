@@ -1998,11 +1998,6 @@ class MooncakeConnectorWorker:
                             token_count_idx += 1
                             if token_count <= 0:
                                 continue
-                            block_token_count = min(token_count, transfer_block_size)
-                            block_transfer_len = (
-                                transfer_len * block_token_count
-                                // transfer_block_size
-                            )
                             src_ptrs.append(
                                 local_region.base_addr
                                 + local_block_id * local_region.block_len
@@ -2013,7 +2008,7 @@ class MooncakeConnectorWorker:
                                 + remote_block_id * remote_region.block_len
                                 + dst_region_offset
                             )
-                            lengths.append(block_transfer_len)
+                            lengths.append(transfer_len)
 
                 if not logged_transfer_plan:
                     logger.debug(
