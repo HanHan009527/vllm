@@ -993,6 +993,23 @@ def get_pcp_local_indices_after_restore(
     return torch.index_select(inverse, 0, local_concat_indices)
 
 
+def restore_pcp_local_tensor_to_padded_tokens(
+    tensor: torch.Tensor,
+    local_indices: torch.Tensor | None,
+    num_padded_local_tokens: int,
+) -> torch.Tensor:
+    """Restore this PCP rank's local tensor and preserve padded batch shape."""
+    if local_indices is None:
+        return tensor
+    tensor = torch.index_select(tensor, 0, local_indices)
+    if tensor.shape[0] == num_padded_local_tokens:
+        return tensor
+    assert tensor.shape[0] < num_padded_local_tokens
+    padded_tensor = tensor.new_zeros((num_padded_local_tokens, *tensor.shape[1:]))
+    padded_tensor[: tensor.shape[0]].copy_(tensor)
+    return padded_tensor
+
+
 def get_pcp_part_indices(
     cu_num_tokens: torch.Tensor,
     selected_shards: int,

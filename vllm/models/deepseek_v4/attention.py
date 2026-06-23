@@ -61,6 +61,7 @@ from vllm.v1.attention.backends.utils import (
     get_pcp_max_buffer_num_tokens,
     get_pcp_num_local_tokens_from_restore_idx,
     pcp_allgather_and_restore,
+    restore_pcp_local_tensor_to_padded_tokens,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
@@ -619,6 +620,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         assert swa_metadata is not None
         local_q_indices = None
+        num_padded_local_tokens = q.shape[0]
         if swa_metadata.pcp_allgather_restore_idx is not None:
             restore_idx = swa_metadata.pcp_allgather_restore_idx
             num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
@@ -665,9 +667,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
-            if local_q_indices is not None:
-                q = torch.index_select(q, 0, local_q_indices)
-            return q
+            return restore_pcp_local_tensor_to_padded_tokens(
+                q, local_q_indices, num_padded_local_tokens
+            )
 
         # FlashInfer full-cache path: the [num_blocks, block_size, 512] cache
         # stores the KV row in its plain dtype (no Q padding). bf16 rewrites q
@@ -686,9 +688,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 block_size,
             )
-            if local_q_indices is not None:
-                q = torch.index_select(q, 0, local_q_indices)
-            return q
+            return restore_pcp_local_tensor_to_padded_tokens(
+                q, local_q_indices, num_padded_local_tokens
+            )
 
         # per-tensor fp8 (torch.float8_e4m3fn)
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
@@ -705,9 +707,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
-        if local_q_indices is not None:
-            q_fp8 = torch.index_select(q_fp8, 0, local_q_indices)
-        return q_fp8
+        return restore_pcp_local_tensor_to_padded_tokens(
+            q_fp8, local_q_indices, num_padded_local_tokens
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls

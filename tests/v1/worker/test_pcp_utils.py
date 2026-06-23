@@ -16,6 +16,7 @@ from vllm.v1.attention.backends.utils import (
     get_pcp_query_indices,
     pcp_allgather_and_restore,
     pcp_kv_allgather_and_restore,
+    restore_pcp_local_tensor_to_padded_tokens,
 )
 from vllm.v1.worker.cp_utils import PCPManager
 
@@ -214,6 +215,53 @@ def test_pcp_restore_idx_derives_actual_local_tokens_with_padding():
     )
     assert local_indices.numel() == actual_local_tokens
     assert int(local_indices.max()) < restore_idx.numel()
+
+
+def test_pcp_local_restore_preserves_padded_token_shape():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=1,
+        max_buffer_num_tokens=64,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+    )
+    tokens = np.array([11], dtype=np.int32)
+    arange_np = np.arange(64, dtype=np.int32)
+
+    pcp_tokens, _ = manager.update_tokens_for_pcp(
+        tokens,
+        arange_np,
+        num_reqs=1,
+        reorder_batch_threshold=1,
+    )
+
+    actual_local_tokens = int(pcp_tokens.sum())
+    padded_local_tokens = 8
+    restore_idx = manager.pcp_allgather_restore_idx.cpu[
+        : actual_local_tokens * manager.pcp_world_size
+    ]
+    local_indices = get_pcp_local_indices_after_restore(
+        num_local_tokens=actual_local_tokens,
+        pcp_rank=manager.pcp_rank,
+        pcp_allgather_restore_idx=restore_idx,
+    )
+    restored = torch.arange(restore_idx.numel() * 2).reshape(restore_idx.numel(), 2)
+
+    local_padded = restore_pcp_local_tensor_to_padded_tokens(
+        restored,
+        local_indices,
+        padded_local_tokens,
+    )
+
+    assert local_padded.shape == (padded_local_tokens, 2)
+    torch.testing.assert_close(
+        local_padded[:actual_local_tokens],
+        torch.index_select(restored, 0, local_indices),
+    )
+    torch.testing.assert_close(
+        local_padded[actual_local_tokens:],
+        torch.zeros(padded_local_tokens - actual_local_tokens, 2, dtype=torch.int64),
+    )
 
 
 def test_get_cp_local_seq_lens_preserves_dcp_helper_behavior():
