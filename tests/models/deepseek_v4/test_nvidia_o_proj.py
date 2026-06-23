@@ -61,6 +61,7 @@ get_wo_a_bf16_weight = o_proj.get_wo_a_bf16_weight
 inv_rope_bf16_o_proj = o_proj.inv_rope_bf16_o_proj
 deep_gemm_fp8_o_proj = o_proj.deep_gemm_fp8_o_proj
 should_fallback_fp8_einsum_error = o_proj.should_fallback_fp8_einsum_error
+log_fp8_einsum_fallback = o_proj.log_fp8_einsum_fallback
 
 
 def test_get_fp8_weight_scale_prefers_weight_scale_inv():
@@ -498,6 +499,20 @@ def test_should_fallback_fp8_einsum_error_is_deepgemm_specific():
         RuntimeError("DeepGEMM backend is not available or outdated")
     )
     assert not should_fallback_fp8_einsum_error(RuntimeError("unrelated failure"))
+
+
+def test_log_fp8_einsum_fallback_warns_once(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(o_proj, "_fp8_einsum_fallback_warning_emitted", False)
+    monkeypatch.setattr(
+        o_proj.logger, "warning", lambda *args, **kwargs: calls.append(args)
+    )
+
+    log_fp8_einsum_fallback(RuntimeError("layout.hpp"))
+    log_fp8_einsum_fallback(RuntimeError("layout.hpp"))
+
+    assert len(calls) == 1
 
 
 def test_deep_gemm_fp8_o_proj_falls_back_when_fp8_einsum_crashes(monkeypatch):

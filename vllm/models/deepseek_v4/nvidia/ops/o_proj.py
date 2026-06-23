@@ -12,6 +12,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum, is_deep_gemm_fp8_einsum_supported
 
 logger = logging.getLogger(__name__)
+_fp8_einsum_fallback_warning_emitted = False
 
 
 def dsv4_nonfinite_diag_enabled() -> bool:
@@ -269,6 +270,17 @@ def should_fallback_fp8_einsum_error(exc: RuntimeError) -> bool:
     )
 
 
+def log_fp8_einsum_fallback(exc: RuntimeError) -> None:
+    global _fp8_einsum_fallback_warning_emitted
+    if _fp8_einsum_fallback_warning_emitted:
+        return
+    _fp8_einsum_fallback_warning_emitted = True
+    logger.warning(
+        "DeepSeek V4 O-proj FP8 einsum failed; falling back to BF16: %s",
+        exc,
+    )
+
+
 def bf16_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -368,10 +380,7 @@ def deep_gemm_fp8_o_proj(
     except RuntimeError as exc:
         if not should_fallback_fp8_einsum_error(exc):
             raise
-        logger.warning(
-            "DeepSeek V4 O-proj FP8 einsum failed; falling back to BF16: %s",
-            exc,
-        )
+        log_fp8_einsum_fallback(exc)
         return bf16_o_proj(
             o,
             positions,
