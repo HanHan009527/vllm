@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.import_utils import PlaceholderModule, _has_module
+from vllm.utils.import_utils import (
+    PlaceholderModule,
+    _has_module,
+    _patch_cutedsl_mlir_global_dtors,
+)
 
 
 def _raises_module_not_found():
@@ -101,3 +106,26 @@ class TestHasModule:
             result = _has_module("json")  # should hit cache
             mock_spec.assert_not_called()
             assert result is True
+
+
+def test_patch_cutedsl_mlir_global_dtors_adds_empty_data_default():
+    calls = []
+
+    def mlir_global_dtors(dtors, priorities, data, *, loc=None, ip=None):
+        calls.append((dtors, priorities, data, loc, ip))
+        return "created"
+
+    llvm_module = SimpleNamespace(mlir_global_dtors=mlir_global_dtors)
+
+    _patch_cutedsl_mlir_global_dtors(llvm_module)
+
+    assert llvm_module.mlir_global_dtors(["dtor"], [0]) == "created"
+    assert calls[-1] == (["dtor"], [0], [], None, None)
+
+    assert llvm_module.mlir_global_dtors(["dtor"], [0], ["data"],
+                                         loc="loc") == "created"
+    assert calls[-1] == (["dtor"], [0], ["data"], "loc", None)
+
+    patched = llvm_module.mlir_global_dtors
+    _patch_cutedsl_mlir_global_dtors(llvm_module)
+    assert llvm_module.mlir_global_dtors is patched

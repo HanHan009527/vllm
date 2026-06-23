@@ -9,9 +9,10 @@ This is similar in concept to the `importlib` module.
 
 import importlib.metadata
 import importlib.util
+import inspect
 import os
 import sys
-from functools import cache
+from functools import cache, wraps
 from types import ModuleType
 from typing import Any
 
@@ -539,6 +540,46 @@ def has_fbgemm_gpu() -> bool:
     return _has_module("fbgemm_gpu")
 
 
+def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
+    """Patch CuteDSL 4.5.x global-dtor creation across binding revisions.
+
+    Some nvidia-cutlass-dsl 4.5.2 builds ship a Python provider that calls
+    ``llvm.mlir_global_dtors(dtors=..., priorities=...)`` while the matching
+    generated binding requires the newer third ``data`` argument. The LLVM IR
+    global-dtor data field can be empty, so defaulting it preserves the provider
+    behavior and avoids treating an otherwise usable CuteDSL install as broken.
+    """
+    if llvm_module is None:
+        from cutlass._mlir.dialects import llvm as llvm_module
+
+    mlir_global_dtors = getattr(llvm_module, "mlir_global_dtors", None)
+    if mlir_global_dtors is None or getattr(
+            mlir_global_dtors, "_vllm_data_default_patch", False):
+        return
+
+    try:
+        signature = inspect.signature(mlir_global_dtors)
+    except (TypeError, ValueError):
+        return
+
+    data_param = signature.parameters.get("data")
+    if data_param is None or data_param.default is not inspect.Parameter.empty:
+        return
+
+    @wraps(mlir_global_dtors)
+    def mlir_global_dtors_with_data_default(dtors,
+                                            priorities,
+                                            data=None,
+                                            *args,
+                                            **kwargs):
+        if data is None:
+            data = []
+        return mlir_global_dtors(dtors, priorities, data, *args, **kwargs)
+
+    mlir_global_dtors_with_data_default._vllm_data_default_patch = True
+    llvm_module.mlir_global_dtors = mlir_global_dtors_with_data_default
+
+
 @cache
 def has_cutedsl() -> bool:
     """Whether the optional CuteDSL packages (cutlass + quack) are available
@@ -553,6 +594,7 @@ def has_cutedsl() -> bool:
         import cutlass  # noqa: F401
         import quack.compile_utils  # noqa: F401
 
+        _patch_cutedsl_mlir_global_dtors()
         return True
     except Exception:
         return False
