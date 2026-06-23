@@ -31,7 +31,8 @@ class DeepseekV4FP8Config(Fp8Config):
     """FP8 config for DeepSeek V4 with expert-dtype-aware MoE dispatch.
 
     DeepSeek V4 checkpoints always use FP8 block quantization for
-    linear/attention layers. The MoE expert weights vary by checkpoint:
+    non-expert linear/attention layers. The MoE expert weights vary by
+    checkpoint:
     - ``expert_dtype="fp4"`` (e.g. DeepSeek-V4-Flash): MXFP4 experts
       with ue8m0 (e8m0fnu) FP8 linear scales.
     - ``expert_dtype="fp8"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block
@@ -39,9 +40,10 @@ class DeepseekV4FP8Config(Fp8Config):
       requests UE8M0-formatted DeepGEMM runtime scales.
 
     MoE dispatch and checkpoint scale storage are keyed off ``expert_dtype``
-    from the model's hf_config. ``quantization_config.scale_fmt`` controls
-    DeepGEMM runtime scale formatting elsewhere and must not make FP8-expert
-    checkpoint scale tensors load as e8m0fnu.
+    from the model's hf_config. ``quantization_config.scale_fmt`` still
+    controls non-expert FP8 linear checkpoint scale dtype and DeepGEMM runtime
+    scale formatting; it must not make FP8-expert checkpoint scale tensors load
+    as e8m0fnu.
 
     NOTE: ``expert_dtype`` is resolved lazily because this config is
     constructed during VllmConfig setup, before ``set_current_vllm_config``
@@ -80,11 +82,27 @@ class DeepseekV4FP8Config(Fp8Config):
             )
         return self._resolved_expert_dtype
 
+    def _scale_fmt(self) -> str:
+        try:
+            hf_config = get_current_vllm_config().model_config.hf_config
+        except Exception:
+            return ""
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        return str(quant_cfg.get("scale_fmt") or "").lower()
+
     @property
     def is_scale_e8m0(self) -> bool:
-        # FP4 checkpoints store e8m0fnu scales for FP8 linear layers. FP8-expert
-        # checkpoints store float32 block scales; their scale_fmt=ue8m0 is a
-        # DeepGEMM runtime preference, not the on-disk scale tensor dtype.
+        # Non-expert FP8 linear layers follow the checkpoint's global scale_fmt.
+        # FP8-expert checkpoints may still store expert scales as float32; MoE
+        # uses is_moe_scale_e8m0 below to avoid applying this global decision to
+        # expert scale tensors.
+        return self._scale_fmt() == "ue8m0"
+
+    @property
+    def is_moe_scale_e8m0(self) -> bool:
+        # FP4 experts use MXFP4-specific methods and e8m0fnu scales. FP8 experts
+        # keep float32 block scales even when non-expert linear layers use
+        # scale_fmt=ue8m0.
         return self.expert_dtype == "fp4"
 
     def _resolve_moe_overrides(self) -> None:
