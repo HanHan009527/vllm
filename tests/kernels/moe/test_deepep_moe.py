@@ -33,7 +33,7 @@ from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
 
-from ...utils import multi_gpu_test
+from ...utils import create_new_process_for_each_test, multi_gpu_test
 from .parallel_utils import ProcessGroupInfo, parallel_launch
 
 if has_deep_ep():
@@ -579,7 +579,12 @@ def test_low_latency_deep_ep_moe(
     )
 
 
-@multi_gpu_test(num_gpus=2)
+@pytest.mark.distributed(num_gpus=2)
+@pytest.mark.skipif(
+    current_platform.device_count() < 2,
+    reason="Need at least 2 GPUs to run the test.",
+)
+@create_new_process_for_each_test(method="spawn")
 @requires_deep_ep
 def test_low_latency_deep_ep_moe_block_fp8(workspace_init):
     low_latency_mode = True
