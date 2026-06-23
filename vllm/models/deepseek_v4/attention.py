@@ -59,6 +59,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.backends.utils import (
     get_pcp_local_indices_after_restore,
     get_pcp_max_buffer_num_tokens,
+    get_pcp_num_local_tokens_from_restore_idx,
     pcp_allgather_and_restore,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
@@ -620,17 +621,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         local_q_indices = None
         if swa_metadata.pcp_allgather_restore_idx is not None:
             restore_idx = swa_metadata.pcp_allgather_restore_idx
+            num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
+                restore_idx, self.pcp_world_size
+            )
             local_q_indices = get_pcp_local_indices_after_restore(
-                q.shape[0],
+                num_local_tokens,
                 self.pcp_rank,
                 restore_idx,
             )
             pcp_group = get_pcp_group()
-            q = pcp_allgather_and_restore(q, q.shape[0], restore_idx, pcp_group)
-            kv = pcp_allgather_and_restore(kv, kv.shape[0], restore_idx, pcp_group)
+            q = pcp_allgather_and_restore(q, num_local_tokens, restore_idx, pcp_group)
+            kv = pcp_allgather_and_restore(kv, num_local_tokens, restore_idx, pcp_group)
             positions = pcp_allgather_and_restore(
                 positions,
-                positions.shape[0],
+                num_local_tokens,
                 restore_idx,
                 pcp_group,
             )

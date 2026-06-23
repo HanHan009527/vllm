@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import (
     get_pcp_max_buffer_num_tokens,
+    get_pcp_num_local_tokens_from_restore_idx,
     pcp_allgather_and_restore,
 )
 from vllm.v1.kv_cache_interface import (
@@ -320,17 +321,21 @@ class DeepseekCompressor(nn.Module):
         block_size = state_metadata.block_size
         if state_metadata.pcp_allgather_restore_idx is not None:
             restore_idx = state_metadata.pcp_allgather_restore_idx
+            pcp_group = get_pcp_group()
+            num_local_tokens = get_pcp_num_local_tokens_from_restore_idx(
+                restore_idx, pcp_group.world_size
+            )
             kv_score = pcp_allgather_and_restore(
                 kv_score,
-                kv_score.shape[0],
+                num_local_tokens,
                 restore_idx,
-                get_pcp_group(),
+                pcp_group,
             )
             positions = pcp_allgather_and_restore(
                 positions,
-                positions.shape[0],
+                num_local_tokens,
                 restore_idx,
-                get_pcp_group(),
+                pcp_group,
             )
             kv, score = kv_score.split(
                 [self.coff * self.head_dim, self.coff * self.head_dim],

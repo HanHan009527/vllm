@@ -946,6 +946,19 @@ def pcp_allgather_and_restore(
     return torch.index_select(gathered, 0, pcp_allgather_restore_idx)
 
 
+def get_pcp_num_local_tokens_from_restore_idx(
+    pcp_allgather_restore_idx: torch.Tensor,
+    pcp_world_size: int,
+) -> int:
+    """Return the pre-padding local token count represented by a restore index."""
+    restore_len = pcp_allgather_restore_idx.numel()
+    assert restore_len % pcp_world_size == 0, (
+        "PCP restore index length must be divisible by PCP world size, "
+        f"got restore_len={restore_len}, pcp_world_size={pcp_world_size}."
+    )
+    return restore_len // pcp_world_size
+
+
 def get_pcp_max_buffer_num_tokens(vllm_config) -> int:
     max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size

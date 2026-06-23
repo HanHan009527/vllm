@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_pcp_kv_indices,
     get_pcp_local_indices_after_restore,
+    get_pcp_num_local_tokens_from_restore_idx,
     get_pcp_max_buffer_num_tokens,
     get_pcp_query_indices,
     pcp_allgather_and_restore,
@@ -170,6 +171,49 @@ def test_pcp_restore_idx_length_uses_local_total_for_odd_request():
     restore_idx = manager.pcp_allgather_restore_idx.cpu[:restore_len]
     assert restore_len == 12
     assert int(restore_idx.max()) < restore_len
+
+
+def test_pcp_restore_idx_derives_actual_local_tokens_with_padding():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=1,
+        max_buffer_num_tokens=64,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+    )
+    tokens = np.array([11], dtype=np.int32)
+    arange_np = np.arange(64, dtype=np.int32)
+
+    pcp_tokens, _ = manager.update_tokens_for_pcp(
+        tokens,
+        arange_np,
+        num_reqs=1,
+        reorder_batch_threshold=1,
+    )
+
+    actual_local_tokens = int(pcp_tokens.sum())
+    padded_local_tokens = 8
+    restore_idx = manager.pcp_allgather_restore_idx.cpu[
+        : actual_local_tokens * manager.pcp_world_size
+    ]
+
+    assert actual_local_tokens == 6
+    assert padded_local_tokens > actual_local_tokens
+    assert (
+        get_pcp_num_local_tokens_from_restore_idx(
+            restore_idx,
+            manager.pcp_world_size,
+        )
+        == actual_local_tokens
+    )
+
+    local_indices = get_pcp_local_indices_after_restore(
+        num_local_tokens=actual_local_tokens,
+        pcp_rank=manager.pcp_rank,
+        pcp_allgather_restore_idx=restore_idx,
+    )
+    assert local_indices.numel() == actual_local_tokens
+    assert int(local_indices.max()) < restore_idx.numel()
 
 
 def test_get_cp_local_seq_lens_preserves_dcp_helper_behavior():
