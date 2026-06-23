@@ -29,8 +29,8 @@ from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     fp8_m_grouped_gemm_nt_masked,
     get_mk_alignment_for_contiguous_layout,
+    is_deep_gemm_contiguous_layout_supported,
     is_deep_gemm_e8m0_used,
-    is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv, round_up
 
@@ -294,7 +294,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return is_deep_gemm_supported()
+        return is_deep_gemm_contiguous_layout_supported()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

@@ -5,6 +5,10 @@ from collections.abc import Callable
 
 import pytest
 
+from vllm.model_executor.layers.fused_moe.experts import (
+    batched_deep_gemm_moe,
+    deep_gemm_moe,
+)
 import vllm.utils.deep_gemm as deep_gemm
 
 
@@ -79,5 +83,40 @@ def test_contiguous_layout_support_requires_deep_gemm_symbol(
     )
     deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
 
+    assert not deep_gemm.is_deep_gemm_contiguous_layout_supported()
+
+    def fake_transform_sf_into_required_layout(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "_transform_sf_into_required_layout_impl",
+        fake_transform_sf_into_required_layout,
+    )
+    deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
+
     assert deep_gemm.is_deep_gemm_contiguous_layout_supported()
-    assert isinstance(deep_gemm._get_mk_alignment_for_contiguous_layout_impl, Callable)
+    assert isinstance(
+        deep_gemm._get_mk_alignment_for_contiguous_layout_impl, Callable
+    )
+    assert isinstance(
+        deep_gemm._transform_sf_into_required_layout_impl, Callable
+    )
+
+
+def test_deep_gemm_moe_support_requires_contiguous_layout_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        deep_gemm_moe,
+        "is_deep_gemm_contiguous_layout_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        batched_deep_gemm_moe,
+        "is_deep_gemm_contiguous_layout_supported",
+        lambda: False,
+    )
+
+    assert not deep_gemm_moe.DeepGemmExperts._supports_current_device()
+    assert not batched_deep_gemm_moe.BatchedDeepGemmExperts._supports_current_device()

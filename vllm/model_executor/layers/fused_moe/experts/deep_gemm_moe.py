@@ -40,7 +40,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     get_mk_alignment_for_contiguous_layout,
-    is_deep_gemm_supported,
+    is_deep_gemm_contiguous_layout_supported,
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
 )
@@ -50,6 +50,8 @@ logger = init_logger(__name__)
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
+    if not is_deep_gemm_contiguous_layout_supported():
+        return False
     align = get_mk_alignment_for_contiguous_layout()[0]
     return align <= M and N % align == 0 and K % align == 0
 
@@ -153,7 +155,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return is_deep_gemm_supported()
+        return is_deep_gemm_contiguous_layout_supported()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -410,7 +412,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         from vllm.platforms import current_platform
 
         return (
-            is_deep_gemm_supported()
+            is_deep_gemm_contiguous_layout_supported()
             and current_platform.is_device_capability_family(100)
         )
 

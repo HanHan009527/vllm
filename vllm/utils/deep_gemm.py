@@ -146,6 +146,12 @@ def is_deep_gemm_contiguous_layout_supported() -> bool:
             "get_mk_alignment_for_contiguous_layout not found"
         )
         return False
+    if _transform_sf_into_required_layout_impl is None:
+        logger.info_once(
+            "DeepGEMM contiguous layout disabled: "
+            "transform_sf_into_required_layout not found"
+        )
+        return False
     return True
 
 
