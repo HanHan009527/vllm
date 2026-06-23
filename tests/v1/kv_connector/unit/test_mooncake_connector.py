@@ -571,6 +571,78 @@ async def test_build_transfer_params_clips_partial_remote_prefill_block():
 
 
 @pytest.mark.asyncio
+async def test_build_transfer_params_clips_partial_kernel_block():
+    """Partial transfers use the physical kernel block size for byte lengths."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
+    worker.pcp_size = 1
+    worker.pcp_rank = 0
+    worker.kv_manager_block_size = 256
+    worker.block_size = 64
+    worker.cp_kv_cache_interleave_size = 256
+
+    block_len = 37440
+    local_region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=block_len,
+        kv_block_len=block_len,
+    )
+    remote_region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x2000,
+        block_len=block_len,
+        kv_block_len=block_len,
+    )
+    transfer_id = "xfer-partial-kernel-block"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-partial-kernel-block",
+        transfer_id=transfer_id,
+        local_block_ids=[[10]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        req_blocks={"d-req-partial-kernel-block": (transfer_id, [[20]])},
+        req_num_tokens={"d-req-partial-kernel-block": 11},
+        kv_caches_base_addr=[remote_region.base_addr],
+        block_lens=[remote_region.block_len],
+        registered_layer_names=[remote_region.layer_name],
+        registered_layer_indices=[remote_region.layer_index],
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-req-partial-kernel-block", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=[local_region],
+        remote_regions=[remote_region],
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [local_region.base_addr + 10 * block_len]
+    assert dst_ptrs == [remote_region.base_addr + 20 * block_len]
+    assert lengths == [block_len * 11 // 64]
+
+
+@pytest.mark.asyncio
 async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
     monkeypatch,
 ):

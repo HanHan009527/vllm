@@ -1958,8 +1958,11 @@ class MooncakeConnectorWorker:
                 )
                 # Collapse one contiguous block group into a single larger
                 # transfer descriptor when the per-block copy is identical.
+                transfer_block_size = getattr(
+                    self, "block_size", self.kv_manager_block_size
+                )
                 has_partial_blocks = any(
-                    token_count != self.kv_manager_block_size
+                    token_count < transfer_block_size
                     for token_count in remote_block_token_counts
                 )
                 can_coalesce = _can_coalesce_block_transfers(
@@ -1995,8 +1998,10 @@ class MooncakeConnectorWorker:
                             token_count_idx += 1
                             if token_count <= 0:
                                 continue
+                            block_token_count = min(token_count, transfer_block_size)
                             block_transfer_len = (
-                                transfer_len * token_count // self.kv_manager_block_size
+                                transfer_len * block_token_count
+                                // transfer_block_size
                             )
                             src_ptrs.append(
                                 local_region.base_addr
