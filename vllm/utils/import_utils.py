@@ -592,9 +592,9 @@ def has_cutedsl() -> bool:
     """
     try:
         import cutlass  # noqa: F401
-        import quack.compile_utils  # noqa: F401
 
         _patch_cutedsl_mlir_global_dtors()
+        import quack.compile_utils  # noqa: F401
         return True
     except Exception:
         return False
