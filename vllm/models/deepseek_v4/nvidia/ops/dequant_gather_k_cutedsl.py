@@ -3,6 +3,10 @@
 
 from functools import cache
 
+from vllm.utils.import_utils import _patch_cutedsl_mlir_global_dtors
+
+_patch_cutedsl_mlir_global_dtors()
+
 import cutlass
 import cutlass.cute as cute
 import torch

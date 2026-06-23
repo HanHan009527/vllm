@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -143,3 +144,29 @@ def test_patch_cutedsl_mlir_global_dtors_adds_matching_data_default():
 
 def test_make_cutedsl_global_dtor_data_default_empty_without_cutlass():
     assert _make_cutedsl_global_dtor_data_default([]) == []
+
+
+def test_deepseek_v4_cutedsl_leaf_modules_patch_before_quack_import():
+    repo_root = Path(__file__).parents[2]
+    leaf_modules = [
+        repo_root / "vllm/models/deepseek_v4/nvidia/ops/"
+        "dequant_gather_k_cutedsl.py",
+        repo_root / "vllm/models/deepseek_v4/nvidia/ops/"
+        "fused_indexer_q_cutedsl.py",
+        repo_root / "vllm/models/deepseek_v4/nvidia/ops/"
+        "sparse_attn_compress_cutedsl.py",
+    ]
+
+    for module_path in leaf_modules:
+        source = module_path.read_text()
+        patch_call = source.index("_patch_cutedsl_mlir_global_dtors()")
+        import_boundaries = [
+            index
+            for marker in (
+                "import cutlass",
+                "from cutlass._mlir.dialects import llvm",
+                "from quack.compile_utils import make_fake_tensor",
+            )
+            if (index := source.find(marker)) != -1
+        ]
+        assert patch_call < min(import_boundaries), module_path
