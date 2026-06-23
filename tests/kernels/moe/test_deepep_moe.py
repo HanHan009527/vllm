@@ -12,6 +12,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
+from tests.kernels.utils import torch_experts
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -27,7 +28,6 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import group_broadcast
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
@@ -330,6 +330,23 @@ def torch_moe_impl(
         test_tensors.topk,
         test_tensors.topk_weights,
     )
+    is_quantized = w1.dtype == current_platform.fp8_dtype()
+    if is_quantized and block_shape is not None:
+        assert not per_act_token_quant
+        assert w1_scale is not None and w2_scale is not None
+        return torch_experts(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            quant_dtype=w1.dtype,
+            per_act_token_quant=per_act_token_quant,
+            block_shape=block_shape,
+        )
+
     if using_fp8_dispatch:
         # The DeepEP implementation is requested to dispatch using FP8.
         # For numerical stability for testing, emulate the fp8 dispatch by
@@ -343,13 +360,9 @@ def torch_moe_impl(
             .to(a.dtype)
         )
 
-    is_quantized = w1.dtype == current_platform.fp8_dtype()
     a_dtype = a.dtype
     if is_quantized:
         assert w1_scale is not None and w2_scale is not None
-        if block_shape is not None:
-            w1_scale = group_broadcast(w1_scale, w1.shape)
-            w2_scale = group_broadcast(w2_scale, w2.shape)
         w1 = w1.to(dtype=torch.float32) * w1_scale
         w2 = w2.to(dtype=torch.float32) * w2_scale
         a = a.to(dtype=torch.float32)
