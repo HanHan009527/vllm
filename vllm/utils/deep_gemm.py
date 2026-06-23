@@ -117,6 +117,22 @@ def is_deep_gemm_e8m0_used() -> bool:
     return False
 
 
+@functools.cache
+def is_deep_gemm_hc_prenorm_supported() -> bool:
+    """Return `True` if DeepGEMM can run the mHC prenorm GEMM kernel."""
+    if not is_deep_gemm_supported():
+        return False
+
+    _lazy_init()
+    if _tf32_hc_prenorm_gemm_impl is None:
+        logger.info_once(
+            "DeepGEMM mHC prenorm GEMM disabled: "
+            "tf32_hc_prenorm_gemm not found"
+        )
+        return False
+    return True
+
+
 def _missing(*_: Any, **__: Any) -> NoReturn:
     """Placeholder for unavailable DeepGEMM backend."""
     raise RuntimeError(
@@ -575,6 +591,7 @@ __all__ = [
     "get_paged_mqa_logits_metadata",
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
+    "is_deep_gemm_hc_prenorm_supported",
     "is_deep_gemm_supported",
     "get_num_sms",
     "set_num_sms",
