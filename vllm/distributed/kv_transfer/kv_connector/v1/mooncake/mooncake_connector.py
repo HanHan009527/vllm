@@ -695,13 +695,23 @@ def _remote_block_token_counts(
     remote_block_ids_per_group: BlockIds,
     num_external_tokens: int | None,
     block_size: int,
+    start_token: int = 0,
 ) -> BlockIds:
     if num_external_tokens is None:
         return [[block_size] * len(group) for group in remote_block_ids_per_group]
 
+    end_token = start_token + num_external_tokens
+    start_block_idx = start_token // block_size
     return [
         [
-            min(max(num_external_tokens - block_idx * block_size, 0), block_size)
+            min(
+                max(
+                    min((start_block_idx + block_idx + 1) * block_size, end_token)
+                    - max((start_block_idx + block_idx) * block_size, start_token),
+                    0,
+                ),
+                block_size,
+            )
             for block_idx, _ in enumerate(remote_group)
         ]
         for remote_group in remote_block_ids_per_group
@@ -714,17 +724,24 @@ def _filter_remote_block_ids_for_pcp_rank(
     pcp_rank: int,
     block_size: int,
     cp_kv_cache_interleave_size: int,
+    start_token: int = 0,
 ) -> BlockIds:
     if pcp_size <= 1:
         return remote_block_ids_per_group
 
     chunks_per_block = block_size // cp_kv_cache_interleave_size
+    start_block_idx = start_token // block_size
     return [
         [
             block_id
             for block_idx, block_id in enumerate(remote_group)
             if any(
-                (block_idx * chunks_per_block + chunk_idx) % pcp_size == pcp_rank
+                (
+                    (start_block_idx + block_idx) * chunks_per_block
+                    + chunk_idx
+                )
+                % pcp_size
+                == pcp_rank
                 for chunk_idx in range(chunks_per_block)
             )
         ]
@@ -739,22 +756,30 @@ def _remote_block_token_counts_for_pcp_rank(
     pcp_rank: int,
     block_size: int,
     cp_kv_cache_interleave_size: int,
+    start_token: int = 0,
 ) -> BlockIds:
     block_token_counts = _remote_block_token_counts(
         remote_block_ids_per_group,
         num_external_tokens,
         block_size,
+        start_token=start_token,
     )
     if pcp_size <= 1:
         return block_token_counts
 
     chunks_per_block = block_size // cp_kv_cache_interleave_size
+    start_block_idx = start_token // block_size
     return [
         [
             token_count
             for block_idx, token_count in enumerate(group_token_counts)
             if any(
-                (block_idx * chunks_per_block + chunk_idx) % pcp_size == pcp_rank
+                (
+                    (start_block_idx + block_idx) * chunks_per_block
+                    + chunk_idx
+                )
+                % pcp_size
+                == pcp_rank
                 for chunk_idx in range(chunks_per_block)
             )
         ]
@@ -781,6 +806,7 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     block_lens: list[int]
     req_num_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
+    req_start_tokens: dict[ReqId, int] = msgspec.field(default_factory=dict)
     registered_layer_names: list[str] = msgspec.field(default_factory=list)
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_layer_aliases: list[list[str]] = msgspec.field(default_factory=list)
@@ -818,6 +844,7 @@ class PullReqMeta:
     transfer_id: TransferId
     local_block_ids: list[list[int]]
     num_external_tokens: int
+    external_start_token: int
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
     # Set expire time to avoid infinitely sending requests.
@@ -853,6 +880,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
         num_external_tokens: int = 0,
+        external_start_token: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -861,6 +889,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 d_req_id=request_id,
                 local_block_ids=local_block_ids,
                 num_external_tokens=num_external_tokens,
+                external_start_token=external_start_token,
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
@@ -1050,7 +1079,9 @@ class MooncakeConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[list[int]], int]] = {}
+        self._reqs_need_recv: dict[
+            ReqId, tuple[Request, list[list[int]], int, int]
+        ] = {}
         self._reqs_need_send: dict[ReqId, tuple[Request, list[list[int]]]] = {}
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -1152,11 +1183,16 @@ class MooncakeConnectorScheduler:
                     else ()
                 )
                 local_block_ids = self.get_sw_clipped_blocks(unhashed_block_ids)
+                token_ids = request.prompt_token_ids or []
+                external_start_token = max(
+                    len(token_ids) - 1 - num_external_tokens, 0
+                )
                 # Get unhashed blocks to pull from remote.
                 self._reqs_need_recv[request.request_id] = (
                     request,
                     local_block_ids,
                     num_external_tokens,
+                    external_start_token,
                 )
             else:
                 logger.warning(
@@ -1187,6 +1223,7 @@ class MooncakeConnectorScheduler:
                 req,
                 block_ids,
                 num_external_tokens,
+                external_start_token,
             ) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
                 meta.add_new_req(
@@ -1194,6 +1231,7 @@ class MooncakeConnectorScheduler:
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
                     num_external_tokens=num_external_tokens,
+                    external_start_token=external_start_token,
                 )
             self._reqs_need_recv.clear()
 
@@ -1241,7 +1279,7 @@ class MooncakeConnectorScheduler:
             # we must add empty block_ids to _reqs_need_recv so that our
             # worker side will notify and free blocks in the prefill instance.
             assert not self.is_kv_producer
-            self._reqs_need_recv[request.request_id] = (request, [], 0)
+            self._reqs_need_recv[request.request_id] = (request, [], 0, 0)
             params["do_remote_prefill"] = False
             return False, None
 
@@ -1782,6 +1820,7 @@ class MooncakeConnectorWorker:
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
             num_external_tokens = agent_meta.req_num_tokens.get(d_req_id)
+            external_start_token = agent_meta.req_start_tokens.get(d_req_id, 0)
             remote_block_token_counts_per_group = (
                 _remote_block_token_counts_for_pcp_rank(
                     remote_block_ids_per_group,
@@ -1794,6 +1833,7 @@ class MooncakeConnectorWorker:
                     cp_kv_cache_interleave_size=getattr(
                         self, "cp_kv_cache_interleave_size", 1
                     ),
+                    start_token=external_start_token,
                 )
             )
             remote_block_ids_per_group = _filter_remote_block_ids_for_pcp_rank(
@@ -1806,6 +1846,7 @@ class MooncakeConnectorWorker:
                 cp_kv_cache_interleave_size=getattr(
                     self, "cp_kv_cache_interleave_size", 1
                 ),
+                start_token=external_start_token,
             )
 
             if not remote_block_ids_per_group or all(
@@ -2309,6 +2350,10 @@ class MooncakeConnectorWorker:
             },
             req_num_tokens={
                 req_id: pull_meta.num_external_tokens
+                for req_id, pull_meta in pull_metas.items()
+            },
+            req_start_tokens={
+                req_id: pull_meta.external_start_token
                 for req_id, pull_meta in pull_metas.items()
             },
             kv_caches_base_addr=self.kv_caches_base_addr,
