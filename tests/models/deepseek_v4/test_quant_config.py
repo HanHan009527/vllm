@@ -104,7 +104,16 @@ quant_config = load_quant_config_module()
 DeepseekV4FP8Config = quant_config.DeepseekV4FP8Config
 
 
+def stub_logger(monkeypatch):
+    logger = types.ModuleType("vllm.logger")
+    logger.init_logger = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[attr-defined]
+        info_once=lambda *args, **kwargs: None
+    )
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger)
+
+
 def test_deepseek_v4_fp8_keeps_linear_and_expert_float32_scales(monkeypatch):
+    stub_logger(monkeypatch)
     hf_config = SimpleNamespace(
         expert_dtype="fp8",
         quantization_config={
@@ -131,6 +140,7 @@ def test_deepseek_v4_fp8_keeps_linear_and_expert_float32_scales(monkeypatch):
 
 
 def test_deepseek_v4_fp8_defaults_non_ue8m0_linear_scales(monkeypatch):
+    stub_logger(monkeypatch)
     hf_config = SimpleNamespace(
         expert_dtype="fp8",
         quantization_config={
