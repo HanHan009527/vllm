@@ -149,6 +149,30 @@ def test_make_cutedsl_global_dtor_data_default_empty_without_cutlass():
     assert _make_cutedsl_global_dtor_data_default([]) == []
 
 
+def test_make_cutedsl_global_dtor_data_default_uses_llvm_zero(monkeypatch):
+    calls = []
+
+    class FakeAttribute:
+
+        @staticmethod
+        def parse(text, context=None):
+            calls.append((text, context))
+            return f"{text}:{context}"
+
+    fake_ir = SimpleNamespace(Attribute=FakeAttribute)
+    fake_mlir = SimpleNamespace(ir=fake_ir)
+    fake_cutlass = SimpleNamespace(_mlir=fake_mlir)
+
+    monkeypatch.setitem(sys.modules, "cutlass", fake_cutlass)
+    monkeypatch.setitem(sys.modules, "cutlass._mlir", fake_mlir)
+
+    assert _make_cutedsl_global_dtor_data_default(["dtor-0"],
+                                                  context="ctx") == [
+                                                      "#llvm.zero:ctx"
+                                                  ]
+    assert calls == [("#llvm.zero", "ctx")]
+
+
 def test_patch_cutedsl_global_dtors_data_attr_extends_to_match_dtors():
     global_dtors = SimpleNamespace(
         attributes={

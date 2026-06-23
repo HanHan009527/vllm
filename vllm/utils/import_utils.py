@@ -553,9 +553,10 @@ def _make_cutedsl_global_dtor_data_default(
     from cutlass._mlir import ir
 
     if context is None:
-        return [ir.Attribute.parse("none") for _ in range(num_dtors)]
+        return [ir.Attribute.parse("#llvm.zero") for _ in range(num_dtors)]
     return [
-        ir.Attribute.parse("none", context=context) for _ in range(num_dtors)
+        ir.Attribute.parse("#llvm.zero", context=context)
+        for _ in range(num_dtors)
     ]
 
 
@@ -621,8 +622,8 @@ def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
     ``llvm.mlir_global_dtors(dtors=..., priorities=...)`` while the matching
     generated binding requires the newer third ``data`` argument. Newer MLIR
     verification requires ``dtors``, ``priorities``, and ``data`` arrays to have
-    matching lengths, so use the LLVM ``none`` attribute for each implicit data
-    entry instead of an always-empty array.
+    matching lengths, so use the LLVM zero attribute for each implicit data entry
+    instead of an always-empty array.
     """
     if llvm_module is None:
         from cutlass._mlir.dialects import llvm as llvm_module
