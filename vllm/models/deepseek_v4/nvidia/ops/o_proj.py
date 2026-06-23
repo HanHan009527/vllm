@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+import math
 import os
 
 import torch
@@ -82,6 +83,92 @@ def apply_bf16_linear(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _decode_scale_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if scale.dtype == torch.uint8 or (
+        e8m0_dtype is not None and scale.dtype == e8m0_dtype
+    ):
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        return _upcast_e8m0_to_fp32(scale)
+    return scale.to(torch.float32)
+
+
+def _expand_block_scales(
+    scale: torch.Tensor,
+    rows: int,
+    cols: int,
+) -> torch.Tensor:
+    scale = _decode_scale_to_fp32(scale)
+    row_blocks, col_blocks = scale.shape[-2:]
+    row_block = math.ceil(rows / row_blocks)
+    col_block = math.ceil(cols / col_blocks)
+    scale = torch.repeat_interleave(scale, row_block, dim=-2)[..., :rows, :]
+    scale = torch.repeat_interleave(scale, col_block, dim=-1)[..., :, :cols]
+    return scale
+
+
+def _reshape_wo_a_weight(
+    weight: torch.Tensor,
+    *,
+    n_groups: int,
+    o_lora_rank: int,
+    input_size: int,
+) -> torch.Tensor | None:
+    expected_numel = n_groups * o_lora_rank * input_size
+    if weight.numel() != expected_numel or weight.ndim not in (2, 3):
+        return None
+    return weight.reshape(n_groups, o_lora_rank, input_size)
+
+
+def get_wo_a_bf16_weight(
+    wo_a: nn.Module,
+    *,
+    n_groups: int,
+    o_lora_rank: int,
+    input_size: int,
+) -> torch.Tensor | None:
+    for attr in ("_fp8_bmm_weight_bf16", "_fp8_weight_bf16", "_dsv4_wo_a_bf16"):
+        weight = getattr(wo_a, attr, None)
+        if weight is None:
+            continue
+        grouped_weight = _reshape_wo_a_weight(
+            weight,
+            n_groups=n_groups,
+            o_lora_rank=o_lora_rank,
+            input_size=input_size,
+        )
+        if grouped_weight is not None:
+            return grouped_weight
+
+    raw_weight = getattr(wo_a, "weight", None)
+    if raw_weight is None:
+        return None
+    grouped_weight = _reshape_wo_a_weight(
+        raw_weight,
+        n_groups=n_groups,
+        o_lora_rank=o_lora_rank,
+        input_size=input_size,
+    )
+    if grouped_weight is None:
+        return None
+
+    weight_scale_inv = getattr(wo_a, "weight_scale_inv", None)
+    if weight_scale_inv is not None:
+        scale = _expand_block_scales(
+            weight_scale_inv.reshape(n_groups, -1, weight_scale_inv.shape[-1]),
+            o_lora_rank,
+            input_size,
+        )
+        grouped_weight = grouped_weight.to(torch.float32) / scale
+
+    grouped_weight = grouped_weight.to(torch.bfloat16)
+    wo_a._dsv4_wo_a_bf16 = grouped_weight
+    return grouped_weight
+
+
 def inv_rope_bf16_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -120,45 +207,32 @@ def inv_rope_bf16_o_proj(
     x1 = rope_pairs[..., 1:2]
     rope_pairs.copy_(torch.cat((x0 * cos + x1 * sin, x1 * cos - x0 * sin), dim=-1))
 
-    wo_a_weight = getattr(wo_a, "_fp8_bmm_weight_bf16", None)
-    if wo_a_weight is None:
-        wo_a_weight = getattr(wo_a, "weight", None)
-    wo_a_input_size = (
-        wo_a_weight.shape[-1]
-        if wo_a_weight is not None and wo_a_weight.ndim >= 2
-        else getattr(wo_a, "input_size", heads_per_group * head_dim)
-    )
-    flattened_size = num_heads * head_dim
-    if flattened_size % wo_a_input_size != 0:
-        raise ValueError(
-            "Cannot reshape O-proj input of size "
-            f"{flattened_size} into groups of size {wo_a_input_size}."
-        )
-
-    wo_a_groups = flattened_size // wo_a_input_size
+    wo_a_input_size = heads_per_group * head_dim
+    wo_a_groups = n_groups
     wo_a_input = projected.reshape(num_tokens, wo_a_groups, wo_a_input_size)
 
-    if wo_a_weight is not None and wo_a_weight.ndim in (2, 3):
-        if wo_a_weight.ndim == 3:
-            weight_groups, weight_rank, _ = wo_a_weight.shape
-            can_group = weight_groups == wo_a_groups and weight_rank == o_lora_rank
-        else:
-            can_group = (
-                wo_a_weight.shape[0] % o_lora_rank == 0
-                and wo_a_weight.shape[0] // o_lora_rank == wo_a_groups
-            )
-        if can_group:
-            grouped_weight = wo_a_weight.reshape(
-                wo_a_groups, o_lora_rank, wo_a_input_size
-            ).to(dtype=wo_a_input.dtype)
-            out = torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
-            log_nonfinite_tensor(
-                "wo_a_bf16_einsum_output",
-                out,
-                input=tensor_diag_summary(wo_a_input),
-                cached_weight=tensor_diag_summary(wo_a_weight),
-            )
-            return out
+    wo_a_weight = get_wo_a_bf16_weight(
+        wo_a,
+        n_groups=wo_a_groups,
+        o_lora_rank=o_lora_rank,
+        input_size=wo_a_input_size,
+    )
+    if wo_a_weight is not None:
+        grouped_weight = wo_a_weight.to(dtype=wo_a_input.dtype)
+        out = torch.einsum("bgi,gri->bgr", wo_a_input, grouped_weight)
+        log_nonfinite_tensor(
+            "wo_a_bf16_einsum_output",
+            out,
+            input=tensor_diag_summary(wo_a_input),
+            cached_weight=tensor_diag_summary(wo_a_weight),
+        )
+        return out
+
+    if getattr(wo_a, "is_bmm", False):
+        raise RuntimeError(
+            "DeepSeek V4 O-proj BF16 fallback requires a grouped BF16 wo_a "
+            "weight when wo_a.is_bmm is set."
+        )
 
     out = maybe_unpack_linear_output(wo_a(wo_a_input))
     log_nonfinite_tensor(

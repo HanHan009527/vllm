@@ -57,6 +57,7 @@ def load_o_proj_module() -> Any:
 
 o_proj = load_o_proj_module()
 get_fp8_weight_scale = o_proj.get_fp8_weight_scale
+get_wo_a_bf16_weight = o_proj.get_wo_a_bf16_weight
 inv_rope_bf16_o_proj = o_proj.inv_rope_bf16_o_proj
 deep_gemm_fp8_o_proj = o_proj.deep_gemm_fp8_o_proj
 
@@ -148,6 +149,58 @@ class FakeCachedGroupedWoA(nn.Module):
         raise AssertionError("cached BF16 BMM weight should bypass wo_a.forward")
 
 
+class FakeFlatCachedGroupedWoA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.full((2, 4), float("nan"), dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self._fp8_weight_bf16 = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0, 0.0],
+            ],
+            dtype=torch.bfloat16,
+        )
+
+    def forward(self, x):
+        raise AssertionError("cached flat BF16 weight should bypass wo_a.forward")
+
+
+class FakeInverseScaleGroupedWoA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0, 0.0],
+                    [0.0, 2.0, 0.0, 0.0],
+                ],
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.full((2, 1, 1), 0.5, dtype=torch.float32),
+            requires_grad=False,
+        )
+
+    def forward(self, x):
+        raise AssertionError("raw grouped BF16 fallback should bypass wo_a.forward")
+
+
+class FakeBmmWoAWithoutGroupedWeight(nn.Module):
+    is_bmm = True
+
+    def forward(self, x):
+        raise AssertionError("BMM fallback should fail before wo_a.forward")
+
+
 class FakeSingleGroupWoA(nn.Module):
     def __init__(self):
         super().__init__()
@@ -201,6 +254,64 @@ def test_inv_rope_bf16_o_proj_uses_cached_bmm_weight():
 
     expected = torch.tensor([[[1.0, 2.0], [10.0, 12.0]]], dtype=torch.bfloat16)
     torch.testing.assert_close(out, expected)
+
+
+def test_inv_rope_bf16_o_proj_uses_flat_cached_bmm_weight():
+    o = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]], dtype=torch.bfloat16
+    )
+    out = inv_rope_bf16_o_proj(
+        o,
+        torch.tensor([0], dtype=torch.long),
+        torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        FakeFlatCachedGroupedWoA(),
+        n_groups=2,
+        heads_per_group=1,
+        nope_dim=2,
+        rope_dim=2,
+        o_lora_rank=2,
+    )
+
+    expected = torch.tensor([[[1.0, 2.0], [10.0, 12.0]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(out, expected)
+
+
+def test_get_wo_a_bf16_weight_dequantizes_raw_inverse_scale_weight():
+    weight = get_wo_a_bf16_weight(
+        FakeInverseScaleGroupedWoA(),
+        n_groups=2,
+        o_lora_rank=2,
+        input_size=4,
+    )
+
+    assert weight is not None
+    expected = torch.tensor(
+        [
+            [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]],
+            [[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(weight, expected)
+
+
+def test_inv_rope_bf16_o_proj_fails_closed_for_bmm_without_grouped_weight():
+    try:
+        inv_rope_bf16_o_proj(
+            torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            FakeBmmWoAWithoutGroupedWeight(),
+            n_groups=1,
+            heads_per_group=1,
+            nope_dim=2,
+            rope_dim=2,
+            o_lora_rank=1,
+        )
+    except RuntimeError as exc:
+        assert "grouped BF16 wo_a weight" in str(exc)
+    else:
+        raise AssertionError("BMM fallback should fail without grouped BF16 weight")
 
 
 class FakeWoB(nn.Module):
