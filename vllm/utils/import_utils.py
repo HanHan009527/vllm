@@ -540,14 +540,29 @@ def has_fbgemm_gpu() -> bool:
     return _has_module("fbgemm_gpu")
 
 
+def _make_cutedsl_global_dtor_data_default(dtors: Any) -> list[Any]:
+    """Build the default LLVM global-dtor data list for CuteDSL bindings."""
+    try:
+        num_dtors = len(dtors)
+    except TypeError:
+        num_dtors = 0
+    if num_dtors == 0:
+        return []
+
+    from cutlass._mlir import ir
+
+    return [ir.Attribute.parse("none") for _ in range(num_dtors)]
+
+
 def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
     """Patch CuteDSL 4.5.x global-dtor creation across binding revisions.
 
     Some nvidia-cutlass-dsl 4.5.2 builds ship a Python provider that calls
     ``llvm.mlir_global_dtors(dtors=..., priorities=...)`` while the matching
-    generated binding requires the newer third ``data`` argument. The LLVM IR
-    global-dtor data field can be empty, so defaulting it preserves the provider
-    behavior and avoids treating an otherwise usable CuteDSL install as broken.
+    generated binding requires the newer third ``data`` argument. Newer MLIR
+    verification requires ``dtors``, ``priorities``, and ``data`` arrays to have
+    matching lengths, so use the LLVM ``none`` attribute for each implicit data
+    entry instead of an always-empty array.
     """
     if llvm_module is None:
         from cutlass._mlir.dialects import llvm as llvm_module
@@ -573,7 +588,7 @@ def _patch_cutedsl_mlir_global_dtors(llvm_module: Any | None = None) -> None:
                                             *args,
                                             **kwargs):
         if data is None:
-            data = []
+            data = _make_cutedsl_global_dtor_data_default(dtors)
         return mlir_global_dtors(dtors, priorities, data, *args, **kwargs)
 
     mlir_global_dtors_with_data_default._vllm_data_default_patch = True
