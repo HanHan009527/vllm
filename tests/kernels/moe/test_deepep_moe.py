@@ -641,3 +641,51 @@ def test_low_latency_deep_ep_moe_block_fp8(workspace_init):
         use_fp8_dispatch,
         False,
     )
+
+
+@pytest.mark.distributed(num_gpus=2)
+@pytest.mark.skipif(
+    current_platform.device_count() < 2,
+    reason="Need at least 2 GPUs to run the test.",
+)
+@create_new_process_for_each_test(method="spawn")
+@requires_deep_ep
+def test_low_latency_deep_ep_moe_dsv4_block_fp8(workspace_init):
+    low_latency_mode = True
+    use_fp8_dispatch = True
+    block_shape = [128, 128]
+    set_random_seed(7)
+
+    world_size, dp_size = (2, 1)
+    config = TestConfig(
+        dtype=current_platform.fp8_dtype(),
+        topk=6,
+        m=2,
+        k=4096,
+        n=2048,
+        num_experts=256,
+        block_shape=block_shape,
+        normalize_topk_weights=True,
+    )
+
+    w1, w2, w1_scale, w2_scale = make_weights(
+        config.num_experts,
+        config.n,
+        config.k,
+        config.dtype,
+        block_shape,
+    )
+
+    parallel_launch(
+        world_size,
+        _deep_ep_moe,
+        low_latency_mode,
+        dp_size,
+        config,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        use_fp8_dispatch,
+        False,
+    )
