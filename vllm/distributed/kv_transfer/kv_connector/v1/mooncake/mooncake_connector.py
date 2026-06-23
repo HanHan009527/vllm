@@ -1848,6 +1848,20 @@ class MooncakeConnectorWorker:
                 ),
                 start_token=external_start_token,
             )
+            logger.debug(
+                "Mooncake transfer request %s/%s on PP%d PCP%d: "
+                "num_external_tokens=%s external_start_token=%d "
+                "local_blocks=%s remote_blocks=%s remote_token_counts=%s",
+                d_req_id,
+                send_meta.transfer_id,
+                getattr(self, "pp_rank", 0),
+                getattr(self, "pcp_rank", 0),
+                num_external_tokens,
+                external_start_token,
+                [group[:4] for group in send_meta.local_block_ids[:4]],
+                [group[:4] for group in remote_block_ids_per_group[:4]],
+                [group[:4] for group in remote_block_token_counts_per_group[:4]],
+            )
 
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
@@ -2030,9 +2044,12 @@ class MooncakeConnectorWorker:
                     logged_transfer_plan = True
 
             logger.debug(
-                "Sending kv_caches for request %s (%d blocks) to %s",
+                "Sending kv_caches for request %s (%d blocks, %d descs, %d bytes) "
+                "to %s",
                 d_req_id,
                 selected_block_count,
+                len(src_ptrs),
+                sum(lengths),
                 remote_session,
             )
 
