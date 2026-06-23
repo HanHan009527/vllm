@@ -16,6 +16,8 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
+    is_deep_gemm_mqa_logits_supported,
+    is_deep_gemm_paged_mqa_logits_supported,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -35,6 +37,127 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _require_fp8_sparse_indexer_fallback(
+    q_scale: torch.Tensor | None,
+    q_values: torch.Tensor,
+    fallback_name: str,
+) -> None:
+    if q_scale is not None or q_values.dtype in (torch.int8, torch.uint8):
+        raise RuntimeError(
+            f"{fallback_name} only supports the FP8 sparse-indexer path when "
+            "DeepGEMM MQA logits kernels are unavailable. The FP4/MXFP4 path "
+            "requires a DeepGEMM build with fp8_fp4 MQA logits support."
+        )
+
+
+def _fp8_mqa_logits_torch_fallback(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    _require_fp8_sparse_indexer_fallback(q_scale, q_values, "FP8 MQA logits fallback")
+
+    k_values, k_scale = kv
+    q_dequant = q_values.float()
+    k_dequant = k_values.float() * k_scale.float().reshape(k_values.shape[0], 1)
+    score = torch.einsum("mhd,nd->hmn", q_dequant, k_dequant)
+    logits = (score.relu() * weights.float().transpose(0, 1).unsqueeze(-1)).sum(dim=0)
+    positions = torch.arange(k_values.shape[0], device=q_values.device)
+    mask = (positions[None, :] >= cu_seqlen_ks[:, None]) & (
+        positions[None, :] < cu_seqlen_ke[:, None]
+    )
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def _dequantize_paged_fp8_kv_cache(
+    kv_cache: torch.Tensor,
+    head_dim: int,
+) -> torch.Tensor:
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] < head_dim + 4:
+        raise RuntimeError(
+            "FP8 paged MQA logits fallback expects a uint8 KV cache with "
+            "FP8 values followed by fp32 scales."
+        )
+    k_values = kv_cache[..., :head_dim].contiguous().view(torch.float8_e4m3fn)
+    k_scales = kv_cache[..., head_dim : head_dim + 4].contiguous().view(torch.float32)
+    return k_values.float() * k_scales.float()
+
+
+def _fp8_paged_mqa_logits_torch_fallback(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    _require_fp8_sparse_indexer_fallback(
+        q_scale, q_values, "FP8 paged MQA logits fallback"
+    )
+
+    batch_size, next_n, _, head_dim = q_values.shape
+    _, block_size, _, _ = kv_cache.shape
+    q_dequant = q_values.float()
+    kv_dequant = _dequantize_paged_fp8_kv_cache(kv_cache, head_dim)
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+
+    for batch_idx in range(batch_size):
+        if context_lens.dim() == 2:
+            q_offsets = context_lens[batch_idx].to(device=q_values.device) - 1
+            context_len = int(context_lens[batch_idx].max().item())
+        else:
+            context_len = int(context_lens[batch_idx].item())
+            q_offsets = torch.arange(
+                context_len - next_n,
+                context_len,
+                device=q_values.device,
+                dtype=torch.int32,
+            )
+
+        weight_slice = (
+            weights[batch_idx * next_n : (batch_idx + 1) * next_n]
+            .float()
+            .transpose(0, 1)
+            .contiguous()
+        )
+        for block_rank in range((context_len + block_size - 1) // block_size):
+            block_idx = int(block_tables[batch_idx, block_rank].item())
+            k_block = kv_dequant[block_idx, :, 0, :]
+            k_offsets = torch.arange(
+                block_rank * block_size,
+                (block_rank + 1) * block_size,
+                device=q_values.device,
+                dtype=torch.int32,
+            )
+            valid_mask = (k_offsets[None, :] < context_len) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            score = torch.einsum("nhd,td->hnt", q_dequant[batch_idx], k_block)
+            block_logits = (
+                score.masked_fill(~valid_mask[None, :, :], float("-inf")).relu()
+                * weight_slice[..., None]
+            ).sum(dim=0)
+            block_logits = block_logits.masked_fill(~valid_mask, float("-inf"))
+            row_start = batch_idx * next_n
+            row_end = row_start + next_n
+            col_start = block_rank * block_size
+            col_end = min(col_start + block_size, max_model_len)
+            logits[row_start:row_end, col_start:col_end] = block_logits[
+                :, : col_end - col_start
+            ]
+
+    return logits
 
 
 def _gather_workspace_shapes(
@@ -230,14 +353,23 @@ def sparse_attn_indexer(
                     chunk.cu_seqlen_ke,
                 )
             else:
-                logits = fp8_fp4_mqa_logits(
-                    (q_slice_cast, q_scale_slice),
-                    (k_quant_cast, k_scale_cast),
-                    weights[chunk.token_start : chunk.token_end],
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    clean_logits=False,
-                )
+                if is_deep_gemm_mqa_logits_supported():
+                    logits = fp8_fp4_mqa_logits(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        clean_logits=False,
+                    )
+                else:
+                    logits = _fp8_mqa_logits_torch_fallback(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                    )
             num_rows = logits.shape[0]
 
             topk_indices = topk_indices_buffer[
@@ -321,16 +453,26 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
+            if is_deep_gemm_paged_mqa_logits_supported():
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
+            else:
+                logits = _fp8_paged_mqa_logits_torch_fallback(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len=max_model_len,
+                )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 

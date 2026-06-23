@@ -168,6 +168,43 @@ def is_deep_gemm_fp8_einsum_supported() -> bool:
     return True
 
 
+@functools.cache
+def is_deep_gemm_mqa_logits_supported() -> bool:
+    """Return `True` if DeepGEMM can run non-paged MQA logits kernels."""
+    if not is_deep_gemm_supported():
+        return False
+
+    _lazy_init()
+    if _fp8_fp4_mqa_logits_impl is None:
+        logger.info_once(
+            "DeepGEMM MQA logits disabled: fp8_fp4_mqa_logits not found"
+        )
+        return False
+    return True
+
+
+@functools.cache
+def is_deep_gemm_paged_mqa_logits_supported() -> bool:
+    """Return `True` if DeepGEMM can run paged MQA logits kernels."""
+    if not is_deep_gemm_supported():
+        return False
+
+    _lazy_init()
+    if _fp8_fp4_paged_mqa_logits_impl is None:
+        logger.info_once(
+            "DeepGEMM paged MQA logits disabled: "
+            "fp8_fp4_paged_mqa_logits not found"
+        )
+        return False
+    if _get_paged_mqa_logits_metadata_impl is None:
+        logger.info_once(
+            "DeepGEMM paged MQA logits disabled: "
+            "get_paged_mqa_logits_metadata not found"
+        )
+        return False
+    return True
+
+
 def _missing(*_: Any, **__: Any) -> NoReturn:
     """Placeholder for unavailable DeepGEMM backend."""
     raise RuntimeError(
@@ -629,6 +666,8 @@ __all__ = [
     "is_deep_gemm_e8m0_used",
     "is_deep_gemm_fp8_einsum_supported",
     "is_deep_gemm_hc_prenorm_supported",
+    "is_deep_gemm_mqa_logits_supported",
+    "is_deep_gemm_paged_mqa_logits_supported",
     "is_deep_gemm_supported",
     "get_num_sms",
     "set_num_sms",

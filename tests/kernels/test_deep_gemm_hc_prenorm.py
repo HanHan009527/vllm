@@ -16,9 +16,13 @@ import vllm.utils.deep_gemm as deep_gemm
 def clear_hc_prenorm_support_cache():
     deep_gemm.is_deep_gemm_hc_prenorm_supported.cache_clear()
     deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
+    deep_gemm.is_deep_gemm_mqa_logits_supported.cache_clear()
+    deep_gemm.is_deep_gemm_paged_mqa_logits_supported.cache_clear()
     yield
     deep_gemm.is_deep_gemm_hc_prenorm_supported.cache_clear()
     deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
+    deep_gemm.is_deep_gemm_mqa_logits_supported.cache_clear()
+    deep_gemm.is_deep_gemm_paged_mqa_logits_supported.cache_clear()
 
 
 def test_hc_prenorm_support_short_circuits_when_deep_gemm_disabled(
@@ -120,3 +124,55 @@ def test_deep_gemm_moe_support_requires_contiguous_layout_helpers(
 
     assert not deep_gemm_moe.DeepGemmExperts._supports_current_device()
     assert not batched_deep_gemm_moe.BatchedDeepGemmExperts._supports_current_device()
+
+
+def test_mqa_logits_support_requires_deep_gemm_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_supported", lambda: True)
+    monkeypatch.setattr(deep_gemm, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm, "_fp8_fp4_mqa_logits_impl", None)
+
+    assert not deep_gemm.is_deep_gemm_mqa_logits_supported()
+
+    def fake_mqa_logits(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(deep_gemm, "_fp8_fp4_mqa_logits_impl", fake_mqa_logits)
+    deep_gemm.is_deep_gemm_mqa_logits_supported.cache_clear()
+
+    assert deep_gemm.is_deep_gemm_mqa_logits_supported()
+    assert isinstance(deep_gemm._fp8_fp4_mqa_logits_impl, Callable)
+
+
+def test_paged_mqa_logits_support_requires_deep_gemm_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_supported", lambda: True)
+    monkeypatch.setattr(deep_gemm, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm, "_fp8_fp4_paged_mqa_logits_impl", None)
+    monkeypatch.setattr(deep_gemm, "_get_paged_mqa_logits_metadata_impl", None)
+
+    assert not deep_gemm.is_deep_gemm_paged_mqa_logits_supported()
+
+    def fake_paged_mqa_logits(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        deep_gemm, "_fp8_fp4_paged_mqa_logits_impl", fake_paged_mqa_logits
+    )
+    deep_gemm.is_deep_gemm_paged_mqa_logits_supported.cache_clear()
+
+    assert not deep_gemm.is_deep_gemm_paged_mqa_logits_supported()
+
+    def fake_paged_metadata(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        deep_gemm, "_get_paged_mqa_logits_metadata_impl", fake_paged_metadata
+    )
+    deep_gemm.is_deep_gemm_paged_mqa_logits_supported.cache_clear()
+
+    assert deep_gemm.is_deep_gemm_paged_mqa_logits_supported()
+    assert isinstance(deep_gemm._fp8_fp4_paged_mqa_logits_impl, Callable)
+    assert isinstance(deep_gemm._get_paged_mqa_logits_metadata_impl, Callable)
