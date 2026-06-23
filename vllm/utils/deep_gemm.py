@@ -134,6 +134,22 @@ def is_deep_gemm_hc_prenorm_supported() -> bool:
 
 
 @functools.cache
+def is_deep_gemm_contiguous_layout_supported() -> bool:
+    """Return `True` if DeepGEMM exposes contiguous-layout FP8 helpers."""
+    if not is_deep_gemm_supported():
+        return False
+
+    _lazy_init()
+    if _get_mk_alignment_for_contiguous_layout_impl is None:
+        logger.info_once(
+            "DeepGEMM contiguous layout disabled: "
+            "get_mk_alignment_for_contiguous_layout not found"
+        )
+        return False
+    return True
+
+
+@functools.cache
 def is_deep_gemm_fp8_einsum_supported() -> bool:
     """Return `True` if DeepGEMM can run FP8 einsum kernels."""
     if not is_deep_gemm_supported():
@@ -603,6 +619,7 @@ __all__ = [
     "fp8_fp4_paged_mqa_logits",
     "get_paged_mqa_logits_metadata",
     "per_block_cast_to_fp8",
+    "is_deep_gemm_contiguous_layout_supported",
     "is_deep_gemm_e8m0_used",
     "is_deep_gemm_fp8_einsum_supported",
     "is_deep_gemm_hc_prenorm_supported",

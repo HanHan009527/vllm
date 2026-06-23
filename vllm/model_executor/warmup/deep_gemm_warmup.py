@@ -24,6 +24,7 @@ from vllm.tracing import instrument
 from vllm.utils.deep_gemm import (
     fp8_gemm_nt,
     get_mk_alignment_for_contiguous_layout,
+    is_deep_gemm_contiguous_layout_supported,
     m_grouped_fp8_gemm_nt_contiguous,
 )
 from vllm.utils.math_utils import cdiv
@@ -134,7 +135,6 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
 
     # FIXME: this logic is brittle and incorrect - since we
     # could use DeepGEMM with for than just Fp8LinearMethod
-    block_size = get_mk_alignment_for_contiguous_layout()[0]
     if not (
         isinstance(module, LinearBase)
         and isinstance(module.quant_method, Fp8LinearMethod)
@@ -144,9 +144,14 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     ):
         return False
 
+    if not is_deep_gemm_contiguous_layout_supported():
+        return False
+
+    deep_gemm_block_sizes = get_mk_alignment_for_contiguous_layout()
+    block_size = deep_gemm_block_sizes[0]
     w, _, block_sizes = _extract_data_from_linear_base_module(module)
     return (
-        block_sizes == get_mk_alignment_for_contiguous_layout()
+        block_sizes == deep_gemm_block_sizes
         and w.ndim == 2
         and w.shape[0] % block_size == 0
         and w.shape[1] % block_size == 0
@@ -158,6 +163,9 @@ def _fused_moe_grouped_gemm_may_use_deep_gemm(module: torch.nn.Module) -> bool:
         return False
 
     if not isinstance(module, MoERunner):
+        return False
+
+    if not is_deep_gemm_contiguous_layout_supported():
         return False
 
     quant_method = module._quant_method

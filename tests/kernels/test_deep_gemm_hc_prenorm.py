@@ -11,8 +11,10 @@ import vllm.utils.deep_gemm as deep_gemm
 @pytest.fixture(autouse=True)
 def clear_hc_prenorm_support_cache():
     deep_gemm.is_deep_gemm_hc_prenorm_supported.cache_clear()
+    deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
     yield
     deep_gemm.is_deep_gemm_hc_prenorm_supported.cache_clear()
+    deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
 
 
 def test_hc_prenorm_support_short_circuits_when_deep_gemm_disabled(
@@ -52,3 +54,30 @@ def test_hc_prenorm_support_requires_deep_gemm_symbol(
 
     assert deep_gemm.is_deep_gemm_hc_prenorm_supported()
     assert isinstance(deep_gemm._tf32_hc_prenorm_gemm_impl, Callable)
+
+
+def test_contiguous_layout_support_requires_deep_gemm_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_supported", lambda: True)
+    monkeypatch.setattr(deep_gemm, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_mk_alignment_for_contiguous_layout_impl",
+        None,
+    )
+
+    assert not deep_gemm.is_deep_gemm_contiguous_layout_supported()
+
+    def fake_get_mk_alignment_for_contiguous_layout():
+        return 128
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_mk_alignment_for_contiguous_layout_impl",
+        fake_get_mk_alignment_for_contiguous_layout,
+    )
+    deep_gemm.is_deep_gemm_contiguous_layout_supported.cache_clear()
+
+    assert deep_gemm.is_deep_gemm_contiguous_layout_supported()
+    assert isinstance(deep_gemm._get_mk_alignment_for_contiguous_layout_impl, Callable)
