@@ -15,6 +15,7 @@ def load_quant_config_module() -> Any:
 
     stub_names = (
         "vllm.config",
+        "vllm.logger",
         "vllm.model_executor.layers.fused_moe",
         "vllm.model_executor.layers.quantization",
         "vllm.model_executor.layers.quantization.fp8",
@@ -29,6 +30,12 @@ def load_quant_config_module() -> Any:
         config = types.ModuleType("vllm.config")
         config.get_current_vllm_config = None  # type: ignore[attr-defined]
         sys.modules["vllm.config"] = config
+
+        logger = types.ModuleType("vllm.logger")
+        logger.init_logger = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[attr-defined]
+            info_once=lambda *args, **kwargs: None
+        )
+        sys.modules["vllm.logger"] = logger
 
         fused_moe = types.ModuleType("vllm.model_executor.layers.fused_moe")
 
