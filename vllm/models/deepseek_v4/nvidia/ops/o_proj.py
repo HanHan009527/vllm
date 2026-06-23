@@ -259,6 +259,49 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     return einsum_recipe, tma_aligned_scales
 
 
+def should_fallback_fp8_einsum_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    return (
+        "DeepGEMM backend is not available" in message
+        or "fp8_einsum" in message
+        or "deepgemm" in message.lower()
+        or "layout.hpp" in message
+    )
+
+
+def bf16_o_proj(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    wo_a: nn.Module,
+    wo_b: nn.Module,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    z = inv_rope_bf16_o_proj(
+        o,
+        positions,
+        cos_sin_cache,
+        wo_a,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+        o_lora_rank=o_lora_rank,
+    )
+    log_nonfinite_tensor(
+        "wo_a_output_z",
+        z,
+        wo_a_cache=tensor_diag_summary(getattr(wo_a, "_fp8_bmm_weight_bf16", None)),
+        wo_b_cache=tensor_diag_summary(getattr(wo_b, "_fp8_weight_bf16", None)),
+    )
+    return apply_bf16_linear(wo_b, z.flatten(1))
+
+
 def deep_gemm_fp8_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -286,26 +329,18 @@ def deep_gemm_fp8_o_proj(
         or weight_scale is None
         or not is_deep_gemm_fp8_einsum_supported()
     ):
-        z = inv_rope_bf16_o_proj(
+        return bf16_o_proj(
             o,
             positions,
             cos_sin_cache,
             wo_a,
+            wo_b,
             n_groups=n_groups,
             heads_per_group=heads_per_group,
             nope_dim=nope_dim,
             rope_dim=rope_dim,
             o_lora_rank=o_lora_rank,
         )
-        log_nonfinite_tensor(
-            "wo_a_output_z",
-            z,
-            wo_a_cache=tensor_diag_summary(
-                getattr(wo_a, "_fp8_bmm_weight_bf16", None)
-            ),
-            wo_b_cache=tensor_diag_summary(getattr(wo_b, "_fp8_weight_bf16", None)),
-        )
-        return apply_bf16_linear(wo_b, z.flatten(1))
 
     o_fp8, o_scale = fused_inv_rope_fp8_quant(
         o,
@@ -322,11 +357,31 @@ def deep_gemm_fp8_o_proj(
         device=o.device,
         dtype=torch.bfloat16,
     )
-    fp8_einsum(
-        "bhr,hdr->bhd",
-        (o_fp8, o_scale),
-        (wo_a.weight, weight_scale),
-        z,
-        recipe=einsum_recipe,
-    )
+    try:
+        fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale),
+            (wo_a.weight, weight_scale),
+            z,
+            recipe=einsum_recipe,
+        )
+    except RuntimeError as exc:
+        if not should_fallback_fp8_einsum_error(exc):
+            raise
+        logger.warning(
+            "DeepSeek V4 O-proj FP8 einsum failed; falling back to BF16: %s",
+            exc,
+        )
+        return bf16_o_proj(
+            o,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_b,
+            n_groups=n_groups,
+            heads_per_group=heads_per_group,
+            nope_dim=nope_dim,
+            rope_dim=rope_dim,
+            o_lora_rank=o_lora_rank,
+        )
     return wo_b(z.flatten(1))

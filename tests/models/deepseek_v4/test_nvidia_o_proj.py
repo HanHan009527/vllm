@@ -60,6 +60,7 @@ get_fp8_weight_scale = o_proj.get_fp8_weight_scale
 get_wo_a_bf16_weight = o_proj.get_wo_a_bf16_weight
 inv_rope_bf16_o_proj = o_proj.inv_rope_bf16_o_proj
 deep_gemm_fp8_o_proj = o_proj.deep_gemm_fp8_o_proj
+should_fallback_fp8_einsum_error = o_proj.should_fallback_fp8_einsum_error
 
 
 def test_get_fp8_weight_scale_prefers_weight_scale_inv():
@@ -487,3 +488,84 @@ def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_without_fp8_einsum():
         wo_b.input, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
     )
     torch.testing.assert_close(out, torch.tensor([[2.0, 3.0]], dtype=torch.bfloat16))
+
+
+def test_should_fallback_fp8_einsum_error_is_deepgemm_specific():
+    assert should_fallback_fp8_einsum_error(
+        RuntimeError("Assertion error (layout.hpp:39): t.dim() == N")
+    )
+    assert should_fallback_fp8_einsum_error(
+        RuntimeError("DeepGEMM backend is not available or outdated")
+    )
+    assert not should_fallback_fp8_einsum_error(RuntimeError("unrelated failure"))
+
+
+def test_deep_gemm_fp8_o_proj_falls_back_when_fp8_einsum_crashes(monkeypatch):
+    wo_b = FakeWoB()
+
+    def fake_fused_inv_rope_fp8_quant(o, *args, **kwargs):
+        return torch.empty_like(o), torch.ones((1, 1, 1), dtype=torch.float32)
+
+    def fake_fp8_einsum(*args, **kwargs):
+        raise RuntimeError("Assertion error (layout.hpp:39): t.dim() == N")
+
+    monkeypatch.setattr(o_proj, "is_deep_gemm_fp8_einsum_supported", lambda: True)
+    monkeypatch.setattr(
+        o_proj, "fused_inv_rope_fp8_quant", fake_fused_inv_rope_fp8_quant
+    )
+    monkeypatch.setattr(o_proj, "fp8_einsum", fake_fp8_einsum)
+
+    out = deep_gemm_fp8_o_proj(
+        torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+        torch.tensor([0], dtype=torch.long),
+        torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        FakeInverseScaleWoA(),
+        wo_b,
+        n_groups=1,
+        heads_per_group=1,
+        nope_dim=2,
+        rope_dim=2,
+        o_lora_rank=2,
+        einsum_recipe=(1, 128, 128),
+        tma_aligned_scales=False,
+    )
+
+    assert wo_b.input is not None
+    torch.testing.assert_close(
+        wo_b.input, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(out, torch.tensor([[2.0, 3.0]], dtype=torch.bfloat16))
+
+
+def test_deep_gemm_fp8_o_proj_reraises_non_deepgemm_runtime_error(monkeypatch):
+    def fake_fused_inv_rope_fp8_quant(o, *args, **kwargs):
+        return torch.empty_like(o), torch.ones((1, 1, 1), dtype=torch.float32)
+
+    def fake_fp8_einsum(*args, **kwargs):
+        raise RuntimeError("unrelated failure")
+
+    monkeypatch.setattr(o_proj, "is_deep_gemm_fp8_einsum_supported", lambda: True)
+    monkeypatch.setattr(
+        o_proj, "fused_inv_rope_fp8_quant", fake_fused_inv_rope_fp8_quant
+    )
+    monkeypatch.setattr(o_proj, "fp8_einsum", fake_fp8_einsum)
+
+    try:
+        deep_gemm_fp8_o_proj(
+            torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            FakeInverseScaleWoA(),
+            FakeWoB(),
+            n_groups=1,
+            heads_per_group=1,
+            nope_dim=2,
+            rope_dim=2,
+            o_lora_rank=2,
+            einsum_recipe=(1, 128, 128),
+            tma_aligned_scales=False,
+        )
+    except RuntimeError as exc:
+        assert "unrelated failure" in str(exc)
+    else:
+        raise AssertionError("non-DeepGEMM runtime errors should not fall back")
