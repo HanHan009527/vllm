@@ -540,7 +540,8 @@ def has_fbgemm_gpu() -> bool:
     return _has_module("fbgemm_gpu")
 
 
-def _make_cutedsl_global_dtor_data_default(dtors: Any) -> list[Any]:
+def _make_cutedsl_global_dtor_data_default(
+        dtors: Any, context: Any | None = None) -> list[Any]:
     """Build the default LLVM global-dtor data list for CuteDSL bindings."""
     try:
         num_dtors = len(dtors)
@@ -551,10 +552,15 @@ def _make_cutedsl_global_dtor_data_default(dtors: Any) -> list[Any]:
 
     from cutlass._mlir import ir
 
-    return [ir.Attribute.parse("none") for _ in range(num_dtors)]
+    if context is None:
+        return [ir.Attribute.parse("none") for _ in range(num_dtors)]
+    return [
+        ir.Attribute.parse("none", context=context) for _ in range(num_dtors)
+    ]
 
 
-def _patch_cutedsl_global_dtors_data_attr(global_dtors: Any) -> None:
+def _patch_cutedsl_global_dtors_data_attr(
+        global_dtors: Any, context: Any | None = None) -> None:
     """Keep LLVM global-dtor ``data`` attributes aligned with ``dtors``."""
     try:
         attrs = global_dtors.attributes
@@ -566,7 +572,7 @@ def _patch_cutedsl_global_dtors_data_attr(global_dtors: Any) -> None:
 
     if missing_data > 0:
         attrs["data"] += _make_cutedsl_global_dtor_data_default(
-            [None] * missing_data)
+            [None] * missing_data, context=context)
 
 
 def _patch_cutedsl_tvm_ffi_global_dtors() -> None:
@@ -590,13 +596,18 @@ def _patch_cutedsl_tvm_ffi_global_dtors() -> None:
     def append_unload_with_data_attr(self, current_block, context):
         current_block = append_unload(self, current_block, context)
         try:
+            mlir_module = context.module
             global_dtors_list = self.find_operations_in_module(
-                context.module, "llvm.mlir.global_dtors")
+                mlir_module, "llvm.mlir.global_dtors")
+            mlir_context = getattr(mlir_module, "context", None)
+            if mlir_context is None:
+                mlir_context = getattr(getattr(mlir_module, "operation", None),
+                                       "context", None)
         except Exception:
             return current_block
 
         for global_dtors in global_dtors_list:
-            _patch_cutedsl_global_dtors_data_attr(global_dtors)
+            _patch_cutedsl_global_dtors_data_attr(global_dtors, mlir_context)
         return current_block
 
     append_unload_with_data_attr._vllm_data_attr_patch = True

@@ -160,13 +160,14 @@ def test_patch_cutedsl_global_dtors_data_attr_extends_to_match_dtors():
     with patch(
             "vllm.utils.import_utils."
             "_make_cutedsl_global_dtor_data_default",
-            side_effect=lambda dtors: [f"none-{i}"
-                                       for i, _ in enumerate(dtors)],
+            side_effect=lambda dtors, context=None: [
+                f"none-{i}" for i, _ in enumerate(dtors)
+            ],
     ) as mock_data_default:
         _patch_cutedsl_global_dtors_data_attr(global_dtors)
 
     assert global_dtors.attributes["data"] == ["none-0", "none-1"]
-    mock_data_default.assert_called_once_with([None, None])
+    mock_data_default.assert_called_once_with([None, None], context=None)
 
 
 def test_patch_cutedsl_tvm_ffi_global_dtors_repairs_provider_append(monkeypatch):
@@ -180,7 +181,7 @@ def test_patch_cutedsl_tvm_ffi_global_dtors_repairs_provider_append(monkeypatch)
     class FakeProvider:
 
         def find_operations_in_module(self, module, name):
-            assert module == "module"
+            assert module.context == "context"
             assert name == "llvm.mlir.global_dtors"
             return [global_dtors]
 
@@ -202,18 +203,21 @@ def test_patch_cutedsl_tvm_ffi_global_dtors_repairs_provider_append(monkeypatch)
             "vllm.utils.import_utils."
             "_make_cutedsl_global_dtor_data_default",
             return_value=["none"],
-    ):
+    ) as mock_data_default:
         _patch_cutedsl_tvm_ffi_global_dtors()
 
         provider = FakeProvider()
         assert provider.append_unload_to_global_dtors(
-            "block", SimpleNamespace(module="module")) == "block"
+            "block",
+            SimpleNamespace(module=SimpleNamespace(context="context")),
+        ) == "block"
 
     assert global_dtors.attributes == {
         "dtors": ["dtor"],
         "priorities": [65535],
         "data": ["none"],
     }
+    mock_data_default.assert_called_once_with([None], context="context")
 
 
 def test_deepseek_v4_cutedsl_leaf_modules_patch_before_quack_import():
