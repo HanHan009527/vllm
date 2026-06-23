@@ -11,7 +11,7 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
-from tests.kernels.moe.utils import make_dummy_moe_config
+from tests.kernels.moe.utils import make_dummy_moe_config, make_test_weights
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import group_broadcast
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
@@ -54,15 +55,30 @@ MAX_TOKENS_PER_RANK = 64
 
 
 def make_weights(
-    e, n, k, dtype
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    e, n, k, dtype, block_shape: list[int] | None = None
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+]:
     """
     Return weights w1, w2, w1_scale, w2_scale
     """
     if dtype in [torch.float16, torch.bfloat16]:
+        assert block_shape is None
         w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
         w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
         return w1, w2, None, None
+
+    if block_shape is not None:
+        (_, w1, w1_scale, _), (_, w2, w2_scale, _) = make_test_weights(
+            e,
+            n,
+            k,
+            in_dtype=torch.float16,
+            quant_dtype=dtype,
+            block_shape=block_shape,
+        )
+        assert w1_scale is not None and w2_scale is not None
+        return w1, w2, w1_scale, w2_scale
 
     # per-out-channel weight quantization
     assert dtype == current_platform.fp8_dtype()
@@ -93,6 +109,7 @@ class TestConfig:
     k: int
     n: int
     num_experts: int
+    block_shape: list[int] | None = None
 
 
 @dataclasses.dataclass
@@ -141,6 +158,7 @@ def make_modular_kernel(
     q_dtype: torch.dtype | None,
     use_fp8_dispatch: bool,
     quant_config: FusedMoEQuantConfig,
+    block_shape: list[int] | None,
 ) -> FusedMoEKernel:
     ht_args: DeepEPHTArgs | None = None
     ll_args: DeepEPLLArgs | None = None
@@ -163,7 +181,7 @@ def make_modular_kernel(
         pgi=pgi,
         dp_size=dp_size,
         q_dtype=q_dtype,
-        block_shape=None,
+        block_shape=block_shape,
         deepep_ht_args=ht_args,
         deepep_ll_args=ll_args,
     )
@@ -206,6 +224,7 @@ def deep_ep_moe_impl(
     num_experts: int,
     use_fp8_dispatch: bool,
     per_act_token_quant: bool,
+    block_shape: list[int] | None,
 ) -> torch.Tensor:
     num_local_experts = w1.size(0)
 
@@ -245,6 +264,7 @@ def deep_ep_moe_impl(
             w2_scale=w2_scale,
             per_act_token_quant=per_act_token_quant,
             a1_scale=rank_token_scales_chunk,
+            block_shape=block_shape,
         )
 
         # Make modular kernel
@@ -259,6 +279,7 @@ def deep_ep_moe_impl(
             q_dtype,
             use_fp8_dispatch,
             quant_config,
+            block_shape,
         )
 
         out = mk.apply(
@@ -302,6 +323,7 @@ def torch_moe_impl(
     w2_scale: torch.Tensor | None,
     using_fp8_dispatch: bool,
     per_act_token_quant: bool,
+    block_shape: list[int] | None,
 ):
     a, topk_ids, topk_weights = (
         test_tensors.rank_tokens,
@@ -324,6 +346,10 @@ def torch_moe_impl(
     is_quantized = w1.dtype == current_platform.fp8_dtype()
     a_dtype = a.dtype
     if is_quantized:
+        assert w1_scale is not None and w2_scale is not None
+        if block_shape is not None:
+            w1_scale = group_broadcast(w1_scale, w1.shape)
+            w2_scale = group_broadcast(w2_scale, w2.shape)
         w1 = w1.to(dtype=torch.float32) * w1_scale
         w2 = w2.to(dtype=torch.float32) * w2_scale
         a = a.to(dtype=torch.float32)
@@ -398,6 +424,7 @@ def _deep_ep_moe(
             w2_scale,
             use_fp8_dispatch,
             per_act_token_quant,
+            config.block_shape,
         )
 
         # Splice experts for this rank.
@@ -424,6 +451,7 @@ def _deep_ep_moe(
             config.num_experts,
             use_fp8_dispatch,
             per_act_token_quant,
+            config.block_shape,
         )
 
     torch.testing.assert_close(
@@ -535,6 +563,48 @@ def test_low_latency_deep_ep_moe(
     config = TestConfig(dtype=dtype, topk=topk, m=m, k=k, n=n, num_experts=num_experts)
 
     w1, w2, w1_scale, w2_scale = make_weights(num_experts, n, k, dtype)
+
+    parallel_launch(
+        world_size,
+        _deep_ep_moe,
+        low_latency_mode,
+        dp_size,
+        config,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        use_fp8_dispatch,
+        False,
+    )
+
+
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep
+def test_low_latency_deep_ep_moe_block_fp8(workspace_init):
+    low_latency_mode = True
+    use_fp8_dispatch = True
+    block_shape = [128, 128]
+    set_random_seed(7)
+
+    world_size, dp_size = (2, 1)
+    config = TestConfig(
+        dtype=current_platform.fp8_dtype(),
+        topk=6,
+        m=2,
+        k=7168,
+        n=2048,
+        num_experts=32,
+        block_shape=block_shape,
+    )
+
+    w1, w2, w1_scale, w2_scale = make_weights(
+        config.num_experts,
+        config.n,
+        config.k,
+        config.dtype,
+        block_shape,
+    )
 
     parallel_launch(
         world_size,
