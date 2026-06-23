@@ -37,6 +37,9 @@ def load_o_proj_module() -> Any:
 
         deep_gemm = types.ModuleType("vllm.utils.deep_gemm")
         deep_gemm.fp8_einsum = None  # type: ignore[attr-defined]
+        deep_gemm.is_deep_gemm_fp8_einsum_supported = (  # type: ignore[attr-defined]
+            lambda: False
+        )
         sys.modules["vllm.utils.deep_gemm"] = deep_gemm
 
         spec = importlib.util.spec_from_file_location("test_o_proj", module_path)
@@ -331,6 +334,39 @@ def test_deep_gemm_fp8_o_proj_force_bf16_ignores_inverse_scale():
             einsum_recipe=(1, 128, 128),
             tma_aligned_scales=False,
             force_bf16=True,
+        )
+    finally:
+        o_proj.fused_inv_rope_fp8_quant = original_fused_inv_rope_fp8_quant
+
+    assert wo_b.input is not None
+    torch.testing.assert_close(
+        wo_b.input, torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    )
+    torch.testing.assert_close(out, torch.tensor([[2.0, 3.0]], dtype=torch.bfloat16))
+
+
+def test_deep_gemm_fp8_o_proj_uses_bf16_fallback_without_fp8_einsum():
+    wo_b = FakeWoB()
+    original_fused_inv_rope_fp8_quant = o_proj.fused_inv_rope_fp8_quant
+
+    def fail_if_fp8_path_is_used(*args, **kwargs):
+        raise AssertionError("missing fp8_einsum should bypass FP8 quantization")
+
+    o_proj.fused_inv_rope_fp8_quant = fail_if_fp8_path_is_used
+    try:
+        out = deep_gemm_fp8_o_proj(
+            torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], dtype=torch.bfloat16),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+            FakeInverseScaleWoA(),
+            wo_b,
+            n_groups=1,
+            heads_per_group=1,
+            nope_dim=2,
+            rope_dim=2,
+            o_lora_rank=2,
+            einsum_recipe=(1, 128, 128),
+            tma_aligned_scales=False,
         )
     finally:
         o_proj.fused_inv_rope_fp8_quant = original_fused_inv_rope_fp8_quant

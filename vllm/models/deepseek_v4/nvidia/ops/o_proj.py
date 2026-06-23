@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from vllm.models.deepseek_v4.common.ops import fused_inv_rope_fp8_quant
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.deep_gemm import fp8_einsum, is_deep_gemm_fp8_einsum_supported
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +207,11 @@ def deep_gemm_fp8_o_proj(
     ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.
     """
     weight_scale = get_fp8_weight_scale(wo_a)
-    if force_bf16 or weight_scale is None:
+    if (
+        force_bf16
+        or weight_scale is None
+        or not is_deep_gemm_fp8_einsum_supported()
+    ):
         z = inv_rope_bf16_o_proj(
             o,
             positions,
