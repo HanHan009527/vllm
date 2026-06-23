@@ -26,6 +26,16 @@ from .ScaledMMLinearKernel import (
 )
 
 
+def _is_explicit_marlin_linear_backend() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return (
+        config is not None
+        and getattr(config.kernel_config, "linear_backend", "auto") == "marlin"
+    )
+
+
 class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     """
     FP8 Marlin kernel for GPUs that lack FP8 hardware support.
@@ -47,6 +57,7 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             compute_capability is not None
             and compute_capability >= 89
             and not envs.VLLM_TEST_FORCE_FP8_MARLIN
+            and not _is_explicit_marlin_linear_backend()
         ):
             return (
                 False,

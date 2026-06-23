@@ -7,6 +7,7 @@ Run `pytest tests/kernels/quantization/test_scaled_mm_kernel_selection.py`.
 
 import inspect
 from abc import ABC
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,9 @@ from vllm.model_executor.kernels.linear import (
     ScaledMMLinearKernel,
     init_int8_linear_kernel,
     register_linear_kernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
+    MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.platforms import PlatformEnum
 
@@ -127,3 +131,57 @@ def test_register_oot_linear_kernel(platform_mock):
     assert isinstance(kernel, OOTInt8ScaledMMLinearKernel), (
         "init_int8_linear_kernel should return an instance of the registered kernel"
     )
+
+
+@patch("vllm.model_executor.kernels.linear.scaled_mm.marlin.current_platform")
+@patch(
+    "vllm.model_executor.kernels.linear.scaled_mm.marlin.is_fp8_marlin_supported",
+    return_value=True,
+)
+def test_fp8_marlin_high_capability_requires_force_for_auto_backend(
+    _is_fp8_marlin_supported,
+    platform_mock,
+    monkeypatch,
+):
+    platform_mock.is_cuda.return_value = True
+    monkeypatch.delenv("VLLM_TEST_FORCE_FP8_MARLIN", raising=False)
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            kernel_config=SimpleNamespace(linear_backend="auto")
+        ),
+    )
+
+    supported, reason = MarlinFP8ScaledMMLinearKernel.is_supported(
+        compute_capability=90
+    )
+
+    assert not supported
+    assert "VLLM_TEST_FORCE_FP8_MARLIN=1" in reason
+
+
+@patch("vllm.model_executor.kernels.linear.scaled_mm.marlin.current_platform")
+@patch(
+    "vllm.model_executor.kernels.linear.scaled_mm.marlin.is_fp8_marlin_supported",
+    return_value=True,
+)
+def test_fp8_marlin_high_capability_allows_explicit_linear_backend(
+    _is_fp8_marlin_supported,
+    platform_mock,
+    monkeypatch,
+):
+    platform_mock.is_cuda.return_value = True
+    monkeypatch.delenv("VLLM_TEST_FORCE_FP8_MARLIN", raising=False)
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            kernel_config=SimpleNamespace(linear_backend="marlin")
+        ),
+    )
+
+    supported, reason = MarlinFP8ScaledMMLinearKernel.is_supported(
+        compute_capability=90
+    )
+
+    assert supported
+    assert reason is None
