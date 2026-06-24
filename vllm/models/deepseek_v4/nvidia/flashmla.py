@@ -399,15 +399,26 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     req_positions = positions[
                         query_start + req_query_start : query_start + req_query_end
                     ].to(torch.long)
-                    pcp_kernel_rows[req_query_start:req_query_end] = (
+                    req_valid = (req_positions >= req_gather_start) & (
+                        req_positions < req_seq_len
+                    )
+                    req_kernel_rows = (
                         req_idx * chunk_M
                         + chunk_N
                         + req_positions
                         - req_gather_start
                     )
-                if q_tokens > 0:
-                    pcp_kernel_rows_min = int(pcp_kernel_rows.min().item())
-                    pcp_kernel_rows_max = int(pcp_kernel_rows.max().item())
+                    req_kernel_rows = torch.where(
+                        req_valid,
+                        req_kernel_rows,
+                        torch.zeros_like(req_kernel_rows),
+                    )
+                    pcp_kernel_rows[req_query_start:req_query_end] = req_kernel_rows
+                valid_query_mask = combined_lens > 0
+                if q_tokens > 0 and valid_query_mask.any():
+                    valid_pcp_kernel_rows = pcp_kernel_rows[valid_query_mask]
+                    pcp_kernel_rows_min = int(valid_pcp_kernel_rows.min().item())
+                    pcp_kernel_rows_max = int(valid_pcp_kernel_rows.max().item())
                     if (
                         pcp_kernel_rows_min < 0
                         or pcp_kernel_rows_max >= chunk_size * chunk_M
@@ -420,6 +431,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             f"workspace_rows={chunk_size * chunk_M}"
                         )
                     pcp_sparse_rows = pcp_kernel_rows_max + 1
+                else:
+                    pcp_sparse_rows = 1
             if (
                 envs.VLLM_DSV4_NONFINITE_DIAG
                 and is_pcp_prefill
@@ -486,9 +499,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 pcp_indices[:, 0] = 0
                 pcp_lens = combined_lens.new_ones((pcp_sparse_rows,))
 
-                pcp_q.index_copy_(0, pcp_kernel_rows, q[query_start:query_end])
-                pcp_indices.index_copy_(0, pcp_kernel_rows, combined_indices)
-                pcp_lens.index_copy_(0, pcp_kernel_rows, combined_lens.clamp_min(1))
+                valid_query_mask = combined_lens > 0
+                if valid_query_mask.any():
+                    valid_pcp_kernel_rows = pcp_kernel_rows[valid_query_mask]
+                    pcp_q.index_copy_(
+                        0,
+                        valid_pcp_kernel_rows,
+                        q[query_start:query_end][valid_query_mask],
+                    )
+                    pcp_indices.index_copy_(
+                        0,
+                        valid_pcp_kernel_rows,
+                        combined_indices[valid_query_mask],
+                    )
+                    pcp_lens.index_copy_(
+                        0,
+                        valid_pcp_kernel_rows,
+                        combined_lens[valid_query_mask],
+                    )
                 flash_mla_sparse_fwd(
                     q=pcp_q,
                     kv=kv.view(-1, 1, q.shape[-1]),
