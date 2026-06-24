@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -372,25 +371,61 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     chunk_M,
                     chunk_N,
                 )
-            if swa_metadata.pcp_allgather_restore_idx is not None:
-                # The FlashMLA sparse prefill kernel is sensitive to PCP-local
-                # query row grouping for non-contiguous local positions. Keep
-                # the kernel call bounded without changing request chunking or
-                # the gathered KV workspace.
-                sparse_query_chunk_size = int(
-                    os.getenv("VLLM_DSV4_PCP_SPARSE_PREFILL_CHUNK_SIZE", "64")
+            pcp_kernel_rows = None
+            pcp_kernel_rows_min = 0
+            pcp_kernel_rows_max = -1
+            pcp_sparse_rows = 0
+            is_pcp_prefill = swa_metadata.pcp_allgather_restore_idx is not None
+            if is_pcp_prefill:
+                q_tokens = query_end - query_start
+                pcp_kernel_rows = torch.empty(
+                    q_tokens, dtype=torch.long, device=q.device
                 )
-                if sparse_query_chunk_size <= 0:
-                    raise ValueError(
-                        "VLLM_DSV4_PCP_SPARSE_PREFILL_CHUNK_SIZE must be positive"
+                chunk_base = query_start_loc_cpu[num_decodes + chunk_start]
+                for req_idx in range(chunk_size):
+                    req_query_start = (
+                        query_start_loc_cpu[num_decodes + chunk_start + req_idx]
+                        - chunk_base
                     )
-            else:
-                sparse_query_chunk_size = query_end - query_start
+                    req_query_end = (
+                        query_start_loc_cpu[num_decodes + chunk_start + req_idx + 1]
+                        - chunk_base
+                    )
+                    if req_query_start == req_query_end:
+                        continue
+                    req_seq_len = int(seq_lens[chunk_start + req_idx].item())
+                    req_gather_len = int(gather_lens[chunk_start + req_idx].item())
+                    req_gather_start = req_seq_len - req_gather_len
+                    req_positions = positions[
+                        query_start + req_query_start : query_start + req_query_end
+                    ].to(torch.long)
+                    pcp_kernel_rows[req_query_start:req_query_end] = (
+                        req_idx * chunk_M
+                        + chunk_N
+                        + req_positions
+                        - req_gather_start
+                    )
+                if q_tokens > 0:
+                    pcp_kernel_rows_min = int(pcp_kernel_rows.min().item())
+                    pcp_kernel_rows_max = int(pcp_kernel_rows.max().item())
+                    if (
+                        pcp_kernel_rows_min < 0
+                        or pcp_kernel_rows_max >= chunk_size * chunk_M
+                    ):
+                        raise ValueError(
+                            "DeepSeek V4 PCP sparse prefill query rows are "
+                            "outside the gathered KV workspace: "
+                            f"min={pcp_kernel_rows_min}, "
+                            f"max={pcp_kernel_rows_max}, "
+                            f"workspace_rows={chunk_size * chunk_M}"
+                        )
+                    pcp_sparse_rows = pcp_kernel_rows_max + 1
             if (
                 envs.VLLM_DSV4_NONFINITE_DIAG
-                and swa_metadata.pcp_allgather_restore_idx is not None
+                and is_pcp_prefill
                 and self.prefix == "model.layers.0.attn"
             ):
+                assert pcp_kernel_rows is not None
                 valid_offsets = torch.arange(
                     combined_indices.shape[1],
                     device=combined_indices.device,
@@ -416,7 +451,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "chunk_N=%d chunk_M=%d kv_rows=%d topk=%d "
                     "lens_min=%d lens_max=%d lens_over_128=%d "
                     "indices_min=%d indices_max=%d invalid_indices=%d "
-                    "sparse_query_chunk_size=%d",
+                    "pcp_kernel_rows_min=%d pcp_kernel_rows_max=%d "
+                    "pcp_sparse_rows=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -435,29 +471,43 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     indices_min,
                     indices_max,
                     int(invalid_count.item()),
-                    sparse_query_chunk_size,
+                    pcp_kernel_rows_min,
+                    pcp_kernel_rows_max,
+                    pcp_sparse_rows,
                 )
-            for sparse_query_start in range(
-                query_start, query_end, sparse_query_chunk_size
-            ):
-                sparse_query_end = min(
-                    sparse_query_start + sparse_query_chunk_size, query_end
+            if is_pcp_prefill:
+                assert pcp_kernel_rows is not None
+                pcp_q = q.new_zeros((pcp_sparse_rows, *q.shape[1:]))
+                pcp_out = output.new_empty((pcp_sparse_rows, *output.shape[1:]))
+                pcp_out.zero_()
+                pcp_indices = combined_indices.new_full(
+                    (pcp_sparse_rows, combined_indices.shape[1]), -1
                 )
-                sparse_indices_start = sparse_query_start - query_start
-                sparse_indices_end = sparse_query_end - query_start
+                pcp_indices[:, 0] = 0
+                pcp_lens = combined_lens.new_ones((pcp_sparse_rows,))
+
+                pcp_q.index_copy_(0, pcp_kernel_rows, q[query_start:query_end])
+                pcp_indices.index_copy_(0, pcp_kernel_rows, combined_indices)
+                pcp_lens.index_copy_(0, pcp_kernel_rows, combined_lens.clamp_min(1))
                 flash_mla_sparse_fwd(
-                    q=q[sparse_query_start:sparse_query_end],
+                    q=pcp_q,
                     kv=kv.view(-1, 1, q.shape[-1]),
-                    indices=combined_indices[
-                        sparse_indices_start:sparse_indices_end
-                    ].unsqueeze(1),
+                    indices=pcp_indices.unsqueeze(1),
                     sm_scale=self.scale,
                     attn_sink=self.attn_sink,
-                    topk_length=combined_lens[
-                        sparse_indices_start:sparse_indices_end
-                    ],
-                    out=output[sparse_query_start:sparse_query_end],
+                    topk_length=pcp_lens,
+                    out=pcp_out,
                 )
-            if swa_metadata.pcp_allgather_restore_idx is not None:
                 chunk_output = output[query_start:query_end]
+                chunk_output.copy_(pcp_out.index_select(0, pcp_kernel_rows))
                 chunk_output[combined_lens == 0] = 0
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
