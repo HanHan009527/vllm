@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -29,6 +31,8 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
@@ -366,6 +370,55 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     top_k,
                     chunk_M,
                     chunk_N,
+                )
+            if (
+                envs.VLLM_DSV4_NONFINITE_DIAG
+                and swa_metadata.pcp_allgather_restore_idx is not None
+                and self.prefix == "model.layers.0.attn"
+            ):
+                valid_offsets = torch.arange(
+                    combined_indices.shape[1],
+                    device=combined_indices.device,
+                    dtype=combined_lens.dtype,
+                )
+                valid_mask = valid_offsets.unsqueeze(0) < combined_lens.unsqueeze(1)
+                valid_indices = combined_indices[valid_mask]
+                kv_rows = kv.shape[0] * kv.shape[1]
+                invalid_count = (
+                    (valid_indices < 0) | (valid_indices >= kv_rows)
+                ).sum()
+                lens_over_128 = (combined_lens > 128).sum()
+                if valid_indices.numel() > 0:
+                    indices_min = int(valid_indices.min().item())
+                    indices_max = int(valid_indices.max().item())
+                else:
+                    indices_min = -1
+                    indices_max = -1
+                logger.error(
+                    "DeepSeek V4 PCP sparse prefill diag at %s: "
+                    "chunk=(%d,%d) q_tokens=%d positions_min=%d "
+                    "positions_max=%d seq_lens=%s gather_lens=%s "
+                    "chunk_N=%d chunk_M=%d kv_rows=%d topk=%d "
+                    "lens_min=%d lens_max=%d lens_over_128=%d "
+                    "indices_min=%d indices_max=%d invalid_indices=%d",
+                    self.prefix,
+                    chunk_start,
+                    chunk_end,
+                    query_end - query_start,
+                    int(positions[query_start:query_end].min().item()),
+                    int(positions[query_start:query_end].max().item()),
+                    seq_lens[chunk_start:chunk_end].detach().cpu().tolist(),
+                    gather_lens[chunk_start:chunk_end].detach().cpu().tolist(),
+                    chunk_N,
+                    chunk_M,
+                    kv_rows,
+                    top_k,
+                    int(combined_lens.min().item()),
+                    int(combined_lens.max().item()),
+                    int(lens_over_128.item()),
+                    indices_min,
+                    indices_max,
+                    int(invalid_count.item()),
                 )
             flash_mla_sparse_fwd(
                 q=q[query_start:query_end],
