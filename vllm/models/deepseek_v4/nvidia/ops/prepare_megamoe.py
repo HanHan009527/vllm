@@ -450,9 +450,14 @@ def prepare_megamoe_inputs_sm90(
     if _has_mega_moe_pre_dispatch_sm90_op():
         from vllm import _custom_ops as ops
 
+        topk_ids_sm90 = (
+            topk_ids
+            if topk_ids.dtype == torch.int32 and topk_ids.stride(1) == 1
+            else topk_ids.to(dtype=torch.int32).contiguous()
+        )
         ops.mega_moe_pre_dispatch_sm90(
             hidden_states,
-            topk_ids,
+            topk_ids_sm90,
             topk_weights,
             x_fp8,
             x_sf,
