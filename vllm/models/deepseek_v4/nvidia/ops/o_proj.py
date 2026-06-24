@@ -24,6 +24,12 @@ def is_fp8_dtype(dtype: torch.dtype) -> bool:
     }
 
 
+def is_missing_fp8_scale(scale: torch.Tensor) -> bool:
+    if scale.dtype != torch.float32:
+        return False
+    return bool((scale == torch.finfo(torch.float32).min).all().item())
+
+
 def dsv4_nonfinite_diag_enabled() -> bool:
     return os.environ.get("VLLM_DSV4_NONFINITE_DIAG") == "1"
 
@@ -63,6 +69,8 @@ def get_fp8_weight_scale(layer: nn.Module) -> torch.Tensor | None:
     if weight is not None and not is_fp8_dtype(weight.dtype):
         return None
     if hasattr(layer, "weight_scale_inv"):
+        if is_missing_fp8_scale(layer.weight_scale_inv):
+            return None
         return layer.weight_scale_inv
     return None
 
@@ -169,7 +177,11 @@ def get_wo_a_bf16_weight(
         return None
 
     weight_scale_inv = getattr(wo_a, "weight_scale_inv", None)
-    if weight_scale_inv is not None and is_fp8_dtype(raw_weight.dtype):
+    if (
+        weight_scale_inv is not None
+        and is_fp8_dtype(raw_weight.dtype)
+        and not is_missing_fp8_scale(weight_scale_inv)
+    ):
         scale = _expand_block_scales(
             weight_scale_inv.reshape(n_groups, -1, weight_scale_inv.shape[-1]),
             o_lora_rank,

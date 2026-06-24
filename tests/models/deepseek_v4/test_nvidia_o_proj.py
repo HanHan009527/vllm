@@ -83,6 +83,19 @@ def test_get_fp8_weight_scale_returns_none_without_scale():
     assert get_fp8_weight_scale(nn.Module()) is None
 
 
+def test_get_fp8_weight_scale_returns_none_for_missing_scale_sentinel():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(
+        torch.ones((2, 2), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale_inv = nn.Parameter(
+        torch.full((1, 1), torch.finfo(torch.float32).min, dtype=torch.float32),
+        requires_grad=False,
+    )
+
+    assert get_fp8_weight_scale(layer) is None
+
+
 class FakeWoA(nn.Module):
     def __init__(self):
         super().__init__()
@@ -196,6 +209,30 @@ class FakeBf16GroupedWoAWithStaleScale(nn.Module):
         raise AssertionError("raw grouped BF16 fallback should bypass wo_a.forward")
 
 
+class FakeFp8GroupedWoAWithMissingScale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [2.0, 0.0, 0.0, 0.0],
+                    [0.0, 2.0, 0.0, 0.0],
+                ],
+                dtype=torch.float8_e4m3fn,
+            ),
+            requires_grad=False,
+        )
+        self.weight_scale_inv = nn.Parameter(
+            torch.full((2, 1, 1), torch.finfo(torch.float32).min),
+            requires_grad=False,
+        )
+
+    def forward(self, x):
+        raise AssertionError("missing-scale FP8 fallback should bypass wo_a.forward")
+
+
 class FakeBmmWoAWithoutGroupedWeight(nn.Module):
     is_bmm = True
 
@@ -281,6 +318,25 @@ def test_inv_rope_bf16_o_proj_uses_flat_cached_bmm_weight():
 def test_get_wo_a_bf16_weight_ignores_stale_scale_for_raw_bf16_weight():
     weight = get_wo_a_bf16_weight(
         FakeBf16GroupedWoAWithStaleScale(),
+        n_groups=2,
+        o_lora_rank=2,
+        input_size=4,
+    )
+
+    assert weight is not None
+    expected = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(weight, expected)
+
+
+def test_get_wo_a_bf16_weight_ignores_missing_scale_sentinel_for_fp8_weight():
+    weight = get_wo_a_bf16_weight(
+        FakeFp8GroupedWoAWithMissingScale(),
         n_groups=2,
         o_lora_rank=2,
         input_size=4,

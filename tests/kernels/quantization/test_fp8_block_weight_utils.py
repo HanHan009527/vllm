@@ -83,6 +83,25 @@ def test_fp8_linear_method_caches_bmm_bf16_weight_from_raw_bf16_weight():
     torch.testing.assert_close(layer._fp8_bmm_weight_bf16, layer.weight)
 
 
+def test_fp8_linear_method_caches_bmm_bf16_weight_with_missing_scale():
+    method = object.__new__(Fp8LinearMethod)
+    method.block_quant = True
+    method.weight_block_size = [2, 2]
+
+    layer = nn.Module()
+    layer.is_bmm = True
+    layer.weight = nn.Parameter(torch.ones((4, 4), dtype=torch.float8_e4m3fn))
+    layer.weight_scale_inv = nn.Parameter(
+        torch.full((2, 2), torch.finfo(torch.float32).min, dtype=torch.float32)
+    )
+
+    method._cache_bf16_weight_if_needed(layer)
+
+    expected = layer.weight.to(torch.bfloat16)
+    torch.testing.assert_close(layer._fp8_weight_bf16, expected)
+    torch.testing.assert_close(layer._fp8_bmm_weight_bf16, expected)
+
+
 def test_dequantize_fp8_block_weight_uses_inverse_scale():
     weight = torch.ones((4, 4), dtype=torch.float32)
     scale_inv = torch.tensor([[2.0, 4.0], [8.0, 16.0]], dtype=torch.float32)

@@ -406,6 +406,12 @@ class Fp8LinearMethod(LinearMethodBase):
         }
         return dtype in fp8_dtypes
 
+    @staticmethod
+    def _is_missing_fp8_scale(scale: torch.Tensor) -> bool:
+        if scale.dtype != torch.float32:
+            return False
+        return bool((scale == torch.finfo(torch.float32).min).all().item())
+
     def _cache_bf16_weight_if_needed(self, layer: RoutedExperts) -> None:
         cache_bf16_weight = getattr(layer, "is_bmm", False) or getattr(
             layer, "cache_bf16_weight", False
@@ -417,12 +423,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_scale = getattr(layer, "weight_scale", None)
                 if weight_scale is None:
                     return
-                assert self.weight_block_size is not None
-                bf16_weight = dequantize_fp8_block_weight(
-                    layer.weight,
-                    weight_scale,
-                    self.weight_block_size,
-                ).to(torch.bfloat16)
+                if self._is_missing_fp8_scale(weight_scale):
+                    bf16_weight = layer.weight.to(torch.bfloat16)
+                else:
+                    assert self.weight_block_size is not None
+                    bf16_weight = dequantize_fp8_block_weight(
+                        layer.weight,
+                        weight_scale,
+                        self.weight_block_size,
+                    ).to(torch.bfloat16)
             else:
                 bf16_weight = layer.weight.to(torch.bfloat16)
             layer._fp8_weight_bf16 = bf16_weight
