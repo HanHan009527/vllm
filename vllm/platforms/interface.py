@@ -253,11 +253,10 @@ class Platform:
             import vllm._C  # noqa: F401
         except ImportError as e:
             logger.warning("Failed to import from vllm._C: %r", e)
-        try:
+        with contextlib.suppress(ImportError):
+            import vllm._moe_C  # noqa: F401
+        with contextlib.suppress(ImportError):
             import vllm._moe_C_stable_libtorch  # noqa: F401
-        except ImportError:
-            with contextlib.suppress(ImportError):
-                import vllm._moe_C  # noqa: F401
 
     @classmethod
     def get_attn_backend_cls(

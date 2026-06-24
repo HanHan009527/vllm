@@ -34,8 +34,10 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -50,7 +52,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -620,9 +626,58 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
+                    coordinator = self.kv_cache_manager.coordinator
+                    computed_per_group: tuple[list[KVCacheBlock], ...] | None = None
+                    if (
+                        self.connector is not None
+                        and self.kv_cache_manager.enable_caching
+                        and not request.skip_reading_prefix_cache
+                        and isinstance(coordinator, HybridKVCacheCoordinator)
+                    ):
+                        computed, per_group_hits = (
+                            coordinator.find_longest_cache_hit_per_group(
+                                request.block_hashes,
+                                request.num_tokens - 1,
+                            )
+                        )
+                        # The connector scalar represents reusable dense
+                        # prefix tokens; tail/state groups still flow through
+                        # the per-group computed block lists.
+                        dense_kinds = (
+                            KVCacheSpecKind.FULL_ATTENTION,
+                            KVCacheSpecKind.MLA_ATTENTION,
+                            KVCacheSpecKind.SINK_FULL_ATTENTION,
+                        )
+                        dense_hits: list[int] = []
+                        for group in coordinator.attention_groups:
+                            if get_kv_cache_spec_kind(group.spec) in dense_kinds:
+                                dense_hits.extend(
+                                    per_group_hits[group_id]
+                                    for group_id in group.group_ids
+                                )
+                        num_new_local_computed_tokens = (
+                            min(dense_hits) if dense_hits else 0
+                        )
+                        for group in coordinator.attention_groups:
+                            if get_kv_cache_spec_kind(group.spec) in dense_kinds:
+                                num_dense_blocks = (
+                                    num_new_local_computed_tokens
+                                    // group.spec.block_size
+                                )
+                                for group_id in group.group_ids:
+                                    del computed[group_id][num_dense_blocks:]
+                        computed_per_group = computed
+                        if self.kv_cache_manager.log_stats:
+                            assert self.kv_cache_manager.prefix_cache_stats is not None
+                            self.kv_cache_manager.prefix_cache_stats.record(
+                                num_tokens=request.num_tokens,
+                                num_hits=num_new_local_computed_tokens,
+                                preempted=request.num_preemptions > 0,
+                            )
+                    else:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.get_computed_blocks(request)
+                        )
 
                     # In case of hybrid models, obtain hint for Marconi-style APC logic
                     if self.has_mamba_layers:
@@ -660,6 +715,18 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+                    if computed_per_group is not None:
+                        for group in coordinator.attention_groups:
+                            num_computed_blocks = (
+                                num_computed_tokens // group.spec.block_size
+                            )
+                            for group_id in group.group_ids:
+                                del computed_per_group[group_id][num_computed_blocks:]
+                        new_computed_blocks = (
+                            self.kv_cache_manager.create_kv_cache_blocks(
+                                computed_per_group
+                            )
+                        )
 
                     # Skip request with pending mm encoding prefetches
                     if (

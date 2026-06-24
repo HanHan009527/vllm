@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -286,6 +287,7 @@ class HFConfigParser(ConfigParserBase):
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
+        config = _maybe_resolve_dsv4_expert_dtype(config, model)
         config = _maybe_remap_hf_config_attrs(config)
         return config_dict, config
 
@@ -572,6 +574,106 @@ def _maybe_update_auto_config_kwargs(kwargs: dict[str, Any], model_type: str):
     if model_type in _AUTO_CONFIG_KWARGS_OVERRIDES:
         kwargs.update(_AUTO_CONFIG_KWARGS_OVERRIDES[model_type])
     return kwargs
+
+
+def _get_quant_method(quant_cfg: Any) -> Any:
+    if quant_cfg is None:
+        return None
+    if isinstance(quant_cfg, dict):
+        return quant_cfg.get("quant_method")
+    return getattr(quant_cfg, "quant_method", None)
+
+
+# FP8 (e4m3) expert weights in the checkpoint imply expert_dtype="fp8".
+# MXFP4 experts are stored as packed uint8, so any non-fp8 weight dtype
+# (or an unreadable checkpoint) falls back to the "fp4" default.
+_DSV4_FP8_WEIGHT_DTYPES = ("F8_E4M3", "F8_E4M3FN", "FLOAT8_E4M3FN")
+
+
+def _find_dsv4_expert_weight_shard(
+    model_path: Path,
+) -> tuple[Path, str] | None:
+    """Locate a safetensors shard plus an expert weight key to probe."""
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            weight_map = json.loads(index_path.read_text())["weight_map"]
+        except (OSError, KeyError, ValueError):
+            return None
+        for key, shard in weight_map.items():
+            if ".experts." in key and key.endswith(".weight"):
+                return model_path / shard, key
+        return None
+
+    single = model_path / "model.safetensors"
+    if single.is_file():
+        try:
+            metadata = parse_safetensors_file_metadata(single)
+        except (OSError, ValueError):
+            return None
+        for key in metadata:
+            if key != "__metadata__" and ".experts." in key and key.endswith(
+                ".weight"
+            ):
+                return single, key
+    return None
+
+
+def _infer_dsv4_expert_dtype_from_checkpoint(
+    model: str | Path,
+) -> str | None:
+    """Resolve DeepSeek-V4 ``expert_dtype`` from on-disk expert weights.
+
+    Returns ``"fp8"`` when the expert weights are stored in FP8 (e4m3),
+    otherwise ``None`` so the caller keeps the FP4 default. Remote or
+    unreadable checkpoints resolve to ``None``.
+    """
+    model_path = Path(str(model))
+    if not model_path.is_dir():
+        return None
+
+    probe = _find_dsv4_expert_weight_shard(model_path)
+    if probe is None:
+        return None
+
+    shard_path, weight_key = probe
+    try:
+        metadata = parse_safetensors_file_metadata(shard_path)
+    except (OSError, ValueError):
+        return None
+
+    dtype = (metadata.get(weight_key) or {}).get("dtype")
+    if dtype and dtype.upper() in _DSV4_FP8_WEIGHT_DTYPES:
+        return "fp8"
+    return None
+
+
+def _maybe_resolve_dsv4_expert_dtype(
+    config: PretrainedConfig, model: str | Path
+) -> PretrainedConfig:
+    """Set ``expert_dtype`` for DeepSeek-V4 FP8 checkpoints.
+
+    DeepSeek-V4 FP8 checkpoints (e.g. DeepSeek-V4-Flash-FP8) ship FP8 block
+    experts but omit ``expert_dtype`` from ``config.json``. Without it the
+    quant config defaults to ``"fp4"`` and the MoE weight loader misroutes
+    the FP8 expert tensors. Infer the value from the checkpoint so the model
+    loads correctly without any external patch.
+    """
+    if (
+        getattr(config, "model_type", None) != "deepseek_v4"
+        or _get_quant_method(getattr(config, "quantization_config", None)) != "fp8"
+        or getattr(config, "expert_dtype", None) is not None
+    ):
+        return config
+
+    expert_dtype = _infer_dsv4_expert_dtype_from_checkpoint(model)
+    if expert_dtype is not None:
+        config.expert_dtype = expert_dtype
+        logger.info_once(
+            "Resolved DeepSeek-V4 expert_dtype=%s from checkpoint weights",
+            expert_dtype,
+        )
+    return config
 
 
 def _maybe_remap_hf_config_attrs(config: PretrainedConfig) -> PretrainedConfig:

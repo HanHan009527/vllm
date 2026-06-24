@@ -2538,6 +2538,13 @@ def topk_hash_softplus_sqrt(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
 ) -> None:
+    if hash_indices_table is not None:
+        assert input_tokens is not None
+        if input_tokens.dtype != topk_indices.dtype:
+            input_tokens = input_tokens.to(dtype=topk_indices.dtype)
+        if hash_indices_table.dtype != topk_indices.dtype:
+            hash_indices_table = hash_indices_table.to(dtype=topk_indices.dtype)
+
     torch.ops._moe_C.topk_softplus_sqrt(
         topk_weights,
         topk_indices,
@@ -3194,6 +3201,48 @@ def dsv3_fused_a_gemm(
     Requires SM 9.0+ (Hopper).
     """
     torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b)
+
+
+def mega_moe_pre_dispatch_sm90(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+) -> None:
+    """DeepSeek V4 MegaMoE SM90 (Hopper) input staging.
+
+    Fused single-launch kernel that quantizes BF16 ``x`` to FP8 E4M3 with a
+    fixed 128-channel group (raw FP32 scale, not packed UE8M0), copies each
+    token's top-k routing row into the symmetric buffers (folding
+    ``routed_scaling_factor`` into the weights), and fills the padded rows
+    ``[num_tokens:]`` with ``-1`` ids / ``0.0`` weights.
+
+    Tensor contract (matches ``get_symm_buffer_for_mega_moe`` SM90 layout):
+      x:                [num_tokens, hidden]      bf16, row-major
+      topk_idx:         [num_tokens, top_k]       int32
+      topk_weights:     [num_tokens, top_k]       float32
+      buf_x:            [padded_max, hidden]      float8_e4m3fn, row-major
+      buf_x_sf:         [padded_max, hidden/128]  float32, row-major
+      buf_topk_idx:     [padded_max, top_k]       int64
+      buf_topk_weights: [padded_max, top_k]       float32
+
+    Requires SM 9.0+. Set ``VLLM_ENABLE_PDL=1`` to enable programmatic
+    dependent launch (griddepcontrol).
+    """
+    torch.ops._C.mega_moe_pre_dispatch_sm90(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        routed_scaling_factor,
+    )
 
 
 if hasattr(torch.ops._C, "weight_packed_linear"):
