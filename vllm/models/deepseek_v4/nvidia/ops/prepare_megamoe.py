@@ -8,6 +8,7 @@ MegaMoE kernels consume.
 """
 
 import functools
+import os
 
 import torch
 
@@ -400,6 +401,19 @@ def _prepare_megamoe_inputs_sm90_triton(
 
 
 @functools.lru_cache(maxsize=1)
+def _load_mega_moe_pre_dispatch_sm90_addon() -> None:
+    addon_path = os.environ.get("VLLM_DSV4_MEGAMOE_PREDISPATCH_LIB")
+    if not addon_path:
+        return
+    if not os.path.isfile(addon_path):
+        raise RuntimeError(
+            "VLLM_DSV4_MEGAMOE_PREDISPATCH_LIB points to a missing file: "
+            f"{addon_path}"
+        )
+    torch.ops.load_library(addon_path)
+
+
+@functools.lru_cache(maxsize=1)
 def _has_mega_moe_pre_dispatch_sm90_op() -> bool:
     """Return True only when the CUDA implementation is actually registered.
 
@@ -410,6 +424,7 @@ def _has_mega_moe_pre_dispatch_sm90_op() -> bool:
     otherwise we must fall back to Triton.
     """
     try:
+        _load_mega_moe_pre_dispatch_sm90_addon()
         if not hasattr(torch.ops._C, "mega_moe_pre_dispatch_sm90"):
             return False
         return torch._C._dispatch_has_kernel_for_dispatch_key(
