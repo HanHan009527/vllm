@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -371,6 +372,20 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     chunk_M,
                     chunk_N,
                 )
+            if swa_metadata.pcp_allgather_restore_idx is not None:
+                # The FlashMLA sparse prefill kernel is sensitive to PCP-local
+                # query row grouping for non-contiguous local positions. Keep
+                # the kernel call bounded without changing request chunking or
+                # the gathered KV workspace.
+                sparse_query_chunk_size = int(
+                    os.getenv("VLLM_DSV4_PCP_SPARSE_PREFILL_CHUNK_SIZE", "64")
+                )
+                if sparse_query_chunk_size <= 0:
+                    raise ValueError(
+                        "VLLM_DSV4_PCP_SPARSE_PREFILL_CHUNK_SIZE must be positive"
+                    )
+            else:
+                sparse_query_chunk_size = query_end - query_start
             if (
                 envs.VLLM_DSV4_NONFINITE_DIAG
                 and swa_metadata.pcp_allgather_restore_idx is not None
@@ -400,7 +415,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "positions_max=%d seq_lens=%s gather_lens=%s "
                     "chunk_N=%d chunk_M=%d kv_rows=%d topk=%d "
                     "lens_min=%d lens_max=%d lens_over_128=%d "
-                    "indices_min=%d indices_max=%d invalid_indices=%d",
+                    "indices_min=%d indices_max=%d invalid_indices=%d "
+                    "sparse_query_chunk_size=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -419,15 +435,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     indices_min,
                     indices_max,
                     int(invalid_count.item()),
+                    sparse_query_chunk_size,
                 )
-            if swa_metadata.pcp_allgather_restore_idx is not None:
-                # The FlashMLA sparse prefill kernel is sensitive to larger
-                # PCP-local query row batches even when the generated sparse
-                # indices are in bounds. Keep the kernel call bounded without
-                # changing the request-level chunking or gathered KV workspace.
-                sparse_query_chunk_size = 128
-            else:
-                sparse_query_chunk_size = query_end - query_start
             for sparse_query_start in range(
                 query_start, query_end, sparse_query_chunk_size
             ):
