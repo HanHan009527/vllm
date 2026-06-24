@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 _fp8_einsum_fallback_warning_emitted = False
 
 
+def is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    }
+
+
 def dsv4_nonfinite_diag_enabled() -> bool:
     return os.environ.get("VLLM_DSV4_NONFINITE_DIAG") == "1"
 
@@ -50,6 +59,9 @@ def log_nonfinite_tensor(label: str, tensor: torch.Tensor, **extra: str) -> None
 
 
 def get_fp8_weight_scale(layer: nn.Module) -> torch.Tensor | None:
+    weight = getattr(layer, "weight", None)
+    if weight is not None and not is_fp8_dtype(weight.dtype):
+        return None
     if hasattr(layer, "weight_scale_inv"):
         return layer.weight_scale_inv
     return None
@@ -157,7 +169,7 @@ def get_wo_a_bf16_weight(
         return None
 
     weight_scale_inv = getattr(wo_a, "weight_scale_inv", None)
-    if weight_scale_inv is not None:
+    if weight_scale_inv is not None and is_fp8_dtype(raw_weight.dtype):
         scale = _expand_block_scales(
             weight_scale_inv.reshape(n_groups, -1, weight_scale_inv.shape[-1]),
             o_lora_rank,

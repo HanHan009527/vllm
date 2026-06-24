@@ -396,24 +396,38 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
+    @staticmethod
+    def _is_fp8_weight_dtype(dtype: torch.dtype) -> bool:
+        fp8_dtypes = {
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        }
+        return dtype in fp8_dtypes
+
     def _cache_bf16_weight_if_needed(self, layer: RoutedExperts) -> None:
         cache_bf16_weight = getattr(layer, "is_bmm", False) or getattr(
             layer, "cache_bf16_weight", False
         )
         if self.block_quant and cache_bf16_weight:
-            weight_scale = getattr(layer, "weight_scale_inv", None)
-            if weight_scale is None:
-                weight_scale = getattr(layer, "weight_scale", None)
-            if weight_scale is not None:
+            if self._is_fp8_weight_dtype(layer.weight.dtype):
+                weight_scale = getattr(layer, "weight_scale_inv", None)
+                if weight_scale is None:
+                    weight_scale = getattr(layer, "weight_scale", None)
+                if weight_scale is None:
+                    return
                 assert self.weight_block_size is not None
                 bf16_weight = dequantize_fp8_block_weight(
                     layer.weight,
                     weight_scale,
                     self.weight_block_size,
                 ).to(torch.bfloat16)
-                layer._fp8_weight_bf16 = bf16_weight
-                if getattr(layer, "is_bmm", False):
-                    layer._fp8_bmm_weight_bf16 = bf16_weight
+            else:
+                bf16_weight = layer.weight.to(torch.bfloat16)
+            layer._fp8_weight_bf16 = bf16_weight
+            if getattr(layer, "is_bmm", False):
+                layer._fp8_bmm_weight_bf16 = bf16_weight
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         if self.use_marlin:

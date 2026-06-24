@@ -172,7 +172,7 @@ class FakeFlatCachedGroupedWoA(nn.Module):
         raise AssertionError("cached flat BF16 weight should bypass wo_a.forward")
 
 
-class FakeInverseScaleGroupedWoA(nn.Module):
+class FakeBf16GroupedWoAWithStaleScale(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(
@@ -278,9 +278,9 @@ def test_inv_rope_bf16_o_proj_uses_flat_cached_bmm_weight():
     torch.testing.assert_close(out, expected)
 
 
-def test_get_wo_a_bf16_weight_dequantizes_raw_direct_scale_weight():
+def test_get_wo_a_bf16_weight_ignores_stale_scale_for_raw_bf16_weight():
     weight = get_wo_a_bf16_weight(
-        FakeInverseScaleGroupedWoA(),
+        FakeBf16GroupedWoAWithStaleScale(),
         n_groups=2,
         o_lora_rank=2,
         input_size=4,
@@ -289,8 +289,8 @@ def test_get_wo_a_bf16_weight_dequantizes_raw_direct_scale_weight():
     assert weight is not None
     expected = torch.tensor(
         [
-            [[0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]],
             [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+            [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]],
         ],
         dtype=torch.bfloat16,
     )
@@ -388,6 +388,9 @@ class FakePerTensorScaleWoA(FakeSingleGroupWoA):
 class FakeInverseScaleWoA(FakeSingleGroupWoA):
     def __init__(self):
         super().__init__()
+        self.weight = nn.Parameter(
+            self.weight.detach().to(torch.float8_e4m3fn), requires_grad=False
+        )
         self.weight_scale_inv = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
 
