@@ -420,15 +420,35 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     indices_max,
                     int(invalid_count.item()),
                 )
-            flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if swa_metadata.pcp_allgather_restore_idx is not None:
+                # The FlashMLA sparse prefill kernel is sensitive to larger
+                # PCP-local query row batches even when the generated sparse
+                # indices are in bounds. Keep the kernel call bounded without
+                # changing the request-level chunking or gathered KV workspace.
+                sparse_query_chunk_size = 128
+            else:
+                sparse_query_chunk_size = query_end - query_start
+            for sparse_query_start in range(
+                query_start, query_end, sparse_query_chunk_size
+            ):
+                sparse_query_end = min(
+                    sparse_query_start + sparse_query_chunk_size, query_end
+                )
+                sparse_indices_start = sparse_query_start - query_start
+                sparse_indices_end = sparse_query_end - query_start
+                flash_mla_sparse_fwd(
+                    q=q[sparse_query_start:sparse_query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices[
+                        sparse_indices_start:sparse_indices_end
+                    ].unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens[
+                        sparse_indices_start:sparse_indices_end
+                    ],
+                    out=output[sparse_query_start:sparse_query_end],
+                )
             if swa_metadata.pcp_allgather_restore_idx is not None:
                 chunk_output = output[query_start:query_end]
                 chunk_output[combined_lens == 0] = 0
