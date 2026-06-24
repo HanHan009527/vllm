@@ -163,7 +163,7 @@ def get_wo_a_bf16_weight(
             o_lora_rank,
             input_size,
         )
-        grouped_weight = grouped_weight.to(torch.float32) / scale
+        grouped_weight = grouped_weight.to(torch.float32) * scale
 
     grouped_weight = grouped_weight.to(torch.bfloat16)
     wo_a._dsv4_wo_a_bf16 = grouped_weight

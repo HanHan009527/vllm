@@ -28,7 +28,7 @@ def test_dequantize_fp8_block_weight_uses_direct_scale():
     torch.testing.assert_close(out, expected)
 
 
-def test_fp8_linear_method_caches_bmm_bf16_weight():
+def test_fp8_linear_method_caches_bmm_bf16_weight_from_direct_scale():
     method = object.__new__(Fp8LinearMethod)
     method.block_quant = True
     method.weight_block_size = [2, 2]
@@ -44,10 +44,10 @@ def test_fp8_linear_method_caches_bmm_bf16_weight():
 
     expected = torch.tensor(
         [
-            [0.5, 0.5, 0.25, 0.25],
-            [0.5, 0.5, 0.25, 0.25],
-            [0.125, 0.125, 0.0625, 0.0625],
-            [0.125, 0.125, 0.0625, 0.0625],
+            [2.0, 2.0, 4.0, 4.0],
+            [2.0, 2.0, 4.0, 4.0],
+            [8.0, 8.0, 16.0, 16.0],
+            [8.0, 8.0, 16.0, 16.0],
         ],
         dtype=torch.bfloat16,
     )

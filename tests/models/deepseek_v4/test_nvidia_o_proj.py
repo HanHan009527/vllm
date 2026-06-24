@@ -278,7 +278,7 @@ def test_inv_rope_bf16_o_proj_uses_flat_cached_bmm_weight():
     torch.testing.assert_close(out, expected)
 
 
-def test_get_wo_a_bf16_weight_dequantizes_raw_inverse_scale_weight():
+def test_get_wo_a_bf16_weight_dequantizes_raw_direct_scale_weight():
     weight = get_wo_a_bf16_weight(
         FakeInverseScaleGroupedWoA(),
         n_groups=2,
@@ -289,8 +289,8 @@ def test_get_wo_a_bf16_weight_dequantizes_raw_inverse_scale_weight():
     assert weight is not None
     expected = torch.tensor(
         [
-            [[2.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]],
-            [[4.0, 0.0, 0.0, 0.0], [0.0, 4.0, 0.0, 0.0]],
+            [[0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
         ],
         dtype=torch.bfloat16,
     )

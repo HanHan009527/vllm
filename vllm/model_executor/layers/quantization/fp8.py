@@ -402,7 +402,6 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         if self.block_quant and cache_bf16_weight:
             weight_scale = getattr(layer, "weight_scale_inv", None)
-            scale_is_inverse = weight_scale is not None
             if weight_scale is None:
                 weight_scale = getattr(layer, "weight_scale", None)
             if weight_scale is not None:
@@ -411,7 +410,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight,
                     weight_scale,
                     self.weight_block_size,
-                    scale_is_inverse=scale_is_inverse,
                 ).to(torch.bfloat16)
                 layer._fp8_weight_bf16 = bf16_weight
                 if getattr(layer, "is_bmm", False):
