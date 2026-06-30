@@ -12,8 +12,11 @@ def test_flashmla_pcp_swa_prefill_consumes_metadata_helper():
 
     assert "build_pcp_swa_prefill_segments" in source
     assert "runtime_metadata=swa_metadata.pcp_prefill_metadata" in source
+    assert "valid_seg_q = segment_q[segment.valid_mask].contiguous()" in source
+    assert "seg_output[segment.valid_mask] = seg_out" in source
     assert "seg_base_pos" not in source
     assert "shifted_indices = torch.where" not in source
+    assert "seg_q.index_copy_" not in source
 
 
 def test_sparse_swa_builder_constructs_pcp_prefill_metadata():
