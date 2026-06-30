@@ -520,6 +520,51 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             topk_length=seg_full_lens,
                             out=seg_out,
                         )
+                        if (
+                            envs.VLLM_DSV4_NONFINITE_DIAG
+                            and self.prefix == "model.layers.0.attn"
+                            and not torch.isfinite(seg_out).all()
+                        ):
+                            valid_seg_out = seg_out.index_select(
+                                0, segment.q_rows[segment.valid_mask]
+                            )
+                            valid_indices = segment.shifted_indices[
+                                segment.valid_mask
+                            ]
+                            valid_lens = segment.topk_lens[segment.valid_mask]
+                            logger.error(
+                                "DeepSeek V4 PCP SWA segment non-finite at %s: "
+                                "query=(%d,%d) kv=(%d,%d) sparse_rows=%d "
+                                "valid_rows_min=%d valid_rows_max=%d "
+                                "q_finite=%s kv_finite=%s "
+                                "valid_out_finite=%s bad_valid_out=%d "
+                                "indices_min=%d indices_max=%d "
+                                "lens_min=%d lens_max=%d",
+                                self.prefix,
+                                segment.query_start,
+                                segment.query_end,
+                                segment.kv_start,
+                                segment.kv_end,
+                                segment.sparse_rows,
+                                int(
+                                    segment.q_rows[
+                                        segment.valid_mask
+                                    ].min().item()
+                                ),
+                                int(
+                                    segment.q_rows[
+                                        segment.valid_mask
+                                    ].max().item()
+                                ),
+                                bool(torch.isfinite(seg_q).all().item()),
+                                bool(torch.isfinite(seg_kv).all().item()),
+                                bool(torch.isfinite(valid_seg_out).all().item()),
+                                int((~torch.isfinite(valid_seg_out)).sum().item()),
+                                int(valid_indices.min().item()),
+                                int(valid_indices.max().item()),
+                                int(valid_lens.min().item()),
+                                int(valid_lens.max().item()),
+                            )
                         seg_output.copy_(seg_out.index_select(0, segment.q_rows))
                         seg_output[segment.topk_lens == 0] = 0
                     continue
