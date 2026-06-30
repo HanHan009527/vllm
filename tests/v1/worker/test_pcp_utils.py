@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backends.utils import (
@@ -18,7 +19,11 @@ from vllm.v1.attention.backends.utils import (
     pcp_kv_allgather_and_restore,
     restore_pcp_local_tensor_to_padded_tokens,
 )
-from vllm.v1.worker.cp_utils import PCPManager
+from vllm.v1.worker.cp_utils import (
+    DSV4_PCP_PREFILL_UNSUPPORTED_ERROR,
+    PCPManager,
+    guard_dsv4_pcp_prefill_runtime_metadata,
+)
 
 
 def test_pcp_manager_dual_chunk_swap_positions_rank0():
@@ -293,6 +298,33 @@ def test_get_pcp_max_buffer_num_tokens():
 
     config.parallel_config.prefill_context_parallel_size = 2
     assert get_pcp_max_buffer_num_tokens(config) == 28
+
+
+def test_deepseek_v4_pcp_prefill_guard_raises_without_runtime_metadata():
+    with pytest.raises(NotImplementedError, match=DSV4_PCP_PREFILL_UNSUPPORTED_ERROR):
+        guard_dsv4_pcp_prefill_runtime_metadata(
+            pcp_allgather_restore_idx=torch.tensor([0, 1], dtype=torch.int64),
+            num_prefill_tokens=2,
+            runtime_metadata=None,
+        )
+
+
+def test_deepseek_v4_pcp_prefill_guard_allows_non_legacy_paths():
+    guard_dsv4_pcp_prefill_runtime_metadata(
+        pcp_allgather_restore_idx=None,
+        num_prefill_tokens=2,
+        runtime_metadata=None,
+    )
+    guard_dsv4_pcp_prefill_runtime_metadata(
+        pcp_allgather_restore_idx=torch.tensor([0, 1], dtype=torch.int64),
+        num_prefill_tokens=0,
+        runtime_metadata=None,
+    )
+    guard_dsv4_pcp_prefill_runtime_metadata(
+        pcp_allgather_restore_idx=torch.tensor([0, 1], dtype=torch.int64),
+        num_prefill_tokens=2,
+        runtime_metadata=object(),
+    )
 
 
 def test_get_pcp_query_and_kv_indices():

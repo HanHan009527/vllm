@@ -28,6 +28,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
 )
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+from vllm.v1.worker.cp_utils import guard_dsv4_pcp_prefill_runtime_metadata
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -338,6 +339,11 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_reqs = num_decodes + num_prefills
         num_tokens = num_decode_tokens + num_prefill_tokens
+        guard_dsv4_pcp_prefill_runtime_metadata(
+            pcp_allgather_restore_idx=swa_metadata.pcp_allgather_restore_idx,
+            num_prefill_tokens=num_prefill_tokens,
+            runtime_metadata=None,
+        )
         if num_tokens == 0:
             return
 

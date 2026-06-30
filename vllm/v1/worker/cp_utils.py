@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -12,6 +13,132 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 else:
     AttentionLayerBase = object
+
+
+DSV4_PCP_PREFILL_UNSUPPORTED_ERROR = (
+    "DeepSeek-V4 prefill PCP requires dsv4 PCP runtime metadata path; "
+    "legacy sparse backend remap path is unsupported."
+)
+
+
+@dataclass(frozen=True)
+class PCPInterleaveRequestView:
+    req_idx: int
+    global_seq_len: int
+    local_token_count: int
+    local_query_start: int
+    local_query_end: int
+    global_positions: torch.Tensor
+    local_positions: torch.Tensor
+    restore_idx: torch.Tensor
+    global_slot_mapping: torch.Tensor
+    local_kv_base: int
+    local_kv_len: int
+
+
+def guard_dsv4_pcp_prefill_runtime_metadata(
+    *,
+    pcp_allgather_restore_idx: torch.Tensor | None,
+    num_prefill_tokens: int,
+    runtime_metadata: object | None,
+) -> None:
+    """Fail closed before DeepSeek V4 sparse backends use legacy PCP remap."""
+    if (
+        pcp_allgather_restore_idx is not None
+        and num_prefill_tokens > 0
+        and runtime_metadata is None
+    ):
+        raise NotImplementedError(DSV4_PCP_PREFILL_UNSUPPORTED_ERROR)
+
+
+def _cpu_long_tensor(data: np.ndarray | torch.Tensor) -> torch.Tensor:
+    if isinstance(data, torch.Tensor):
+        return data.detach().to(device="cpu", dtype=torch.long)
+    return torch.as_tensor(data, dtype=torch.long, device="cpu")
+
+
+def build_pcp_interleave_request_views(
+    *,
+    original_token_counts: np.ndarray | torch.Tensor,
+    local_token_counts: np.ndarray | torch.Tensor,
+    local_positions: np.ndarray | torch.Tensor,
+    restore_idx: torch.Tensor,
+    pcp_world_size: int,
+    global_slot_mapping: torch.Tensor,
+    local_valid_mask: np.ndarray | torch.Tensor | None = None,
+) -> list[PCPInterleaveRequestView]:
+    """Build per-request PCP views from the current local-rank token layout.
+
+    The current V1 PCP manager uses a dual-chunk head/tail layout. The view keeps
+    the request-local selected global positions, compact local positions, and the
+    per-request restore slice together so model-specific metadata builders do not
+    need to rediscover those relationships from raw buffers.
+    """
+    original_counts = _cpu_long_tensor(original_token_counts)
+    local_counts = _cpu_long_tensor(local_token_counts)
+    positions = _cpu_long_tensor(local_positions)
+    valid_mask = (
+        _cpu_long_tensor(local_valid_mask).to(dtype=torch.bool)
+        if local_valid_mask is not None
+        else None
+    )
+    slots = global_slot_mapping.detach().to(device="cpu", dtype=torch.long)
+    restore = restore_idx.detach().to(device="cpu", dtype=torch.long)
+
+    num_reqs = int(original_counts.numel())
+    original_starts = torch.empty(num_reqs, dtype=torch.long)
+    local_starts = torch.empty(num_reqs, dtype=torch.long)
+    padded_starts = torch.empty(num_reqs, dtype=torch.long)
+    if num_reqs == 0:
+        return []
+    original_starts[0] = 0
+    local_starts[0] = 0
+    padded_starts[0] = 0
+    if num_reqs > 1:
+        original_starts[1:] = torch.cumsum(original_counts, dim=0)[:-1]
+        local_starts[1:] = torch.cumsum(local_counts, dim=0)[:-1]
+        padded_starts[1:] = torch.cumsum(local_counts * pcp_world_size, dim=0)[:-1]
+
+    views: list[PCPInterleaveRequestView] = []
+    compact_start = 0
+    for req_idx in range(num_reqs):
+        global_seq_len = int(original_counts[req_idx].item())
+        local_count = int(local_counts[req_idx].item())
+        local_start = int(local_starts[req_idx].item())
+        local_end = local_start + local_count
+
+        req_positions = positions[local_start:local_end]
+        if valid_mask is None:
+            req_valid_mask = req_positions < global_seq_len
+        else:
+            req_valid_mask = valid_mask[local_start:local_end]
+
+        valid_positions = req_positions[req_valid_mask]
+        valid_count = int(valid_positions.numel())
+        original_start = int(original_starts[req_idx].item())
+        slot_indices = original_start + valid_positions
+        request_slots = slots[slot_indices] if valid_count > 0 else slots[:0]
+        compact_end = compact_start + valid_count
+
+        padded_start = int(padded_starts[req_idx].item())
+        padded_end = padded_start + local_count * pcp_world_size
+        views.append(
+            PCPInterleaveRequestView(
+                req_idx=req_idx,
+                global_seq_len=global_seq_len,
+                local_token_count=valid_count,
+                local_query_start=compact_start,
+                local_query_end=compact_end,
+                global_positions=valid_positions,
+                local_positions=torch.arange(valid_count, dtype=torch.long),
+                restore_idx=restore[padded_start:padded_end],
+                global_slot_mapping=request_slots,
+                local_kv_base=compact_start,
+                local_kv_len=valid_count,
+            )
+        )
+        compact_start = compact_end
+    return views
 
 
 class PCPManager:
@@ -93,6 +220,7 @@ class PCPManager:
         self.pcp_local_token_indices_cpu = (
             self.pcp_local_token_indices_cpu_tensor.numpy()
         )
+        self.pcp_request_views: list[PCPInterleaveRequestView] = []
 
     @staticmethod
     def _get_cumsum_and_arange(
@@ -218,6 +346,20 @@ class PCPManager:
         restore_idx = all_positions.argsort()
         self.pcp_allgather_restore_idx.np[: restore_idx.shape[0]] = restore_idx
         self.pcp_allgather_restore_idx.copy_to_gpu(restore_idx.shape[0])
+        identity_slot_mapping = torch.arange(
+            int(tokens.sum(dtype=np.int64)),
+            dtype=torch.long,
+            device="cpu",
+        )
+        self.pcp_request_views = build_pcp_interleave_request_views(
+            original_token_counts=tokens,
+            local_token_counts=pcp_tokens[:num_reqs],
+            local_positions=positions[:num_local_tokens],
+            restore_idx=torch.from_numpy(restore_idx),
+            pcp_world_size=self.pcp_world_size,
+            global_slot_mapping=identity_slot_mapping,
+            local_valid_mask=local_valid_mask,
+        )
 
         return pcp_tokens[:num_reqs], positions
 

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
     from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.worker.cp_utils import PCPInterleaveRequestView
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -408,6 +409,9 @@ class CommonAttentionMetadata:
     pcp_full_seq_lens_cpu: torch.Tensor | None = None
     """Full per-request sequence lengths before PCP splits prefill tokens."""
 
+    pcp_request_views: list["PCPInterleaveRequestView"] | None = None
+    """Request-level PCP token layout views for model-specific metadata builders."""
+
     positions: torch.Tensor | None = None
     """(num_actual_tokens,) token positions.  Optional; set when the caller
     has positions available so that builders can pre-compute position-dependent
@@ -516,6 +520,7 @@ class CommonAttentionMetadata:
             pcp_allgather_restore_idx=self.pcp_allgather_restore_idx,
             pcp_full_seq_lens=maybe_slice_reqs(self.pcp_full_seq_lens),
             pcp_full_seq_lens_cpu=maybe_slice_reqs(self.pcp_full_seq_lens_cpu),
+            pcp_request_views=maybe_slice_reqs(self.pcp_request_views),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
         )
 

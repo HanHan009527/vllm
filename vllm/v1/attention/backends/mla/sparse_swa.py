@@ -6,8 +6,10 @@ from typing import ClassVar, cast
 import torch
 
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import get_pcp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
+from vllm.models.deepseek_v4.pcp_metadata import DeepseekV4PcpPrefillMetadata
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
@@ -184,6 +186,7 @@ class DeepseekSparseSWAMetadata:
     prefill_max_model_len: int = 0
     prefill_max_num_batched_tokens: int = 0
     pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_prefill_metadata: DeepseekV4PcpPrefillMetadata | None = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -426,6 +429,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             prefill_seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            slot_mapping,
+            common_attn_metadata.positions,
+            common_attn_metadata.pcp_allgather_restore_idx,
+            common_attn_metadata.pcp_request_views,
             pcp_enabled,
         )
 
@@ -500,8 +507,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor | None,
+        pcp_allgather_restore_idx: torch.Tensor | None,
+        pcp_request_views: list | None,
         pcp_enabled: bool,
-    ) -> dict[str, torch.Tensor | int | None]:
+    ) -> dict[str, object]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
         Returns a dict of keyword arguments to pass to the
@@ -546,6 +557,37 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             result["prefill_window_size"] = self.window_size
             result["prefill_max_model_len"] = self.max_model_len
             result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+            if pcp_enabled:
+                assert pcp_allgather_restore_idx is not None
+                assert pcp_request_views is not None
+                base = query_start_loc_cpu[num_decodes]
+                local_query_start_loc = (
+                    query_start_loc[
+                        num_decodes : num_decodes + num_prefills + 1
+                    ]
+                    - int(base.item())
+                )
+                parallel_config = self.vllm_config.parallel_config
+                try:
+                    pcp_rank = get_pcp_group().rank_in_group
+                except AssertionError:
+                    pcp_rank = 0
+                result["pcp_prefill_metadata"] = DeepseekV4PcpPrefillMetadata(
+                    cp_size=parallel_config.prefill_context_parallel_size,
+                    cp_rank=pcp_rank,
+                    strategy="dual_chunk",
+                    views=pcp_request_views,
+                    local_query_start_loc=local_query_start_loc,
+                    local_seq_lens=seq_lens[num_decodes:],
+                    local_swa_indices=None,
+                    local_swa_valid_lens=None,
+                    local_c4_indices=None,
+                    local_c128_indices=None,
+                    global_slot_mapping=slot_mapping,
+                    compressor_write_locs_global=None,
+                    restore_idx=pcp_allgather_restore_idx,
+                    debug_global_positions=positions,
+                )
 
         return result
 

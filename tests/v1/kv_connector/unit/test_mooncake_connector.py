@@ -151,6 +151,8 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
     worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=False)
 
     block_len = 256
+    worker.block_size = block_len
+    worker.kv_manager_block_size = block_len
     remote_regions = [
         TransferRegion(
             layer_name=f"model.layers.{layer_index}.self_attn",
@@ -1393,6 +1395,7 @@ async def test_receive_kv_selects_remote_pp_workers(
         side_effect=fake_receive,
     ):
         decode_worker.receive_kv("p-engine", pull_metas)
+        assert pull_metas["d-req-1"].pull_tasks_count == len(expected_addrs)
         await asyncio.sleep(0)
 
     assert seen_addrs == expected_addrs

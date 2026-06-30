@@ -2496,6 +2496,9 @@ class GPUModelRunner(
                 cm_base.pcp_full_seq_lens_cpu = self.pcp_full_seq_lens.cpu[
                     :num_reqs_padded
                 ]
+                cm_base.pcp_request_views = self.pcp_manager.pcp_request_views[
+                    :num_reqs
+                ]
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)

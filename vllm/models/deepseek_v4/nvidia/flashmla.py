@@ -19,6 +19,10 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
 )
+from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_sparse_prefill_rows,
+    build_pcp_swa_prefill_segments,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
@@ -27,6 +31,7 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
+from vllm.v1.worker.cp_utils import guard_dsv4_pcp_prefill_runtime_metadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -267,6 +272,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        is_pcp_prefill = swa_metadata.pcp_allgather_restore_idx is not None
+        guard_dsv4_pcp_prefill_runtime_metadata(
+            pcp_allgather_restore_idx=swa_metadata.pcp_allgather_restore_idx,
+            num_prefill_tokens=num_prefill_tokens,
+            runtime_metadata=swa_metadata.pcp_prefill_metadata,
+        )
 
         # Use pre-computed prefill metadata.
         seq_lens = swa_metadata.prefill_seq_lens
@@ -371,74 +382,27 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     chunk_M,
                     chunk_N,
                 )
-            pcp_kernel_rows = None
-            pcp_kernel_rows_min = 0
-            pcp_kernel_rows_max = -1
-            pcp_sparse_rows = 0
-            is_pcp_prefill = swa_metadata.pcp_allgather_restore_idx is not None
+            pcp_sparse_rows = None
             if is_pcp_prefill:
-                q_tokens = query_end - query_start
-                pcp_kernel_rows = torch.empty(
-                    q_tokens, dtype=torch.long, device=q.device
+                local_query_start_loc = query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ]
+                local_query_start_loc = local_query_start_loc - local_query_start_loc[0]
+                pcp_sparse_rows = build_pcp_sparse_prefill_rows(
+                    combined_lens=combined_lens,
+                    positions=positions[query_start:query_end],
+                    local_query_start_loc=local_query_start_loc,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    chunk_n=chunk_N,
+                    chunk_m=chunk_M,
                 )
-                chunk_base = query_start_loc_cpu[num_decodes + chunk_start]
-                for req_idx in range(chunk_size):
-                    req_query_start = (
-                        query_start_loc_cpu[num_decodes + chunk_start + req_idx]
-                        - chunk_base
-                    )
-                    req_query_end = (
-                        query_start_loc_cpu[num_decodes + chunk_start + req_idx + 1]
-                        - chunk_base
-                    )
-                    if req_query_start == req_query_end:
-                        continue
-                    req_seq_len = int(seq_lens[chunk_start + req_idx].item())
-                    req_gather_len = int(gather_lens[chunk_start + req_idx].item())
-                    req_gather_start = req_seq_len - req_gather_len
-                    req_positions = positions[
-                        query_start + req_query_start : query_start + req_query_end
-                    ].to(torch.long)
-                    req_valid = (req_positions >= req_gather_start) & (
-                        req_positions < req_seq_len
-                    )
-                    req_kernel_rows = (
-                        req_idx * chunk_M
-                        + chunk_N
-                        + req_positions
-                        - req_gather_start
-                    )
-                    req_kernel_rows = torch.where(
-                        req_valid,
-                        req_kernel_rows,
-                        torch.zeros_like(req_kernel_rows),
-                    )
-                    pcp_kernel_rows[req_query_start:req_query_end] = req_kernel_rows
-                valid_query_mask = combined_lens > 0
-                if q_tokens > 0 and valid_query_mask.any():
-                    valid_pcp_kernel_rows = pcp_kernel_rows[valid_query_mask]
-                    pcp_kernel_rows_min = int(valid_pcp_kernel_rows.min().item())
-                    pcp_kernel_rows_max = int(valid_pcp_kernel_rows.max().item())
-                    if (
-                        pcp_kernel_rows_min < 0
-                        or pcp_kernel_rows_max >= chunk_size * chunk_M
-                    ):
-                        raise ValueError(
-                            "DeepSeek V4 PCP sparse prefill query rows are "
-                            "outside the gathered KV workspace: "
-                            f"min={pcp_kernel_rows_min}, "
-                            f"max={pcp_kernel_rows_max}, "
-                            f"workspace_rows={chunk_size * chunk_M}"
-                        )
-                    pcp_sparse_rows = pcp_kernel_rows_max + 1
-                else:
-                    pcp_sparse_rows = 1
             if (
                 envs.VLLM_DSV4_NONFINITE_DIAG
                 and is_pcp_prefill
                 and self.prefix == "model.layers.0.attn"
             ):
-                assert pcp_kernel_rows is not None
+                assert pcp_sparse_rows is not None
                 valid_offsets = torch.arange(
                     combined_indices.shape[1],
                     device=combined_indices.device,
@@ -484,154 +448,95 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     indices_min,
                     indices_max,
                     int(invalid_count.item()),
-                    pcp_kernel_rows_min,
-                    pcp_kernel_rows_max,
-                    pcp_sparse_rows,
+                    pcp_sparse_rows.rows_min,
+                    pcp_sparse_rows.rows_max,
+                    pcp_sparse_rows.sparse_rows,
                 )
             if is_pcp_prefill:
-                assert pcp_kernel_rows is not None
+                assert pcp_sparse_rows is not None
                 if top_k == 0:
-                    # SWA-only prefill is row-sensitive in FlashMLA. Rebase
-                    # each PCP request segment to a compact local KV window
-                    # instead of passing sparse global PCP row coordinates.
                     kv_flat = kv.view(-1, 1, q.shape[-1])
-                    local_query_start_loc = [
-                        query_start_loc_cpu[num_decodes + chunk_start + i]
-                        - query_start_loc_cpu[num_decodes + chunk_start]
-                        for i in range(chunk_size + 1)
-                    ]
-                    for req_idx in range(chunk_size):
-                        req_query_start = local_query_start_loc[req_idx]
-                        req_query_end = local_query_start_loc[req_idx + 1]
-                        req_seq_len = int(seq_lens[chunk_start + req_idx].item())
-                        req_gather_len = int(
-                            gather_lens[chunk_start + req_idx].item()
+                    segments = build_pcp_swa_prefill_segments(
+                        combined_indices=combined_indices,
+                        combined_lens=combined_lens,
+                        positions=positions[query_start:query_end],
+                        local_query_start_loc=local_query_start_loc,
+                        seq_lens=seq_lens[chunk_start:chunk_end],
+                        gather_lens=gather_lens[chunk_start:chunk_end],
+                        chunk_n=chunk_N,
+                        chunk_m=chunk_M,
+                        window_size=self.window_size,
+                    )
+                    for segment in segments:
+                        seg_output = output[
+                            query_start
+                            + segment.query_start : query_start
+                            + segment.query_end
+                        ]
+                        if not segment.valid_mask.any():
+                            seg_output.zero_()
+                            continue
+
+                        seg_kv = kv_flat[segment.kv_start : segment.kv_end]
+                        seg_q = q.new_zeros((segment.sparse_rows, *q.shape[1:]))
+                        seg_out = output.new_empty(
+                            (segment.sparse_rows, *output.shape[1:])
                         )
-                        req_gather_start = req_seq_len - req_gather_len
-                        for seg_query_start in range(
-                            req_query_start, req_query_end, 64
-                        ):
-                            seg_query_end = min(seg_query_start + 64, req_query_end)
-                            seg_positions = positions[
+                        seg_out.zero_()
+                        seg_full_indices = combined_indices.new_full(
+                            (segment.sparse_rows, segment.shifted_indices.shape[1]),
+                            -1,
+                        )
+                        seg_full_indices[:, 0] = 0
+                        seg_full_lens = segment.topk_lens.new_ones(
+                            (segment.sparse_rows,)
+                        )
+                        valid_seg_rows = segment.q_rows[segment.valid_mask]
+                        seg_q.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            q[
                                 query_start
-                                + seg_query_start : query_start
-                                + seg_query_end
-                            ].to(torch.long)
-                            seg_lens = combined_lens[seg_query_start:seg_query_end]
-                            seg_valid = seg_lens > 0
-                            seg_output = output[
-                                query_start
-                                + seg_query_start : query_start
-                                + seg_query_end
-                            ]
-                            if not seg_valid.any():
-                                seg_output.zero_()
-                                continue
-
-                            valid_positions = seg_positions[seg_valid]
-                            seg_base_pos = max(
-                                req_gather_start,
-                                int(valid_positions.min().item())
-                                - self.window_size
-                                + 1,
-                            )
-                            seg_end_pos = int(valid_positions.max().item()) + 1
-                            kv_base = (
-                                req_idx * chunk_M
-                                + chunk_N
-                                + seg_base_pos
-                                - req_gather_start
-                            )
-                            kv_end = (
-                                req_idx * chunk_M
-                                + chunk_N
-                                + seg_end_pos
-                                - req_gather_start
-                            )
-                            seg_kv = kv_flat[kv_base:kv_end]
-                            seg_rows = seg_positions - seg_base_pos
-                            seg_rows = torch.where(
-                                seg_valid,
-                                seg_rows,
-                                torch.zeros_like(seg_rows),
-                            )
-                            seg_sparse_rows = (
-                                int(seg_rows[seg_valid].max().item()) + 1
-                            )
-                            seg_q = q.new_zeros((seg_sparse_rows, *q.shape[1:]))
-                            seg_out = output.new_empty(
-                                (seg_sparse_rows, *output.shape[1:])
-                            )
-                            seg_out.zero_()
-                            seg_indices = combined_indices[
-                                seg_query_start:seg_query_end
-                            ]
-                            shifted_indices = torch.where(
-                                seg_indices >= 0, seg_indices - kv_base, seg_indices
-                            )
-                            valid_offsets = torch.arange(
-                                shifted_indices.shape[1],
-                                device=shifted_indices.device,
-                                dtype=seg_lens.dtype,
-                            )
-                            valid_mask = (
-                                valid_offsets.unsqueeze(0) < seg_lens.unsqueeze(1)
-                            )
-                            valid_shifted_indices = shifted_indices[valid_mask]
-                            if (
-                                (valid_shifted_indices < 0).any()
-                                or (valid_shifted_indices >= seg_kv.shape[0]).any()
-                            ):
-                                raise ValueError(
-                                    "DeepSeek V4 PCP SWA prefill segment indices "
-                                    "are outside the rebased KV workspace"
-                                )
-
-                            seg_full_indices = combined_indices.new_full(
-                                (seg_sparse_rows, shifted_indices.shape[1]), -1
-                            )
-                            seg_full_indices[:, 0] = 0
-                            seg_full_lens = seg_lens.new_ones((seg_sparse_rows,))
-                            valid_seg_rows = seg_rows[seg_valid]
-                            seg_q.index_copy_(
-                                0,
-                                valid_seg_rows,
-                                q[
-                                    query_start
-                                    + seg_query_start : query_start
-                                    + seg_query_end
-                                ][seg_valid],
-                            )
-                            seg_full_indices.index_copy_(
-                                0, valid_seg_rows, shifted_indices[seg_valid]
-                            )
-                            seg_full_lens.index_copy_(
-                                0, valid_seg_rows, seg_lens[seg_valid]
-                            )
-                            flash_mla_sparse_fwd(
-                                q=seg_q,
-                                kv=seg_kv,
-                                indices=seg_full_indices.unsqueeze(1),
-                                sm_scale=self.scale,
-                                attn_sink=self.attn_sink,
-                                topk_length=seg_full_lens,
-                                out=seg_out,
-                            )
-                            seg_output.copy_(seg_out.index_select(0, seg_rows))
-                            seg_output[seg_lens == 0] = 0
+                                + segment.query_start : query_start
+                                + segment.query_end
+                            ][segment.valid_mask],
+                        )
+                        seg_full_indices.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            segment.shifted_indices[segment.valid_mask],
+                        )
+                        seg_full_lens.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            segment.topk_lens[segment.valid_mask],
+                        )
+                        flash_mla_sparse_fwd(
+                            q=seg_q,
+                            kv=seg_kv,
+                            indices=seg_full_indices.unsqueeze(1),
+                            sm_scale=self.scale,
+                            attn_sink=self.attn_sink,
+                            topk_length=seg_full_lens,
+                            out=seg_out,
+                        )
+                        seg_output.copy_(seg_out.index_select(0, segment.q_rows))
+                        seg_output[segment.topk_lens == 0] = 0
                     continue
-                pcp_q = q.new_zeros((pcp_sparse_rows, *q.shape[1:]))
-                pcp_out = output.new_empty((pcp_sparse_rows, *output.shape[1:]))
+                pcp_q = q.new_zeros((pcp_sparse_rows.sparse_rows, *q.shape[1:]))
+                pcp_out = output.new_empty(
+                    (pcp_sparse_rows.sparse_rows, *output.shape[1:])
+                )
                 pcp_out.zero_()
                 pcp_indices = combined_indices.new_full(
-                    (pcp_sparse_rows, combined_indices.shape[1]), -1
+                    (pcp_sparse_rows.sparse_rows, combined_indices.shape[1]), -1
                 )
                 pcp_indices[:, 0] = 0
-                pcp_lens = combined_lens.new_ones((pcp_sparse_rows,))
+                pcp_lens = combined_lens.new_ones((pcp_sparse_rows.sparse_rows,))
 
-                valid_query_mask = combined_lens > 0
+                valid_query_mask = pcp_sparse_rows.valid_query_mask
                 if valid_query_mask.any():
-                    valid_pcp_kernel_rows = pcp_kernel_rows[valid_query_mask]
+                    valid_pcp_kernel_rows = pcp_sparse_rows.q_rows[valid_query_mask]
                     pcp_q.index_copy_(
                         0,
                         valid_pcp_kernel_rows,
@@ -657,7 +562,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     out=pcp_out,
                 )
                 chunk_output = output[query_start:query_end]
-                chunk_output.copy_(pcp_out.index_select(0, pcp_kernel_rows))
+                chunk_output.copy_(pcp_out.index_select(0, pcp_sparse_rows.q_rows))
                 chunk_output[combined_lens == 0] = 0
             else:
                 flash_mla_sparse_fwd(
