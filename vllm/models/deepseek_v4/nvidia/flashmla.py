@@ -51,6 +51,15 @@ def _pcp_swa_torch_sparse_fwd(
     out: torch.Tensor,
 ) -> None:
     """Reference sparse SWA attention for PCP prefill segment fallback."""
+    out.zero_()
+    active_rows = topk_length > 0
+    if not active_rows.any():
+        return
+
+    q = q[active_rows]
+    indices = indices[active_rows]
+    topk_length = topk_length[active_rows]
+
     num_rows, num_heads, _ = q.shape
     max_topk = indices.shape[1]
     valid_offsets = torch.arange(
@@ -72,7 +81,9 @@ def _pcp_swa_torch_sparse_fwd(
         probs = probs[..., :max_topk]
     else:
         probs = torch.softmax(scores, dim=-1)
-    out.copy_(torch.einsum("rhk,rkd->rhd", probs, gathered_kv).to(out.dtype))
+    out[active_rows].copy_(
+        torch.einsum("rhk,rkd->rhd", probs, gathered_kv).to(out.dtype)
+    )
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):

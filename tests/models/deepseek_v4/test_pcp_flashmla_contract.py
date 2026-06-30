@@ -14,6 +14,9 @@ def test_flashmla_pcp_swa_prefill_consumes_metadata_helper():
     assert "runtime_metadata=swa_metadata.pcp_prefill_metadata" in source
     assert "def _pcp_swa_torch_sparse_fwd(" in source
     assert "_pcp_swa_torch_sparse_fwd(" in source
+    assert "active_rows = topk_length > 0" in source
+    assert "out.zero_()" in source
+    assert "out[active_rows].copy_(" in source
     assert "seg_q.index_copy_(" in source
     assert "valid_seg_rows = segment.q_rows[segment.valid_mask]" in source
     assert "seg_out.index_select(" in source
