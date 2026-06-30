@@ -65,6 +65,39 @@ def test_build_pcp_swa_prefill_segments_rebases_to_local_kv_window():
     torch.testing.assert_close(segment.valid_mask, torch.tensor([True, True]))
 
 
+def test_build_pcp_swa_prefill_segments_splits_dual_chunk_position_jump():
+    segments = build_pcp_swa_prefill_segments(
+        combined_indices=torch.tensor(
+            [
+                [2, 3, -1],
+                [3, 4, -1],
+                [17, 18, -1],
+                [18, 19, -1],
+            ],
+            dtype=torch.int32,
+        ),
+        combined_lens=torch.tensor([2, 2, 2, 2], dtype=torch.int32),
+        positions=torch.tensor([5, 6, 20, 21], dtype=torch.int64),
+        local_query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([24], dtype=torch.int32),
+        gather_lens=torch.tensor([24], dtype=torch.int32),
+        chunk_n=0,
+        chunk_m=24,
+        window_size=4,
+        segment_size=64,
+    )
+
+    assert len(segments) == 2
+    assert (segments[0].query_start, segments[0].query_end) == (0, 2)
+    assert (segments[0].kv_start, segments[0].kv_end) == (2, 7)
+    assert (segments[1].query_start, segments[1].query_end) == (2, 4)
+    assert (segments[1].kv_start, segments[1].kv_end) == (17, 22)
+    torch.testing.assert_close(
+        segments[1].shifted_indices,
+        torch.tensor([[0, 1, -1], [1, 2, -1]], dtype=torch.int32),
+    )
+
+
 def test_build_pcp_swa_prefill_segments_handles_empty_valid_segment():
     segments = build_pcp_swa_prefill_segments(
         combined_indices=torch.full((2, 3), -1, dtype=torch.int32),

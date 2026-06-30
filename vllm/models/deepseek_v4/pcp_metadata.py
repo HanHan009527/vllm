@@ -136,8 +136,27 @@ def build_pcp_swa_prefill_segments(
         req_gather_len = int(gather_lens[req_idx].item())
         req_gather_start = req_seq_len - req_gather_len
 
-        for seg_query_start in range(req_query_start, req_query_end, segment_size):
-            seg_query_end = min(seg_query_start + segment_size, req_query_end)
+        seg_query_start = req_query_start
+        while seg_query_start < req_query_end:
+            tentative_query_end = min(seg_query_start + segment_size, req_query_end)
+            seg_positions_all = positions[
+                seg_query_start:tentative_query_end
+            ].to(torch.long)
+            seg_lens_all = combined_lens[seg_query_start:tentative_query_end]
+            seg_valid_all = seg_lens_all > 0
+            if seg_positions_all.numel() > 1:
+                adjacent_valid = seg_valid_all[:-1] & seg_valid_all[1:]
+                position_breaks = adjacent_valid & (
+                    seg_positions_all[1:] != seg_positions_all[:-1] + 1
+                )
+                if position_breaks.any():
+                    first_break = int(position_breaks.nonzero()[0].item()) + 1
+                    seg_query_end = seg_query_start + first_break
+                else:
+                    seg_query_end = tentative_query_end
+            else:
+                seg_query_end = tentative_query_end
+
             seg_positions = positions[seg_query_start:seg_query_end].to(torch.long)
             seg_lens = combined_lens[seg_query_start:seg_query_end]
             seg_valid = seg_lens > 0
@@ -157,6 +176,7 @@ def build_pcp_swa_prefill_segments(
                         valid_mask=seg_valid,
                     )
                 )
+                seg_query_start = seg_query_end
                 continue
 
             valid_positions = seg_positions[seg_valid]
@@ -206,4 +226,5 @@ def build_pcp_swa_prefill_segments(
                     valid_mask=seg_valid,
                 )
             )
+            seg_query_start = seg_query_end
     return segments
