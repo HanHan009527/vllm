@@ -17,9 +17,11 @@ def test_flashmla_pcp_swa_prefill_consumes_metadata_helper():
     assert "active_rows = topk_length > 0" in source
     assert "out.zero_()" in source
     assert "out[active_rows].copy_(" in source
-    assert "seg_q.index_copy_(" in source
-    assert "valid_seg_rows = segment.q_rows[segment.valid_mask]" in source
-    assert "seg_out.index_select(" in source
+    assert "seg_q = segment_q[segment.valid_mask]" in source
+    assert "seg_indices = segment.shifted_indices[segment.valid_mask]" in source
+    assert "seg_output[segment.valid_mask] = seg_out" in source
+    assert "valid_seg_rows = segment.q_rows[segment.valid_mask]" not in source
+    assert "seg_out.index_select(" not in source
     assert "seg_base_pos" not in source
     assert "shifted_indices = torch.where" not in source
 
