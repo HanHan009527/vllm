@@ -483,24 +483,42 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             + segment.query_start : query_start
                             + segment.query_end
                         ]
-                        valid_seg_q = segment_q[segment.valid_mask].contiguous()
-                        valid_seg_indices = segment.shifted_indices[
-                            segment.valid_mask
-                        ].contiguous()
-                        valid_seg_lens = segment.topk_lens[
-                            segment.valid_mask
-                        ].contiguous()
+                        seg_q = q.new_zeros((segment.sparse_rows, *q.shape[1:]))
+                        seg_indices = segment.shifted_indices.new_full(
+                            (segment.sparse_rows, segment.shifted_indices.shape[1]),
+                            -1,
+                        )
+                        seg_indices[:, 0] = 0
+                        seg_lens = segment.topk_lens.new_ones(
+                            (segment.sparse_rows,)
+                        )
+                        valid_seg_rows = segment.q_rows[segment.valid_mask]
+                        seg_q.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            segment_q[segment.valid_mask],
+                        )
+                        seg_indices.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            segment.shifted_indices[segment.valid_mask],
+                        )
+                        seg_lens.index_copy_(
+                            0,
+                            valid_seg_rows,
+                            segment.topk_lens[segment.valid_mask],
+                        )
                         seg_out = output.new_empty(
-                            (valid_seg_q.shape[0], *output.shape[1:])
+                            (segment.sparse_rows, *output.shape[1:])
                         )
                         seg_out.zero_()
                         flash_mla_sparse_fwd(
-                            q=valid_seg_q,
+                            q=seg_q,
                             kv=seg_kv,
-                            indices=valid_seg_indices.unsqueeze(1),
+                            indices=seg_indices.unsqueeze(1),
                             sm_scale=self.scale,
                             attn_sink=self.attn_sink,
-                            topk_length=valid_seg_lens,
+                            topk_length=seg_lens,
                             out=seg_out,
                         )
                         if (
@@ -532,17 +550,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                                         segment.valid_mask
                                     ].max().item()
                                 ),
-                                bool(torch.isfinite(valid_seg_q).all().item()),
+                                bool(torch.isfinite(seg_q).all().item()),
                                 bool(torch.isfinite(seg_kv).all().item()),
                                 bool(torch.isfinite(seg_out).all().item()),
                                 int((~torch.isfinite(seg_out)).sum().item()),
-                                int(valid_seg_indices.min().item()),
-                                int(valid_seg_indices.max().item()),
-                                int(valid_seg_lens.min().item()),
-                                int(valid_seg_lens.max().item()),
+                                int(seg_indices[valid_seg_rows].min().item()),
+                                int(seg_indices[valid_seg_rows].max().item()),
+                                int(seg_lens[valid_seg_rows].min().item()),
+                                int(seg_lens[valid_seg_rows].max().item()),
                             )
                         seg_output.zero_()
-                        seg_output[segment.valid_mask] = seg_out
+                        seg_output[segment.valid_mask] = seg_out.index_select(
+                            0, valid_seg_rows
+                        )
                     continue
                 pcp_q = q.new_zeros((pcp_sparse_rows.sparse_rows, *q.shape[1:]))
                 pcp_out = output.new_empty(
