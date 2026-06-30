@@ -647,6 +647,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
+        slot_mapping = swa_metadata.slot_mapping
+        insert_mask = None
+        if local_q_indices is not None:
+            # PCP all-gather/restore includes padding rows so every rank has a
+            # uniform input shape. The fused KV insert kernels only support real
+            # cache slots; passing -1 padding slots can corrupt valid tail rows.
+            insert_mask = slot_mapping >= 0
+            q = q[insert_mask]
+            kv = kv[insert_mask]
+            positions = positions[insert_mask]
+            slot_mapping = slot_mapping[insert_mask]
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
@@ -660,13 +671,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q,
                 kv,
                 swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.padded_heads,
                 self.eps,
                 swa_metadata.block_size,
             )
+            if insert_mask is not None:
+                padded_q = q.new_zeros(
+                    (insert_mask.shape[0], self.padded_heads, self.head_dim)
+                )
+                padded_q[insert_mask] = q
+                q = padded_q
             return restore_pcp_local_tensor_to_padded_tokens(
                 q, local_q_indices, num_padded_local_tokens
             )
@@ -682,12 +699,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q,
                 kv,
                 swa_kv_cache_3d,
-                swa_metadata.slot_mapping,
+                slot_mapping,
                 positions,
                 cos_sin_cache,
                 self.eps,
                 block_size,
             )
+            if insert_mask is not None:
+                padded_q = q.new_zeros((insert_mask.shape[0], *q.shape[1:]))
+                padded_q[insert_mask] = q
+                q = padded_q
             return restore_pcp_local_tensor_to_padded_tokens(
                 q, local_q_indices, num_padded_local_tokens
             )
@@ -699,7 +720,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             kv,
             q_fp8,
             swa_kv_cache_3d,
-            swa_metadata.slot_mapping,
+            slot_mapping,
             positions,
             cos_sin_cache,
             self._flashinfer_fp8_kv_scale,
@@ -707,6 +728,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
+        if insert_mask is not None:
+            padded_q_fp8 = q_fp8.new_zeros((insert_mask.shape[0], *q_fp8.shape[1:]))
+            padded_q_fp8[insert_mask] = q_fp8
+            q_fp8 = padded_q_fp8
         return restore_pcp_local_tensor_to_padded_tokens(
             q_fp8, local_q_indices, num_padded_local_tokens
         )

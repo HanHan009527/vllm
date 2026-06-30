@@ -29,6 +29,15 @@ def test_sparse_swa_builder_constructs_pcp_prefill_metadata():
     assert "pcp_request_views" in source
 
 
+def test_attention_pcp_cache_insert_skips_padding_slots():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" /
+              "attention.py").read_text()
+
+    assert "insert_mask = slot_mapping >= 0" in source
+    assert "slot_mapping = slot_mapping[insert_mask]" in source
+    assert "padded_q[insert_mask] = q" in source
+
+
 def test_flashinfer_pcp_prefill_fails_closed_without_metadata():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
               "flashinfer_sparse.py").read_text()
