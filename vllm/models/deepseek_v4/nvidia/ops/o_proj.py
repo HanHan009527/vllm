@@ -4,11 +4,16 @@ import torch
 import torch.nn as nn
 
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _upcast_e8m0_to_fp32,
+)
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
     fused_inv_rope_fp8_quant,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
 
 def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -24,6 +29,14 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
     einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
     tma_aligned_scales = cap.major >= 10
     return einsum_recipe, tma_aligned_scales
+
+
+def _decode_e8m0_scale_for_deepgemm(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.uint8 or (
+        _E8M0_DTYPE is not None and scale.dtype == _E8M0_DTYPE
+    ):
+        return _upcast_e8m0_to_fp32(scale).contiguous()
+    return scale
 
 
 def _deepseek_v4_fp8_einsum(
@@ -101,6 +114,8 @@ def _deepseek_v4_fp8_einsum(
             if b_groups != num_groups:
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
+    a_scale = _decode_e8m0_scale_for_deepgemm(a_scale)
+    b_scale = _decode_e8m0_scale_for_deepgemm(b_scale)
     fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), out, recipe=recipe)
 
 
