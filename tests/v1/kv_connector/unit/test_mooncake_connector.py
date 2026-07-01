@@ -921,6 +921,13 @@ def patch_worker_dependencies():
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.make_zmq_socket"
         ) as mock_make_zmq,
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.torch.accelerator.current_device_index",
+            return_value=0,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.current_platform.set_device"
+        ),
         patch("httpx.AsyncClient") as mock_async_client,
     ):
         # Mock PP group
