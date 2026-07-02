@@ -310,6 +310,15 @@ def _pcp_bad_kv_output_rows_diag(
     return samples
 
 
+def _kv_cache_storage_block_size(
+    k_cache: torch.Tensor | None,
+    fallback: int,
+) -> int:
+    if k_cache is not None and k_cache.dim() >= 3:
+        return int(k_cache.shape[1])
+    return int(fallback)
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
@@ -592,25 +601,33 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
+                compressed_cache_block_size = _kv_cache_storage_block_size(
+                    compressed_k_cache,
+                    attn_metadata.block_size // self.compress_ratio,
+                )
                 dequantize_and_gather_k_cache(
                     kv[:chunk_size],
                     compressed_k_cache,
                     seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
                     gather_lens=None,
                     block_table=block_table[chunk_start:chunk_end],
-                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    block_size=compressed_cache_block_size,
                     offset=0,
                 )
 
             # Gather SWA KV
             swa_block_table = swa_metadata.block_table[num_decodes:]
+            swa_cache_block_size = _kv_cache_storage_block_size(
+                swa_k_cache,
+                swa_metadata.block_size,
+            )
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
                 swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],
                 gather_lens=gather_lens[chunk_start:chunk_end],
                 block_table=swa_block_table[chunk_start:chunk_end],
-                block_size=swa_metadata.block_size,
+                block_size=swa_cache_block_size,
                 offset=chunk_N,
                 force_triton=is_pcp_prefill,
             )
@@ -699,7 +716,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     block_table=swa_block_table,
                     seq_lens=seq_lens,
                     gather_lens=gather_lens,
-                    block_size=swa_metadata.block_size,
+                    block_size=swa_cache_block_size,
                     chunk_start=chunk_start,
                     chunk_end=chunk_end,
                 )
@@ -815,7 +832,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     tuple(int(stride) for stride in swa_k_cache.stride()),
                     tuple(int(dim) for dim in kv.shape),
                     tuple(int(stride) for stride in kv.stride()),
-                    swa_metadata.block_size,
+                    swa_cache_block_size,
                     slot_coverage["read_slots"],
                     slot_coverage["write_slots"],
                     slot_coverage["write_unique"],
