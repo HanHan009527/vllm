@@ -181,6 +181,17 @@ class PCPManager:
             dtype=torch.int64,
             device=device,
         )
+        self.pcp_padded_positions = torch.empty(
+            (max_buffer_num_tokens,),
+            dtype=torch.int64,
+            device=device,
+        )
+        self.pcp_padded_query_start_loc = CpuGpuBuffer(
+            (max_num_reqs + 1,),
+            dtype=torch.int32,
+            device=device,
+            pin_memory=pin_memory,
+        )
         self.num_pcp_pads_cpu_tensor = torch.zeros(
             (max_num_reqs,), device="cpu", dtype=torch.int64
         )
@@ -287,6 +298,14 @@ class PCPManager:
         self.pcp_unpad_mask.copy_to_gpu(pcp_padded_arange.shape[0])
 
         pcp_tokens = num_padded_scheduled_tokens // self.pcp_world_size
+        self.pcp_padded_query_start_loc.cpu[0] = 0
+        pcp_padded_query_start = np.cumsum(
+            pcp_tokens[:num_reqs] * self.pcp_world_size, dtype=np.int32
+        )
+        self.pcp_padded_query_start_loc.cpu[1 : num_reqs + 1].copy_(
+            torch.from_numpy(pcp_padded_query_start)
+        )
+        self.pcp_padded_query_start_loc.copy_to_gpu(num_reqs + 1)
         pcp_chunk_sizes = (pcp_tokens // 2).clip(min=1)
         pcp_chunk_sizes[:num_decode_reqs] = pcp_tokens[:num_decode_reqs]
 

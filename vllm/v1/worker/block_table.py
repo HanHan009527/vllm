@@ -145,21 +145,23 @@ class BlockTable:
         positions: torch.Tensor,
         *,
         use_pcp: bool = True,
+        out: torch.Tensor | None = None,
     ) -> None:
         num_tokens = positions.shape[0]
         pcp_world_size = self.pcp_world_size if use_pcp else 1
         pcp_rank = self.pcp_rank if use_pcp else 0
         total_cp_world_size = pcp_world_size * self.dcp_world_size
         total_cp_rank = pcp_rank * self.dcp_world_size + self.dcp_rank
+        slot_mapping = self.slot_mapping.gpu if out is None else out
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
-            self.max_num_batched_tokens,
+            slot_mapping.shape[0],
             query_start_loc,
             positions,
             self.block_table.gpu,
             self.block_table.gpu.stride(0),
             self.block_size,
-            self.slot_mapping.gpu,
+            slot_mapping,
             TOTAL_CP_WORLD_SIZE=total_cp_world_size,
             TOTAL_CP_RANK=total_cp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
@@ -311,13 +313,20 @@ class MultiGroupBlockTable:
         positions: torch.Tensor,
         *,
         use_pcp: bool = True,
+        out: torch.Tensor | None = None,
     ) -> None:
+        if out is not None and len(self.block_tables) != 1:
+            raise ValueError(
+                "Custom slot-mapping output is only supported for single "
+                "KV-cache-group block tables."
+            )
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(
                 num_reqs,
                 query_start_loc,
                 positions,
                 use_pcp=use_pcp,
+                out=out,
             )
 
     def commit_block_table(self, num_reqs: int) -> None:

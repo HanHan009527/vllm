@@ -4180,22 +4180,16 @@ class GPUModelRunner(
                             :pcp_full_tokens
                         ]
                     )
-                    local_valid_mask = (
-                        self.pcp_manager.pcp_local_unpad_mask_gpu_tensor[
-                            :num_tokens_unpadded
-                        ]
-                    )
-                    local_slot_mapping = blk_table.slot_mapping.gpu[
-                        :num_tokens_unpadded
-                    ].clone()
-                    local_slot_mapping[~local_valid_mask] = -1
                     pcp_group = get_pcp_group()
-                    gathered_slot_mapping = pcp_group.all_gather(
-                        local_slot_mapping.contiguous(),
+                    gathered_positions = pcp_group.all_gather(
+                        self.positions[:num_tokens_unpadded].contiguous(),
                         dim=0,
                     )
                     torch.index_select(
-                        gathered_slot_mapping, 0, restore_idx, out=slot_mapping
+                        gathered_positions,
+                        0,
+                        restore_idx,
+                        out=self.pcp_manager.pcp_padded_positions[:pcp_full_tokens],
                     )
                     gathered_valid_mask = pcp_group.all_gather(
                         self.pcp_manager.pcp_local_unpad_mask_gpu_tensor[
@@ -4205,6 +4199,19 @@ class GPUModelRunner(
                     )
                     valid_mask = torch.index_select(
                         gathered_valid_mask, 0, restore_idx
+                    )
+                    # PCP token ownership (dual chunk) is independent from
+                    # CP-interleaved KV ownership. Compute this rank's cache
+                    # slots from the restored full token positions so every
+                    # CP stripe owner gets a chance to write its tokens.
+                    num_reqs = self.input_batch.num_reqs
+                    blk_table.compute_slot_mapping(
+                        num_reqs,
+                        self.pcp_manager.pcp_padded_query_start_loc.gpu[
+                            : num_reqs + 1
+                        ],
+                        self.pcp_manager.pcp_padded_positions[:pcp_full_tokens],
+                        out=slot_mapping,
                     )
                     slot_mapping[~valid_mask] = -1
                     return slot_mapping

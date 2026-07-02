@@ -83,12 +83,37 @@ def test_pcp_prefill_slot_mapping_uses_post_split_local_slots():
         block_table_source
     )
     assert "use_pcp=use_pcp" in block_table_source
-    assert "use_pcp=False" in runner_source
     assert (
         "torch.index_select(\n                        blk_table.slot_mapping.gpu"
         not in runner_source
     )
-    assert "local_slot_mapping = blk_table.slot_mapping.gpu[" in runner_source
+    assert "gathered_positions = pcp_group.all_gather(" in runner_source
+    assert "gathered_slot_mapping = pcp_group.all_gather(" not in runner_source
+    assert "pcp_padded_query_start_loc" in runner_source
+    assert "out=slot_mapping" in runner_source
+
+
+def test_pcp_manager_builds_full_query_start_for_restored_tokens():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        max_buffer_num_tokens=64,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+    )
+
+    pcp_tokens, _ = manager.update_tokens_for_pcp(
+        np.array([1, 5, 8], dtype=np.int32),
+        np.arange(64, dtype=np.int32),
+        num_reqs=3,
+        reorder_batch_threshold=1,
+    )
+
+    assert pcp_tokens.tolist() == [1, 4, 4]
+    torch.testing.assert_close(
+        manager.pcp_padded_query_start_loc.cpu[:4],
+        torch.tensor([0, 2, 10, 18], dtype=torch.int32),
+    )
 
 
 def test_pcp_194_local_tokens_restore_to_388_full_tokens():
