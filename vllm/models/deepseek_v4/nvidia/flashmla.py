@@ -183,6 +183,14 @@ def _pcp_bad_kv_cache_rows_diag(
         return [{"error": "unexpected_cache_row_width", "row_width": int(row_width)}]
 
     cache_block_size = row_width // 584
+    cache_layout_diag = {
+        "cache_shape": tuple(int(dim) for dim in k_cache.shape),
+        "cache_stride": tuple(int(stride) for stride in k_cache.stride()),
+        "cache_2d_shape": tuple(int(dim) for dim in cache_2d.shape),
+        "cache_2d_stride": tuple(int(stride) for stride in cache_2d.stride()),
+        "cache_row_width": int(row_width),
+        "cache_block_size": int(cache_block_size),
+    }
     block_table_cpu = block_table.detach().cpu()
     seq_lens_cpu = seq_lens.detach().cpu()
     gather_lens_cpu = gather_lens.detach().cpu()
@@ -194,6 +202,7 @@ def _pcp_bad_kv_cache_rows_diag(
             "bad_row": int(bad_row),
             "req_offset": req_offset,
             "row_in_req": row_in_req,
+            **cache_layout_diag,
         }
         if row_in_req < chunk_n:
             sample["region"] = "compressed"
@@ -261,6 +270,40 @@ def _pcp_bad_kv_cache_rows_diag(
                 "scale_bytes": scale_bytes.detach().cpu().tolist(),
                 "bf16_tail_finite": bool(torch.isfinite(bf16_tail).all().item()),
                 "bf16_tail_amax": _finite_amax_for_diag(bf16_tail),
+            }
+        )
+        samples.append(sample)
+    return samples
+
+
+def _pcp_bad_kv_output_rows_diag(
+    kv_flat: torch.Tensor,
+    bad_rows: torch.Tensor,
+) -> list[dict[str, object]]:
+    samples = []
+    for bad_row in bad_rows[:4].detach().cpu().tolist():
+        row = kv_flat[int(bad_row)]
+        nonfinite_cols = torch.nonzero(~torch.isfinite(row), as_tuple=False).flatten()
+        sample: dict[str, object] = {
+            "bad_row": int(bad_row),
+            "nonfinite_cols": int(nonfinite_cols.numel()),
+        }
+        if nonfinite_cols.numel() == 0:
+            samples.append(sample)
+            continue
+
+        col_sample = nonfinite_cols[:16]
+        bad_values = row.index_select(0, col_sample).float()
+        sample.update(
+            {
+                "col_min": int(nonfinite_cols.min().item()),
+                "col_max": int(nonfinite_cols.max().item()),
+                "cols_sample": col_sample.detach().cpu().tolist(),
+                "values_sample": bad_values.detach().cpu().tolist(),
+                "nan_count": int(torch.isnan(row).sum().item()),
+                "posinf_count": int(torch.isposinf(row).sum().item()),
+                "neginf_count": int(torch.isneginf(row).sum().item()),
+                "finite_amax": _finite_amax_for_diag(row),
             }
         )
         samples.append(sample)
@@ -700,6 +743,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                         chunk_n=chunk_N,
                         chunk_m=chunk_M,
                     )
+                    bad_kv_output_samples = _pcp_bad_kv_output_rows_diag(
+                        kv_flat, bad_kv_rows
+                    )
                 else:
                     bad_kv_rows_sample = []
                     bad_kv_rows_min = -1
@@ -707,6 +753,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     bad_kv_compressed = 0
                     bad_kv_swa = 0
                     bad_kv_cache_samples = []
+                    bad_kv_output_samples = []
                 logger.error(
                     "DeepSeek V4 PCP sparse prefill diag at %s: "
                     "chunk=(%d,%d) q_tokens=%d positions_min=%d "
@@ -720,6 +767,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "bad_kv_rows=%d bad_kv_min=%d bad_kv_max=%d "
                     "bad_kv_compressed=%d bad_kv_swa=%d "
                     "bad_kv_sample=%s bad_kv_cache_samples=%s "
+                    "bad_kv_output_samples=%s "
+                    "swa_k_cache_shape=%s swa_k_cache_stride=%s "
+                    "kv_shape=%s kv_stride=%s "
+                    "swa_block_size=%d "
                     "read_slots=%d write_slots=%d write_unique=%d "
                     "missing_read_slots=%d missing_min=%d missing_max=%d "
                     "read_slot_min=%d read_slot_max=%d "
@@ -759,6 +810,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     bad_kv_swa,
                     bad_kv_rows_sample,
                     bad_kv_cache_samples,
+                    bad_kv_output_samples,
+                    tuple(int(dim) for dim in swa_k_cache.shape),
+                    tuple(int(stride) for stride in swa_k_cache.stride()),
+                    tuple(int(dim) for dim in kv.shape),
+                    tuple(int(stride) for stride in kv.stride()),
+                    swa_metadata.block_size,
                     slot_coverage["read_slots"],
                     slot_coverage["write_slots"],
                     slot_coverage["write_unique"],
