@@ -1976,13 +1976,6 @@ class GPUModelRunner(
                     self.device, dtype=torch.int64, non_blocking=True
                 )
             )
-            self.input_batch.block_table.compute_slot_mapping(
-                num_reqs,
-                self.query_start_loc.gpu[: num_reqs + 1],
-                self.positions[:total_num_scheduled_tokens],
-                use_pcp=False,
-            )
-
             pcp_num_scheduled_tokens, pcp_positions = (
                 self.pcp_manager.update_tokens_for_pcp(
                     num_scheduled_tokens[:num_reqs],
@@ -2210,7 +2203,14 @@ class GPUModelRunner(
                     self.device, dtype=torch.int64, non_blocking=True
                 )
             )
-        if self.pcp_world_size == 1:
+        if self.pcp_world_size > 1:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs,
+                self.query_start_loc.gpu[: num_reqs + 1],
+                self.positions[:total_num_scheduled_tokens],
+                use_pcp=False,
+            )
+        else:
             self.input_batch.block_table.compute_slot_mapping(
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
@@ -4174,16 +4174,9 @@ class GPUModelRunner(
                             :num_tokens_unpadded
                         ]
                     )
-                    local_token_indices = (
-                        self.pcp_manager.pcp_local_token_indices_gpu_tensor[
-                            :num_tokens_unpadded
-                        ]
-                    )
-                    local_slot_mapping = torch.index_select(
-                        blk_table.slot_mapping.gpu,
-                        0,
-                        local_token_indices,
-                    )
+                    local_slot_mapping = blk_table.slot_mapping.gpu[
+                        :num_tokens_unpadded
+                    ].clone()
                     local_slot_mapping[~local_valid_mask] = -1
                     pcp_group = get_pcp_group()
                     gathered_slot_mapping = pcp_group.all_gather(

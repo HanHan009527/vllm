@@ -72,7 +72,7 @@ def test_build_pcp_request_views_preserves_explicit_global_slot_identity():
     torch.testing.assert_close(views[1].restore_idx, torch.tensor([4, 6, 7, 5]))
 
 
-def test_pcp_prefill_slot_mapping_uses_dense_global_slots():
+def test_pcp_prefill_slot_mapping_uses_post_split_local_slots():
     block_table_source = (_VLLM_ROOT / "v1" / "worker" /
                           "block_table.py").read_text()
     runner_source = (_VLLM_ROOT / "v1" / "worker" /
@@ -84,3 +84,41 @@ def test_pcp_prefill_slot_mapping_uses_dense_global_slots():
     )
     assert "use_pcp=use_pcp" in block_table_source
     assert "use_pcp=False" in runner_source
+    assert (
+        "torch.index_select(\n                        blk_table.slot_mapping.gpu"
+        not in runner_source
+    )
+    assert "local_slot_mapping = blk_table.slot_mapping.gpu[" in runner_source
+
+
+def test_pcp_194_local_tokens_restore_to_388_full_tokens():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        max_buffer_num_tokens=512,
+        max_num_reqs=1,
+        device=torch.device("cpu"),
+    )
+
+    pcp_tokens, pcp_positions = manager.update_tokens_for_pcp(
+        np.array([388], dtype=np.int32),
+        np.arange(512, dtype=np.int32),
+        num_reqs=1,
+        reorder_batch_threshold=1,
+    )
+
+    assert pcp_tokens.tolist() == [194]
+    assert pcp_positions[:194].tolist() == list(range(97)) + list(range(291, 388))
+    assert manager.pcp_allgather_restore_idx.cpu[:388].numel() == 388
+    assert manager.pcp_local_unpad_mask_cpu_tensor[:194].all()
+
+    views = manager.pcp_request_views
+    assert len(views) == 1
+    assert views[0].global_seq_len == 388
+    assert views[0].local_token_count == 194
+    assert views[0].local_query_start == 0
+    assert views[0].local_query_end == 194
+    torch.testing.assert_close(
+        views[0].global_positions,
+        torch.tensor(list(range(97)) + list(range(291, 388))),
+    )
