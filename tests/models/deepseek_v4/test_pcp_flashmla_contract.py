@@ -62,6 +62,16 @@ def test_attention_pcp_fp8_insert_uses_storage_block_size():
     )
 
 
+def test_attention_pcp_insert_remaps_slots_from_metadata_block_table():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" /
+              "attention.py").read_text()
+
+    assert "def _pcp_slot_mapping_from_metadata_block_table(" in source
+    assert "block_table=swa_metadata.block_table" in source
+    assert "restore_lengths = [" in source
+    assert "slot_mapping=slot_mapping" in source
+
+
 def test_flashinfer_pcp_prefill_fails_closed_without_metadata():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
               "flashinfer_sparse.py").read_text()

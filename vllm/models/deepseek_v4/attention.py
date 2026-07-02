@@ -75,6 +75,28 @@ def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
     return float(torch.amax(torch.abs(tensor[finite].float())).item())
 
 
+def _pcp_slot_mapping_from_metadata_block_table(
+    *,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    restore_lengths: list[int],
+    block_size: int,
+) -> torch.Tensor:
+    if not restore_lengths:
+        return slot_mapping
+    req_indices = torch.repeat_interleave(
+        torch.arange(len(restore_lengths), device=positions.device),
+        torch.tensor(restore_lengths, device=positions.device),
+    )
+    req_indices = req_indices[: positions.shape[0]]
+    block_indices = torch.div(positions, block_size, rounding_mode="floor")
+    block_offsets = positions % block_size
+    physical_blocks = block_table[req_indices, block_indices]
+    remapped = physical_blocks.to(torch.int64) * block_size + block_offsets
+    return torch.where(slot_mapping >= 0, remapped, slot_mapping)
+
+
 def _resolve_dsv4_kv_cache_dtype(
     use_flashmla_fp8_layout: bool,
     kv_cache_dtype: str,
@@ -649,6 +671,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
+        swa_storage_block_size = (
+            int(swa_kv_cache.shape[1])
+            if swa_kv_cache.dim() >= 3
+            else int(self.swa_cache_layer.block_size)
+        )
         # The fused insert ops require int64 position_ids; the runner's positions
         # buffer is already int64, so no cast is needed.
         assert positions.dtype == torch.int64
@@ -657,6 +684,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         slot_mapping = swa_metadata.slot_mapping
         insert_mask = None
         if local_q_indices is not None:
+            assert swa_metadata.pcp_prefill_metadata is not None
+            restore_lengths = [
+                int(view.restore_idx.numel())
+                for view in swa_metadata.pcp_prefill_metadata.views
+            ]
+            slot_mapping = _pcp_slot_mapping_from_metadata_block_table(
+                slot_mapping=slot_mapping,
+                positions=positions,
+                block_table=swa_metadata.block_table,
+                restore_lengths=restore_lengths,
+                block_size=swa_storage_block_size,
+            )
             # PCP all-gather/restore includes padding rows so every rank has a
             # uniform input shape. The fused KV insert kernels only support real
             # cache slots; passing -1 padding slots can corrupt valid tail rows.
@@ -699,11 +738,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     xpu_qnorm_rope_kv_fp8_insert,
                 )
 
-                swa_storage_block_size = (
-                    int(swa_kv_cache.shape[1])
-                    if swa_kv_cache.dim() >= 3
-                    else int(self.swa_cache_layer.block_size)
-                )
                 xpu_qnorm_rope_kv_fp8_insert(
                     q,
                     kv,
