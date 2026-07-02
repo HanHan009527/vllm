@@ -4172,7 +4172,9 @@ class GPUModelRunner(
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 if self.pcp_world_size > 1 and use_pcp_slot_mapping:
                     pcp_full_tokens = num_tokens_unpadded * self.pcp_world_size
-                    slot_mapping = self.pcp_manager.pcp_padded_slot_mapping[
+                    slot_mapping = self.pcp_manager.get_pcp_padded_slot_mapping(
+                        kv_cache_gid
+                    )[
                         :pcp_full_tokens
                     ]
                     restore_idx = (

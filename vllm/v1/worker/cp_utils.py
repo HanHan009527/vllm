@@ -181,6 +181,9 @@ class PCPManager:
             dtype=torch.int64,
             device=device,
         )
+        self.pcp_padded_slot_mappings: dict[int, torch.Tensor] = {
+            0: self.pcp_padded_slot_mapping,
+        }
         self.pcp_padded_positions = torch.empty(
             (max_buffer_num_tokens,),
             dtype=torch.int64,
@@ -232,6 +235,13 @@ class PCPManager:
             self.pcp_local_token_indices_cpu_tensor.numpy()
         )
         self.pcp_request_views: list[PCPInterleaveRequestView] = []
+
+    def get_pcp_padded_slot_mapping(self, kv_cache_gid: int) -> torch.Tensor:
+        slot_mapping = self.pcp_padded_slot_mappings.get(kv_cache_gid)
+        if slot_mapping is None:
+            slot_mapping = torch.empty_like(self.pcp_padded_slot_mapping)
+            self.pcp_padded_slot_mappings[kv_cache_gid] = slot_mapping
+        return slot_mapping
 
     @staticmethod
     def _get_cumsum_and_arange(

@@ -92,6 +92,27 @@ def test_pcp_prefill_slot_mapping_uses_restored_full_cache_slots():
     assert "pcp_padded_query_start_loc" in runner_source
     assert "use_pcp=False" in runner_source
     assert "out=slot_mapping" in runner_source
+    assert "get_pcp_padded_slot_mapping(" in runner_source
+
+
+def test_pcp_manager_uses_distinct_slot_mapping_buffers_per_kv_group():
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        max_buffer_num_tokens=16,
+        max_num_reqs=4,
+        device=torch.device("cpu"),
+    )
+
+    gid0_slots = manager.get_pcp_padded_slot_mapping(0)
+    gid1_slots = manager.get_pcp_padded_slot_mapping(1)
+
+    assert gid0_slots.data_ptr() != gid1_slots.data_ptr()
+    gid0_slots[:4] = torch.tensor([0, 1, 2, 3])
+    gid1_slots[:4] = torch.tensor([10, 11, 12, 13])
+    torch.testing.assert_close(gid0_slots[:4], torch.tensor([0, 1, 2, 3]))
+    torch.testing.assert_close(gid1_slots[:4], torch.tensor([10, 11, 12, 13]))
+    assert manager.get_pcp_padded_slot_mapping(1).data_ptr() == gid1_slots.data_ptr()
 
 
 def test_pcp_manager_builds_full_query_start_for_restored_tokens():
