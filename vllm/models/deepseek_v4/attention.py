@@ -699,6 +699,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padding head slots; the kernel allocates and returns
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
+            # The insert kernel writes the physical FlashMLA cache layout, whose
+            # block size can differ from the scheduler metadata block size.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
             q = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
@@ -709,7 +711,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 cos_sin_cache,
                 self.padded_heads,
                 self.eps,
-                swa_metadata.block_size,
+                self.swa_cache_layer.block_size,
             )
             if insert_mask is not None:
                 padded_q = q.new_zeros(
