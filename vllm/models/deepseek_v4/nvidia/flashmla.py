@@ -159,6 +159,24 @@ def _pcp_cache_slot_coverage_diag(
         "scale_gt240": scale_gt240,
         "scale_oob": scale_oob,
         "scale_cache_block_size": scale_cache_block_size,
+        "block0": (
+            int(block_table_cpu[chunk_start, 0].item())
+            if chunk_start < block_table_cpu.shape[0]
+            and block_table_cpu.shape[1] > 0
+            else -1
+        ),
+        "block1": (
+            int(block_table_cpu[chunk_start, 1].item())
+            if chunk_start < block_table_cpu.shape[0]
+            and block_table_cpu.shape[1] > 1
+            else -1
+        ),
+        "write0": (
+            int(valid_write_slots[0].item()) if valid_write_slots.numel() > 0 else -1
+        ),
+        "write1": (
+            int(valid_write_slots[1].item()) if valid_write_slots.numel() > 1 else -1
+        ),
     }
 
 
@@ -794,7 +812,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "write_slot_min=%d write_slot_max=%d "
                     "scale_min=%d scale_max=%d scale_gt200=%d "
                     "scale_gt240=%d scale_oob=%d "
-                    "scale_cache_block_size=%d",
+                    "scale_cache_block_size=%d "
+                    "block0=%d block1=%d write0=%d write1=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -849,6 +868,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     slot_coverage["scale_gt240"],
                     slot_coverage["scale_oob"],
                     slot_coverage["scale_cache_block_size"],
+                    slot_coverage["block0"],
+                    slot_coverage["block1"],
+                    slot_coverage["write0"],
+                    slot_coverage["write1"],
                 )
             if is_pcp_prefill:
                 assert pcp_sparse_rows is not None
