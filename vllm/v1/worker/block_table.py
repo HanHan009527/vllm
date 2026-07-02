@@ -309,9 +309,16 @@ class MultiGroupBlockTable:
         num_reqs: int,
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        use_pcp: bool = True,
     ) -> None:
         for block_table in self.block_tables:
-            block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+            block_table.compute_slot_mapping(
+                num_reqs,
+                query_start_loc,
+                positions,
+                use_pcp=use_pcp,
+            )
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:

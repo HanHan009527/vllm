@@ -82,4 +82,5 @@ def test_pcp_prefill_slot_mapping_uses_dense_global_slots():
     assert "pcp_world_size = self.pcp_world_size if use_pcp else 1" in (
         block_table_source
     )
+    assert "use_pcp=use_pcp" in block_table_source
     assert "use_pcp=False" in runner_source
