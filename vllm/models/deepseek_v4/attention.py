@@ -68,6 +68,13 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 logger = init_logger(__name__)
 
 
+def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
+    finite = torch.isfinite(tensor)
+    if not finite.any():
+        return float("nan")
+    return float(torch.amax(torch.abs(tensor[finite].float())).item())
+
+
 def _resolve_dsv4_kv_cache_dtype(
     use_flashmla_fp8_layout: bool,
     kv_cache_dtype: str,
@@ -658,6 +665,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             kv = kv[insert_mask]
             positions = positions[insert_mask]
             slot_mapping = slot_mapping[insert_mask]
+
+            if envs.VLLM_DSV4_NONFINITE_DIAG and self.prefix in (
+                "model.layers.0.attn",
+                "model.layers.2.attn",
+            ):
+                unique_slots = torch.unique(slot_mapping)
+                duplicate_slots = slot_mapping.numel() - unique_slots.numel()
+                logger.error(
+                    "DeepSeek V4 PCP KV insert diag at %s: "
+                    "tokens=%d valid_slots=%d duplicate_slots=%d "
+                    "positions_min=%d positions_max=%d "
+                    "slot_min=%d slot_max=%d q_finite=%s q_amax=%s "
+                    "kv_finite=%s kv_amax=%s",
+                    self.prefix,
+                    q.shape[0],
+                    slot_mapping.numel(),
+                    duplicate_slots,
+                    int(positions.min().item()) if positions.numel() else -1,
+                    int(positions.max().item()) if positions.numel() else -1,
+                    int(slot_mapping.min().item()) if slot_mapping.numel() else -1,
+                    int(slot_mapping.max().item()) if slot_mapping.numel() else -1,
+                    bool(torch.isfinite(q).all().item()),
+                    _finite_amax_for_diag(q),
+                    bool(torch.isfinite(kv).all().item()),
+                    _finite_amax_for_diag(kv),
+                )
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:

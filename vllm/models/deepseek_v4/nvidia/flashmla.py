@@ -48,6 +48,73 @@ def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
     return float(torch.amax(torch.abs(tensor[finite].float())).item())
 
 
+def _pcp_cache_slot_coverage_diag(
+    *,
+    write_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    block_size: int,
+    chunk_start: int,
+    chunk_end: int,
+) -> dict[str, int]:
+    valid_write_slots = write_slot_mapping[write_slot_mapping >= 0].detach().cpu()
+    if valid_write_slots.numel() == 0:
+        return {
+            "read_slots": 0,
+            "write_slots": 0,
+            "write_unique": 0,
+            "missing": 0,
+            "missing_min": -1,
+            "missing_max": -1,
+            "read_min": -1,
+            "read_max": -1,
+            "write_min": -1,
+            "write_max": -1,
+        }
+
+    block_table_cpu = block_table.detach().cpu()
+    seq_lens_cpu = seq_lens.detach().cpu()
+    gather_lens_cpu = gather_lens.detach().cpu()
+    read_slots: list[int] = []
+    for req_idx in range(chunk_start, chunk_end):
+        seq_len = int(seq_lens_cpu[req_idx].item())
+        gather_len = int(gather_lens_cpu[req_idx].item())
+        start_pos = seq_len - gather_len
+        for pos in range(start_pos, seq_len):
+            block_idx = pos // block_size
+            pos_in_block = pos % block_size
+            physical_block = int(block_table_cpu[req_idx, block_idx].item())
+            read_slots.append(physical_block * block_size + pos_in_block)
+
+    if not read_slots:
+        read_slots_cpu = torch.empty(0, dtype=torch.long)
+    else:
+        read_slots_cpu = torch.tensor(read_slots, dtype=torch.long)
+    write_unique = torch.unique(valid_write_slots)
+    if read_slots_cpu.numel() == 0:
+        missing_slots = read_slots_cpu
+    else:
+        missing_slots = read_slots_cpu[~torch.isin(read_slots_cpu, write_unique)]
+
+    return {
+        "read_slots": int(read_slots_cpu.numel()),
+        "write_slots": int(valid_write_slots.numel()),
+        "write_unique": int(write_unique.numel()),
+        "missing": int(missing_slots.numel()),
+        "missing_min": int(missing_slots.min().item())
+        if missing_slots.numel()
+        else -1,
+        "missing_max": int(missing_slots.max().item())
+        if missing_slots.numel()
+        else -1,
+        "read_min": int(read_slots_cpu.min().item()) if read_slots_cpu.numel() else -1,
+        "read_max": int(read_slots_cpu.max().item()) if read_slots_cpu.numel() else -1,
+        "write_min": int(write_unique.min().item()),
+        "write_max": int(write_unique.max().item()),
+    }
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
@@ -411,6 +478,15 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             )
             if envs.VLLM_DSV4_NONFINITE_DIAG and is_pcp_prefill and pcp_diag_layer:
                 assert pcp_sparse_rows is not None
+                slot_coverage = _pcp_cache_slot_coverage_diag(
+                    write_slot_mapping=swa_metadata.slot_mapping,
+                    block_table=swa_block_table,
+                    seq_lens=seq_lens,
+                    gather_lens=gather_lens,
+                    block_size=swa_metadata.block_size,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                )
                 valid_offsets = torch.arange(
                     combined_indices.shape[1],
                     device=combined_indices.device,
@@ -438,7 +514,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "indices_min=%d indices_max=%d invalid_indices=%d "
                     "pcp_kernel_rows_min=%d pcp_kernel_rows_max=%d "
                     "pcp_sparse_rows=%d q_finite=%s q_amax=%s "
-                    "kv_finite=%s kv_amax=%s",
+                    "kv_finite=%s kv_amax=%s "
+                    "read_slots=%d write_slots=%d write_unique=%d "
+                    "missing_read_slots=%d missing_min=%d missing_max=%d "
+                    "read_slot_min=%d read_slot_max=%d "
+                    "write_slot_min=%d write_slot_max=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -464,6 +544,16 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     _finite_amax_for_diag(q[query_start:query_end]),
                     bool(torch.isfinite(kv).all().item()),
                     _finite_amax_for_diag(kv),
+                    slot_coverage["read_slots"],
+                    slot_coverage["write_slots"],
+                    slot_coverage["write_unique"],
+                    slot_coverage["missing"],
+                    slot_coverage["missing_min"],
+                    slot_coverage["missing_max"],
+                    slot_coverage["read_min"],
+                    slot_coverage["read_max"],
+                    slot_coverage["write_min"],
+                    slot_coverage["write_max"],
                 )
             if is_pcp_prefill:
                 assert pcp_sparse_rows is not None
