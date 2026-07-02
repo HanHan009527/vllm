@@ -571,6 +571,29 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 offset=chunk_N,
                 force_triton=is_pcp_prefill,
             )
+            pcp_diag_layer = self.prefix in (
+                "model.layers.0.attn",
+                "model.layers.2.attn",
+            )
+            if envs.VLLM_DSV4_NONFINITE_DIAG and is_pcp_prefill and pcp_diag_layer:
+                kv_flat_after_gather = kv.view(-1, q.shape[-1])
+                kv_row_finite_after_gather = torch.isfinite(
+                    kv_flat_after_gather
+                ).all(dim=1)
+                bad_after_gather = torch.nonzero(
+                    ~kv_row_finite_after_gather, as_tuple=False
+                ).flatten()
+                if bad_after_gather.numel() > 0:
+                    logger.error(
+                        "DeepSeek V4 PCP post-gather KV diag at %s: "
+                        "chunk=(%d,%d) chunk_N=%d chunk_M=%d bad_rows=%s",
+                        self.prefix,
+                        chunk_start,
+                        chunk_end,
+                        chunk_N,
+                        chunk_M,
+                        bad_after_gather[:16].detach().cpu().tolist(),
+                    )
 
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
@@ -625,10 +648,6 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     chunk_n=chunk_N,
                     chunk_m=chunk_M,
                 )
-            pcp_diag_layer = self.prefix in (
-                "model.layers.0.attn",
-                "model.layers.2.attn",
-            )
             if envs.VLLM_DSV4_NONFINITE_DIAG and is_pcp_prefill and pcp_diag_layer:
                 assert pcp_sparse_rows is not None
                 slot_coverage = _pcp_cache_slot_coverage_diag(
