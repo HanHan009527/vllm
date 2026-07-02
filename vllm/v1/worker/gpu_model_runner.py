@@ -4200,10 +4200,11 @@ class GPUModelRunner(
                     valid_mask = torch.index_select(
                         gathered_valid_mask, 0, restore_idx
                     )
-                    # PCP token ownership (dual chunk) is independent from
-                    # CP-interleaved KV ownership. Compute this rank's cache
-                    # slots from the restored full token positions so every
-                    # CP stripe owner gets a chance to write its tokens.
+                    # PCP prefill all-gathers q/kv before the fused KV insert,
+                    # and the current FlashMLA sparse prefill path reads a
+                    # complete local KV cache. Compute slots from restored full
+                    # positions while ignoring PCP ownership; padding rows are
+                    # masked below.
                     num_reqs = self.input_batch.num_reqs
                     blk_table.compute_slot_mapping(
                         num_reqs,
@@ -4211,6 +4212,7 @@ class GPUModelRunner(
                             : num_reqs + 1
                         ],
                         self.pcp_manager.pcp_padded_positions[:pcp_full_tokens],
+                        use_pcp=False,
                         out=slot_mapping,
                     )
                     slot_mapping[~valid_mask] = -1

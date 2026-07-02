@@ -72,7 +72,7 @@ def test_build_pcp_request_views_preserves_explicit_global_slot_identity():
     torch.testing.assert_close(views[1].restore_idx, torch.tensor([4, 6, 7, 5]))
 
 
-def test_pcp_prefill_slot_mapping_uses_post_split_local_slots():
+def test_pcp_prefill_slot_mapping_uses_restored_full_cache_slots():
     block_table_source = (_VLLM_ROOT / "v1" / "worker" /
                           "block_table.py").read_text()
     runner_source = (_VLLM_ROOT / "v1" / "worker" /
@@ -90,6 +90,7 @@ def test_pcp_prefill_slot_mapping_uses_post_split_local_slots():
     assert "gathered_positions = pcp_group.all_gather(" in runner_source
     assert "gathered_slot_mapping = pcp_group.all_gather(" not in runner_source
     assert "pcp_padded_query_start_loc" in runner_source
+    assert "use_pcp=False" in runner_source
     assert "out=slot_mapping" in runner_source
 
 
