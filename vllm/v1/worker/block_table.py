@@ -143,10 +143,14 @@ class BlockTable:
         num_reqs: int,
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        use_pcp: bool = True,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        pcp_world_size = self.pcp_world_size if use_pcp else 1
+        pcp_rank = self.pcp_rank if use_pcp else 0
+        total_cp_world_size = pcp_world_size * self.dcp_world_size
+        total_cp_rank = pcp_rank * self.dcp_world_size + self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,

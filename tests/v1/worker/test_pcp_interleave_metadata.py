@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -8,6 +10,8 @@ from vllm.v1.worker.cp_utils import (
     PCPManager,
     build_pcp_interleave_request_views,
 )
+
+_VLLM_ROOT = Path(__file__).parents[3] / "vllm"
 
 
 def test_pcp_request_views_follow_dual_chunk_manager_layout():
@@ -66,3 +70,16 @@ def test_build_pcp_request_views_preserves_explicit_global_slot_identity():
     torch.testing.assert_close(views[1].global_positions, torch.tensor([1, 2]))
     torch.testing.assert_close(views[1].global_slot_mapping, torch.tensor([21, 22]))
     torch.testing.assert_close(views[1].restore_idx, torch.tensor([4, 6, 7, 5]))
+
+
+def test_pcp_prefill_slot_mapping_uses_dense_global_slots():
+    block_table_source = (_VLLM_ROOT / "v1" / "worker" /
+                          "block_table.py").read_text()
+    runner_source = (_VLLM_ROOT / "v1" / "worker" /
+                     "gpu_model_runner.py").read_text()
+
+    assert "use_pcp: bool = True" in block_table_source
+    assert "pcp_world_size = self.pcp_world_size if use_pcp else 1" in (
+        block_table_source
+    )
+    assert "use_pcp=False" in runner_source

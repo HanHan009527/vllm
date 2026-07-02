@@ -1980,6 +1980,7 @@ class GPUModelRunner(
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
+                use_pcp=False,
             )
 
             pcp_num_scheduled_tokens, pcp_positions = (
