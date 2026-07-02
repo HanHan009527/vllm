@@ -76,6 +76,8 @@ def _pcp_cache_slot_coverage_diag(
             "scale_max": -1,
             "scale_gt200": 0,
             "scale_gt240": 0,
+            "scale_oob": 0,
+            "scale_cache_block_size": -1,
         }
 
     block_table_cpu = block_table.detach().cpu()
@@ -106,21 +108,35 @@ def _pcp_cache_slot_coverage_diag(
     scale_max = -1
     scale_gt200 = 0
     scale_gt240 = 0
+    scale_oob = 0
+    scale_cache_block_size = -1
     if read_slots_cpu.numel() > 0:
-        read_slots_gpu = read_slots_cpu.to(device=k_cache.device, non_blocking=True)
-        block_idx = read_slots_gpu // block_size
-        pos_in_block = read_slots_gpu % block_size
-        cache_2d = k_cache.view(k_cache.shape[0], -1)
-        scale_base = block_size * 576 + pos_in_block * 8
-        scales = torch.stack(
-            [cache_2d[block_idx, scale_base + i] for i in range(7)],
-            dim=1,
-        )
-        scales_cpu = scales.detach().cpu()
-        scale_min = int(scales_cpu.min().item())
-        scale_max = int(scales_cpu.max().item())
-        scale_gt200 = int((scales_cpu > 200).sum().item())
-        scale_gt240 = int((scales_cpu > 240).sum().item())
+        cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+        row_width = cache_2d.shape[1]
+        if row_width >= 584:
+            scale_cache_block_size = row_width // 584
+        if scale_cache_block_size > 0:
+            read_slots_gpu = read_slots_cpu.to(device=k_cache.device, non_blocking=True)
+            block_idx = read_slots_gpu // scale_cache_block_size
+            pos_in_block = read_slots_gpu % scale_cache_block_size
+            scale_base = scale_cache_block_size * 576 + pos_in_block * 8
+            valid_scale = (block_idx >= 0) & (block_idx < cache_2d.shape[0])
+            valid_scale &= (scale_base + 6) < row_width
+            scale_oob = int((~valid_scale).sum().item())
+            if valid_scale.any():
+                block_idx = block_idx[valid_scale]
+                scale_base = scale_base[valid_scale]
+                scales = torch.stack(
+                    [cache_2d[block_idx, scale_base + i] for i in range(7)],
+                    dim=1,
+                )
+                scales_cpu = scales.detach().cpu()
+                scale_min = int(scales_cpu.min().item())
+                scale_max = int(scales_cpu.max().item())
+                scale_gt200 = int((scales_cpu > 200).sum().item())
+                scale_gt240 = int((scales_cpu > 240).sum().item())
+        else:
+            scale_oob = int(read_slots_cpu.numel())
 
     return {
         "read_slots": int(read_slots_cpu.numel()),
@@ -141,6 +157,8 @@ def _pcp_cache_slot_coverage_diag(
         "scale_max": scale_max,
         "scale_gt200": scale_gt200,
         "scale_gt240": scale_gt240,
+        "scale_oob": scale_oob,
+        "scale_cache_block_size": scale_cache_block_size,
     }
 
 
@@ -550,7 +568,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "read_slot_min=%d read_slot_max=%d "
                     "write_slot_min=%d write_slot_max=%d "
                     "scale_min=%d scale_max=%d scale_gt200=%d "
-                    "scale_gt240=%d",
+                    "scale_gt240=%d scale_oob=%d "
+                    "scale_cache_block_size=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -590,6 +609,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     slot_coverage["scale_max"],
                     slot_coverage["scale_gt200"],
                     slot_coverage["scale_gt240"],
+                    slot_coverage["scale_oob"],
+                    slot_coverage["scale_cache_block_size"],
                 )
             if is_pcp_prefill:
                 assert pcp_sparse_rows is not None
