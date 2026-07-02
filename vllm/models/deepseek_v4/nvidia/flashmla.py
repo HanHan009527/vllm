@@ -50,6 +50,7 @@ def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
 
 def _pcp_cache_slot_coverage_diag(
     *,
+    k_cache: torch.Tensor,
     write_slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -71,6 +72,10 @@ def _pcp_cache_slot_coverage_diag(
             "read_max": -1,
             "write_min": -1,
             "write_max": -1,
+            "scale_min": -1,
+            "scale_max": -1,
+            "scale_gt200": 0,
+            "scale_gt240": 0,
         }
 
     block_table_cpu = block_table.detach().cpu()
@@ -97,6 +102,26 @@ def _pcp_cache_slot_coverage_diag(
     else:
         missing_slots = read_slots_cpu[~torch.isin(read_slots_cpu, write_unique)]
 
+    scale_min = -1
+    scale_max = -1
+    scale_gt200 = 0
+    scale_gt240 = 0
+    if read_slots_cpu.numel() > 0:
+        read_slots_gpu = read_slots_cpu.to(device=k_cache.device, non_blocking=True)
+        block_idx = read_slots_gpu // block_size
+        pos_in_block = read_slots_gpu % block_size
+        cache_2d = k_cache.view(k_cache.shape[0], -1)
+        scale_base = block_size * 576 + pos_in_block * 8
+        scales = torch.stack(
+            [cache_2d[block_idx, scale_base + i] for i in range(7)],
+            dim=1,
+        )
+        scales_cpu = scales.detach().cpu()
+        scale_min = int(scales_cpu.min().item())
+        scale_max = int(scales_cpu.max().item())
+        scale_gt200 = int((scales_cpu > 200).sum().item())
+        scale_gt240 = int((scales_cpu > 240).sum().item())
+
     return {
         "read_slots": int(read_slots_cpu.numel()),
         "write_slots": int(valid_write_slots.numel()),
@@ -112,6 +137,10 @@ def _pcp_cache_slot_coverage_diag(
         "read_max": int(read_slots_cpu.max().item()) if read_slots_cpu.numel() else -1,
         "write_min": int(write_unique.min().item()),
         "write_max": int(write_unique.max().item()),
+        "scale_min": scale_min,
+        "scale_max": scale_max,
+        "scale_gt200": scale_gt200,
+        "scale_gt240": scale_gt240,
     }
 
 
@@ -479,6 +508,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
             if envs.VLLM_DSV4_NONFINITE_DIAG and is_pcp_prefill and pcp_diag_layer:
                 assert pcp_sparse_rows is not None
                 slot_coverage = _pcp_cache_slot_coverage_diag(
+                    k_cache=swa_k_cache,
                     write_slot_mapping=swa_metadata.slot_mapping,
                     block_table=swa_block_table,
                     seq_lens=seq_lens,
@@ -518,7 +548,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "read_slots=%d write_slots=%d write_unique=%d "
                     "missing_read_slots=%d missing_min=%d missing_max=%d "
                     "read_slot_min=%d read_slot_max=%d "
-                    "write_slot_min=%d write_slot_max=%d",
+                    "write_slot_min=%d write_slot_max=%d "
+                    "scale_min=%d scale_max=%d scale_gt200=%d "
+                    "scale_gt240=%d",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -554,6 +586,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     slot_coverage["read_max"],
                     slot_coverage["write_min"],
                     slot_coverage["write_max"],
+                    slot_coverage["scale_min"],
+                    slot_coverage["scale_max"],
+                    slot_coverage["scale_gt200"],
+                    slot_coverage["scale_gt240"],
                 )
             if is_pcp_prefill:
                 assert pcp_sparse_rows is not None
