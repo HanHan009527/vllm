@@ -162,6 +162,111 @@ def _pcp_cache_slot_coverage_diag(
     }
 
 
+def _pcp_bad_kv_cache_rows_diag(
+    *,
+    k_cache: torch.Tensor,
+    bad_rows: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    block_size: int,
+    chunk_start: int,
+    chunk_n: int,
+    chunk_m: int,
+) -> list[dict[str, object]]:
+    if bad_rows.numel() == 0:
+        return []
+
+    cache_2d = k_cache.reshape(k_cache.shape[0], -1)
+    row_width = cache_2d.shape[1]
+    if row_width < 584:
+        return [{"error": "unexpected_cache_row_width", "row_width": int(row_width)}]
+
+    cache_block_size = row_width // 584
+    block_table_cpu = block_table.detach().cpu()
+    seq_lens_cpu = seq_lens.detach().cpu()
+    gather_lens_cpu = gather_lens.detach().cpu()
+    samples = []
+    for bad_row in bad_rows[:4].detach().cpu().tolist():
+        req_offset = int(bad_row) // chunk_m
+        row_in_req = int(bad_row) % chunk_m
+        sample: dict[str, object] = {
+            "bad_row": int(bad_row),
+            "req_offset": req_offset,
+            "row_in_req": row_in_req,
+        }
+        if row_in_req < chunk_n:
+            sample["region"] = "compressed"
+            samples.append(sample)
+            continue
+
+        local_swa_idx = row_in_req - chunk_n
+        req_idx = chunk_start + req_offset
+        if req_idx >= seq_lens_cpu.numel():
+            sample["error"] = "req_oob"
+            samples.append(sample)
+            continue
+        seq_len = int(seq_lens_cpu[req_idx].item())
+        gather_len = int(gather_lens_cpu[req_idx].item())
+        if local_swa_idx >= gather_len:
+            sample["error"] = "swa_idx_oob"
+            sample["local_swa_idx"] = int(local_swa_idx)
+            sample["gather_len"] = gather_len
+            samples.append(sample)
+            continue
+
+        pos = seq_len - gather_len + local_swa_idx
+        block_idx = pos // block_size
+        pos_in_block = pos % block_size
+        physical_block = int(block_table_cpu[req_idx, block_idx].item())
+        slot = physical_block * block_size + pos_in_block
+        cache_block = slot // cache_block_size
+        cache_pos = slot % cache_block_size
+        data_base = cache_pos * 576
+        scale_base = cache_block_size * 576 + cache_pos * 8
+        sample.update(
+            {
+                "region": "swa",
+                "req_idx": int(req_idx),
+                "local_swa_idx": int(local_swa_idx),
+                "pos": int(pos),
+                "slot": int(slot),
+                "cache_block": int(cache_block),
+                "cache_pos": int(cache_pos),
+            }
+        )
+        if (
+            cache_block < 0
+            or cache_block >= cache_2d.shape[0]
+            or data_base + 575 >= row_width
+            or scale_base + 7 >= row_width
+        ):
+            sample["error"] = "cache_oob"
+            samples.append(sample)
+            continue
+
+        fp8_bytes = cache_2d[cache_block, data_base : data_base + 448]
+        scale_bytes = cache_2d[cache_block, scale_base : scale_base + 8]
+        bf16_tail = (
+            cache_2d[cache_block, data_base + 448 : data_base + 576]
+            .contiguous()
+            .view(torch.bfloat16)
+        )
+        sample.update(
+            {
+                "fp8_min": int(fp8_bytes.min().item()),
+                "fp8_max": int(fp8_bytes.max().item()),
+                "fp8_0x7f": int((fp8_bytes == 0x7F).sum().item()),
+                "fp8_0xff": int((fp8_bytes == 0xFF).sum().item()),
+                "scale_bytes": scale_bytes.detach().cpu().tolist(),
+                "bf16_tail_finite": bool(torch.isfinite(bf16_tail).all().item()),
+                "bf16_tail_amax": _finite_amax_for_diag(bf16_tail),
+            }
+        )
+        samples.append(sample)
+    return samples
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
@@ -565,12 +670,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     bad_kv_rows_max = int(bad_kv_rows.max().item())
                     bad_kv_compressed = int((bad_kv_rows < chunk_N).sum().item())
                     bad_kv_swa = int((bad_kv_rows >= chunk_N).sum().item())
+                    bad_kv_cache_samples = _pcp_bad_kv_cache_rows_diag(
+                        k_cache=swa_k_cache,
+                        bad_rows=bad_kv_rows,
+                        block_table=swa_block_table,
+                        seq_lens=seq_lens,
+                        gather_lens=gather_lens,
+                        block_size=swa_metadata.block_size,
+                        chunk_start=chunk_start,
+                        chunk_n=chunk_N,
+                        chunk_m=chunk_M,
+                    )
                 else:
                     bad_kv_rows_sample = []
                     bad_kv_rows_min = -1
                     bad_kv_rows_max = -1
                     bad_kv_compressed = 0
                     bad_kv_swa = 0
+                    bad_kv_cache_samples = []
                 logger.error(
                     "DeepSeek V4 PCP sparse prefill diag at %s: "
                     "chunk=(%d,%d) q_tokens=%d positions_min=%d "
@@ -583,7 +700,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "kv_finite=%s kv_amax=%s "
                     "bad_kv_rows=%d bad_kv_min=%d bad_kv_max=%d "
                     "bad_kv_compressed=%d bad_kv_swa=%d "
-                    "bad_kv_sample=%s "
+                    "bad_kv_sample=%s bad_kv_cache_samples=%s "
                     "read_slots=%d write_slots=%d write_unique=%d "
                     "missing_read_slots=%d missing_min=%d missing_max=%d "
                     "read_slot_min=%d read_slot_max=%d "
@@ -622,6 +739,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     bad_kv_compressed,
                     bad_kv_swa,
                     bad_kv_rows_sample,
+                    bad_kv_cache_samples,
                     slot_coverage["read_slots"],
                     slot_coverage["write_slots"],
                     slot_coverage["write_unique"],
