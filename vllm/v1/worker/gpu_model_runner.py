@@ -1956,6 +1956,7 @@ class GPUModelRunner(
         cu_num_tokens = self._get_cumsum_and_arange(
             num_scheduled_tokens, self.query_pos.np
         )
+        local_cu_num_tokens_for_pcp = None
 
         # Get positions.
         positions_np = (
@@ -1993,6 +1994,7 @@ class GPUModelRunner(
             cu_num_tokens = self._get_cumsum_and_arange(
                 num_scheduled_tokens, self.query_pos.np
             )
+            local_cu_num_tokens_for_pcp = cu_num_tokens.copy()
             positions_np = (
                 self.input_batch.num_computed_tokens_cpu[req_indices]
                 + pcp_positions[:total_num_scheduled_tokens]
@@ -2204,6 +2206,15 @@ class GPUModelRunner(
                 )
             )
         if self.pcp_world_size > 1:
+            assert local_cu_num_tokens_for_pcp is not None
+            # Slot mapping is computed on this rank's local PCP token order.
+            # Metadata construction below will write the same local ranges.
+            self.query_start_loc.np[0] = 0
+            self.query_start_loc.np[1 : num_reqs + 1] = local_cu_num_tokens_for_pcp
+            self.query_start_loc.np[num_reqs + 1 :].fill(
+                local_cu_num_tokens_for_pcp[-1]
+            )
+            self.query_start_loc.copy_to_gpu()
             self.input_batch.block_table.compute_slot_mapping(
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
