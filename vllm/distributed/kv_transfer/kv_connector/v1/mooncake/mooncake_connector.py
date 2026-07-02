@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -66,6 +67,9 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
+_MOONCAKE_TRANSFER_PLAN_DIFF_ENV = "VLLM_MOONCAKE_TRANSFER_PLAN_DIFF"
+_TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT = 16
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -113,6 +117,15 @@ class TransferRegion:
     @property
     def match_layer_indices(self) -> tuple[int, ...]:
         return self.layer_indices or (self.layer_index,)
+
+
+def _transfer_plan_diff_enabled() -> bool:
+    return os.environ.get(_MOONCAKE_TRANSFER_PLAN_DIFF_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -581,6 +594,245 @@ def _align_transfer_regions(
         aligned_remote.append(remote_region)
 
     return aligned_local, aligned_remote, None
+
+
+def _legacy_align_transfer_regions(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
+    """Validation-only model of the old occurrence/group alignment path."""
+
+    def keyed_regions(
+        regions: list[TransferRegion],
+    ) -> list[tuple[tuple[str, int], TransferRegion]]:
+        counts: dict[str, int] = defaultdict(int)
+        keyed: list[tuple[tuple[str, int], TransferRegion]] = []
+        for region in regions:
+            occurrence = counts[region.layer_name]
+            counts[region.layer_name] += 1
+            keyed.append(((region.layer_name, occurrence), region))
+        return keyed
+
+    local_keyed = keyed_regions(local_regions)
+    remote_keyed = keyed_regions(remote_regions)
+    remote_by_key = dict(remote_keyed)
+    aligned_local: list[TransferRegion] = []
+    aligned_remote: list[TransferRegion] = []
+    for key, local_region in local_keyed:
+        remote_region = remote_by_key.get(key)
+        if remote_region is None:
+            return (
+                [],
+                [],
+                (
+                    "old occurrence/group path: producer registered layer has no "
+                    f"matching consumer occurrence: {key[0]} occurrence {key[1]}."
+                ),
+            )
+        if local_region.layer_index != remote_region.layer_index:
+            return (
+                [],
+                [],
+                (
+                    "old occurrence/group path: registered layer index mismatch "
+                    f"for {local_region.layer_name}: producer="
+                    f"{local_region.layer_index}, consumer="
+                    f"{remote_region.layer_index}."
+                ),
+            )
+        if local_region.group_index != remote_region.group_index:
+            return (
+                [],
+                [],
+                (
+                    "old occurrence/group path: registered group index mismatch "
+                    f"for {local_region.layer_name}: producer="
+                    f"{local_region.group_index}, consumer="
+                    f"{remote_region.group_index}."
+                ),
+            )
+        aligned_local.append(local_region)
+        aligned_remote.append(remote_region)
+
+    return aligned_local, aligned_remote, None
+
+
+def _summarize_block_ids(block_ids: list[int]) -> dict[str, Any]:
+    if len(block_ids) <= 6:
+        return {"count": len(block_ids), "ids": block_ids}
+    return {
+        "count": len(block_ids),
+        "first": block_ids[:3],
+        "last": block_ids[-3:],
+    }
+
+
+def _region_debug_identity(region: TransferRegion) -> dict[str, Any]:
+    return {
+        "name": region.layer_name,
+        "index": region.layer_index,
+        "group": region.group_index,
+        "aliases": region.layer_aliases,
+        "alias_indices": region.layer_indices,
+        "logical_groups": region.logical_group_indices,
+        "alias_groups": region.alias_group_indices,
+    }
+
+
+def _summarize_transfer_plan_selection(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+    local_block_ids_by_group: list[list[int]],
+    remote_block_ids_by_group: list[list[int]],
+    *,
+    use_old_occurrence_group: bool,
+) -> dict[str, Any]:
+    """Summarize old/new transfer-plan block selection without side effects."""
+
+    num_groups = len(remote_block_ids_by_group)
+    path_name = (
+        "old occurrence/group" if use_old_occurrence_group else "new alias/group"
+    )
+    signature: list[tuple[Any, ...]] = []
+    sample_regions: list[dict[str, Any]] = []
+    errors: list[str] = []
+    selected_region_count = 0
+    selected_local_block_count = 0
+    selected_remote_block_count = 0
+
+    for region_idx, (local_region, remote_region) in enumerate(
+        zip(local_regions, remote_regions)
+    ):
+        if use_old_occurrence_group:
+            if local_region.group_index != remote_region.group_index:
+                group_indices = ()
+                select_err = (
+                    "old occurrence/group path: registered group index mismatch "
+                    f"for {local_region.layer_name}: producer="
+                    f"{local_region.group_index}, consumer={remote_region.group_index}."
+                )
+                local_block_ids: list[int] = []
+                remote_block_ids: list[int] = []
+            elif 0 <= local_region.group_index < num_groups:
+                group_indices = (local_region.group_index,)
+                (
+                    local_block_ids,
+                    remote_block_ids,
+                    select_err,
+                ) = _select_region_block_ids(
+                    local_block_ids_by_group, remote_block_ids_by_group, group_indices
+                )
+            else:
+                group_indices = ()
+                select_err = None
+                local_block_ids = []
+                remote_block_ids = []
+        else:
+            group_indices = _common_group_indices_for_regions(
+                local_region,
+                remote_region,
+                num_groups,
+            )
+            local_block_ids, remote_block_ids, select_err = _select_region_block_ids(
+                local_block_ids_by_group,
+                remote_block_ids_by_group,
+                group_indices,
+            )
+
+        if select_err is not None:
+            errors.append(f"{path_name} region {region_idx}: {select_err}")
+        if local_block_ids:
+            selected_region_count += 1
+            selected_local_block_count += len(local_block_ids)
+            selected_remote_block_count += len(remote_block_ids)
+
+        signature.append(
+            (
+                local_region.layer_name,
+                local_region.layer_index,
+                local_region.group_index,
+                remote_region.layer_name,
+                remote_region.layer_index,
+                remote_region.group_index,
+                group_indices,
+                len(local_block_ids),
+                len(remote_block_ids),
+                select_err,
+            )
+        )
+        if (
+            local_block_ids
+            or select_err is not None
+            or len(sample_regions) < _TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT
+        ):
+            sample_regions.append(
+                {
+                    "region": region_idx,
+                    "groups": group_indices,
+                    "local": _region_debug_identity(local_region),
+                    "remote": _region_debug_identity(remote_region),
+                    "local_blocks": _summarize_block_ids(local_block_ids),
+                    "remote_blocks": _summarize_block_ids(remote_block_ids),
+                    "error": select_err,
+                }
+            )
+
+    return {
+        "path": path_name,
+        "pairs": len(signature),
+        "selected_regions": selected_region_count,
+        "selected_local_blocks": selected_local_block_count,
+        "selected_remote_blocks": selected_remote_block_count,
+        "errors": errors,
+        "signature": tuple(signature),
+        "sample": sample_regions[:_TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT],
+    }
+
+
+def _log_transfer_plan_diff_diagnostic(
+    req_id: ReqId,
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+    legacy_local_regions: list[TransferRegion] | None,
+    legacy_remote_regions: list[TransferRegion] | None,
+    legacy_align_err: str | None,
+    local_block_ids_by_group: list[list[int]],
+    remote_block_ids_by_group: list[list[int]],
+) -> None:
+    if not _transfer_plan_diff_enabled():
+        return
+
+    new_summary = _summarize_transfer_plan_selection(
+        local_regions,
+        remote_regions,
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+        use_old_occurrence_group=False,
+    )
+    old_summary: dict[str, Any] | None = None
+    if legacy_local_regions is not None and legacy_remote_regions is not None:
+        old_summary = _summarize_transfer_plan_selection(
+            legacy_local_regions,
+            legacy_remote_regions,
+            local_block_ids_by_group,
+            remote_block_ids_by_group,
+            use_old_occurrence_group=True,
+        )
+
+    old_signature = None if old_summary is None else old_summary["signature"]
+    differs = legacy_align_err is not None or old_signature != new_summary["signature"]
+    logger.info(
+        "Mooncake transfer-plan diff diagnostic for request %s: "
+        "old occurrence/group align_err=%s old_pairs=%s new_pairs=%d "
+        "differs=%s old=%s new=%s",
+        req_id,
+        legacy_align_err,
+        None if old_summary is None else old_summary["pairs"],
+        new_summary["pairs"],
+        differs,
+        old_summary,
+        new_summary,
+    )
 
 
 def _common_group_indices_for_regions(
@@ -1570,6 +1822,24 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
+        legacy_local_regions: list[TransferRegion] | None = None
+        legacy_remote_regions: list[TransferRegion] | None = None
+        legacy_align_err: str | None = None
+        if _transfer_plan_diff_enabled():
+            (
+                legacy_local_regions,
+                legacy_remote_regions,
+                legacy_align_err,
+            ) = _legacy_align_transfer_regions(local_regions, remote_regions)
+            logger.info(
+                "Mooncake transfer-plan diff alignment diagnostic: "
+                "old occurrence/group align_err=%s old_pairs=%d "
+                "new alias/group candidate_regions local=%d remote=%d",
+                legacy_align_err,
+                len(legacy_local_regions),
+                len(local_regions),
+                len(remote_regions),
+            )
         local_regions, remote_regions, align_err = _align_transfer_regions(
             local_regions, remote_regions
         )
@@ -1673,6 +1943,9 @@ class MooncakeConnectorWorker:
                 meta,
                 local_regions,
                 remote_regions,
+                legacy_local_regions=legacy_local_regions,
+                legacy_remote_regions=legacy_remote_regions,
+                legacy_align_err=legacy_align_err,
             )
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
@@ -1772,6 +2045,10 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        *,
+        legacy_local_regions: list[TransferRegion] | None = None,
+        legacy_remote_regions: list[TransferRegion] | None = None,
+        legacy_align_err: str | None = None,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
@@ -1863,6 +2140,17 @@ class MooncakeConnectorWorker:
             )
             remote_block_ids_by_group = self._logical_to_kernel_block_ids(
                 remote_block_ids_by_group
+            )
+
+            _log_transfer_plan_diff_diagnostic(
+                d_req_id,
+                local_regions,
+                remote_regions,
+                legacy_local_regions,
+                legacy_remote_regions,
+                legacy_align_err,
+                local_block_ids_by_group,
+                remote_block_ids_by_group,
             )
 
             selected_region_blocks: list[
@@ -2091,6 +2379,17 @@ class MooncakeConnectorWorker:
             # DeepSeek V4 MTP draft caches are named after the base model
             # layers, so their layer indices are outside the base layer range.
             if is_mtp_speculative and layer_index >= total_num_hidden_layers:
+                if _transfer_plan_diff_enabled():
+                    logger.info(
+                        "Mooncake MTP draft KV reachability diagnostic: "
+                        "layer=%s layer_index=%d total_base_layers=%d "
+                        "layer_spec_present=%s old occurrence/group would_register=%s",
+                        layer_name,
+                        layer_index,
+                        total_num_hidden_layers,
+                        layer_name in self._layer_specs,
+                        layer_name in self._layer_specs,
+                    )
                 logger.debug(
                     "Skipping MTP speculative KV cache layer %s outside the "
                     "base model layer range [0, %d)",

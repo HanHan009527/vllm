@@ -26,6 +26,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _legacy_align_transfer_regions,
+    _summarize_transfer_plan_selection,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -162,6 +164,121 @@ def test_align_transfer_regions_uses_layer_name_occurrences():
     assert err is None
     assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
     assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+def test_legacy_align_transfer_regions_models_occurrence_group_path():
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1000,
+            block_len=256,
+            kv_block_len=128,
+            group_index=0,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1100,
+            block_len=256,
+            kv_block_len=128,
+            group_index=1,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB000,
+            block_len=256,
+            kv_block_len=128,
+            group_index=0,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB100,
+            block_len=256,
+            kv_block_len=128,
+            group_index=1,
+        ),
+    ]
+
+    aligned_local, aligned_remote, err = _legacy_align_transfer_regions(
+        local_regions, remote_regions
+    )
+
+    assert err is None
+    assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
+    assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+    mismatched_remote_regions = [
+        remote_regions[0],
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB100,
+            block_len=256,
+            kv_block_len=128,
+            group_index=0,
+        ),
+    ]
+    _, _, err = _legacy_align_transfer_regions(local_regions, mismatched_remote_regions)
+    assert err is not None
+    assert "old occurrence/group path" in err
+
+
+def test_transfer_plan_diff_summary_separates_old_and_new_group_selection():
+    local_region = TransferRegion(
+        layer_name="model.layers.0.self_attn",
+        layer_index=0,
+        base_addr=0x1000,
+        block_len=256,
+        kv_block_len=128,
+        group_index=0,
+        layer_aliases=(
+            "model.layers.0.self_attn",
+            "model.layers.1.self_attn",
+        ),
+        layer_indices=(0, 1),
+        logical_group_indices=(0, 1),
+        alias_group_indices=((0,), (1,)),
+    )
+    remote_region = TransferRegion(
+        layer_name="model.layers.1.self_attn",
+        layer_index=1,
+        base_addr=0xB000,
+        block_len=256,
+        kv_block_len=128,
+        group_index=0,
+        layer_aliases=("model.layers.1.self_attn",),
+        layer_indices=(1,),
+        logical_group_indices=(1,),
+        alias_group_indices=((1,),),
+    )
+    local_block_ids_by_group = [[10, 11, 12], [20, 21, 22]]
+    remote_block_ids_by_group = [[100, 101], [200, 201]]
+
+    old_summary = _summarize_transfer_plan_selection(
+        [local_region],
+        [remote_region],
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+        use_old_occurrence_group=True,
+    )
+    new_summary = _summarize_transfer_plan_selection(
+        [local_region],
+        [remote_region],
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+        use_old_occurrence_group=False,
+    )
+
+    assert old_summary["sample"][0]["groups"] == (0,)
+    assert old_summary["sample"][0]["local_blocks"]["ids"] == [11, 12]
+    assert new_summary["sample"][0]["groups"] == (1,)
+    assert new_summary["sample"][0]["local_blocks"]["ids"] == [21, 22]
+    assert old_summary["signature"] != new_summary["signature"]
 
 
 @pytest.mark.asyncio
