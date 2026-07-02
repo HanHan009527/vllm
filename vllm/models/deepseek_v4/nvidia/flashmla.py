@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.models.deepseek_v4.pcp_metadata import (
     build_pcp_sparse_prefill_rows,
     build_pcp_swa_prefill_segments,
+    pcp_swa_torch_sparse_fwd,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
@@ -38,52 +39,6 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
-
-
-def _pcp_swa_torch_sparse_fwd(
-    *,
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    indices: torch.Tensor,
-    topk_length: torch.Tensor,
-    sm_scale: float,
-    attn_sink: torch.Tensor | None,
-    out: torch.Tensor,
-) -> None:
-    """Reference sparse SWA attention for PCP prefill segment fallback."""
-    out.zero_()
-    active_rows = topk_length > 0
-    if not active_rows.any():
-        return
-
-    q = q[active_rows]
-    indices = indices[active_rows]
-    topk_length = topk_length[active_rows]
-
-    num_rows, num_heads, _ = q.shape
-    max_topk = indices.shape[1]
-    valid_offsets = torch.arange(
-        max_topk, device=indices.device, dtype=topk_length.dtype
-    )
-    valid_mask = valid_offsets.unsqueeze(0) < topk_length.unsqueeze(1)
-    safe_indices = torch.where(indices >= 0, indices, torch.zeros_like(indices))
-    gathered_kv = kv.index_select(0, safe_indices.reshape(-1)).view(
-        num_rows, max_topk, kv.shape[1], kv.shape[-1]
-    )
-    gathered_kv = gathered_kv.squeeze(2).to(torch.float32)
-    q_float = q.to(torch.float32)
-    scores = torch.einsum("rhd,rkd->rhk", q_float, gathered_kv) * sm_scale
-    scores = scores.masked_fill(~valid_mask.unsqueeze(1), -float("inf"))
-    if attn_sink is not None:
-        sink = attn_sink[:num_heads].to(torch.float32).view(1, num_heads, 1)
-        sink = sink.expand(num_rows, -1, -1)
-        probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)
-        probs = probs[..., :max_topk]
-    else:
-        probs = torch.softmax(scores, dim=-1)
-    out[active_rows].copy_(
-        torch.einsum("rhk,rkd->rhd", probs, gathered_kv).to(out.dtype)
-    )
 
 
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
@@ -536,7 +491,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             (seg_q.shape[0], *output.shape[1:])
                         )
                         seg_out.zero_()
-                        _pcp_swa_torch_sparse_fwd(
+                        pcp_swa_torch_sparse_fwd(
                             q=seg_q,
                             kv=seg_kv,
                             indices=seg_indices,

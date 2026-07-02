@@ -130,3 +130,25 @@ def test_build_pcp_swa_prefill_segments_rejects_out_of_window_indices():
             chunk_m=4,
             window_size=3,
         )
+
+
+def test_pcp_swa_torch_sparse_fwd_keeps_overflowed_logits_finite():
+    assert hasattr(_PCP_METADATA, "pcp_swa_torch_sparse_fwd")
+    pcp_swa_torch_sparse_fwd = _PCP_METADATA.pcp_swa_torch_sparse_fwd
+    q = torch.full((1, 1, 2), 1e20, dtype=torch.float32)
+    kv = torch.full((2, 1, 2), 1e20, dtype=torch.float32)
+    indices = torch.tensor([[0, 1]], dtype=torch.int32)
+    topk_length = torch.tensor([2], dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    pcp_swa_torch_sparse_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        topk_length=topk_length,
+        sm_scale=1.0,
+        attn_sink=None,
+        out=out,
+    )
+
+    assert torch.isfinite(out).all()

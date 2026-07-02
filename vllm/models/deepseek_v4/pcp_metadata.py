@@ -52,6 +52,60 @@ class DeepseekV4PcpPrefillMetadata:
     swa_segments: list[DeepseekV4PcpSwaSegment] | None = None
 
 
+def pcp_swa_torch_sparse_fwd(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None,
+    out: torch.Tensor,
+) -> None:
+    """Reference sparse SWA attention for PCP prefill segment fallback."""
+    out.zero_()
+    active_rows = topk_length > 0
+    if not active_rows.any():
+        return
+
+    q = q[active_rows]
+    indices = indices[active_rows]
+    topk_length = topk_length[active_rows]
+
+    num_rows, num_heads, _ = q.shape
+    max_topk = indices.shape[1]
+    valid_offsets = torch.arange(
+        max_topk, device=indices.device, dtype=topk_length.dtype
+    )
+    valid_mask = valid_offsets.unsqueeze(0) < topk_length.unsqueeze(1)
+    safe_indices = torch.where(indices >= 0, indices, torch.zeros_like(indices))
+    gathered_kv = kv.index_select(0, safe_indices.reshape(-1)).view(
+        num_rows, max_topk, kv.shape[1], kv.shape[-1]
+    )
+    gathered_kv = gathered_kv.squeeze(2).to(torch.float32)
+    q_float = q.to(torch.float32)
+    scores = torch.einsum("rhd,rkd->rhk", q_float, gathered_kv) * sm_scale
+    scores = scores.masked_fill(~valid_mask.unsqueeze(1), -float("inf"))
+    if attn_sink is not None:
+        sink = attn_sink[:num_heads].to(torch.float32).view(1, num_heads, 1)
+        sink = sink.expand(num_rows, -1, -1)
+        scores = torch.cat([scores, sink], dim=-1)
+
+    scores = torch.nan_to_num(
+        scores,
+        nan=torch.finfo(scores.dtype).min,
+        posinf=torch.finfo(scores.dtype).max,
+        neginf=torch.finfo(scores.dtype).min,
+    )
+    scores = scores - scores.max(dim=-1, keepdim=True).values
+    probs = torch.softmax(scores, dim=-1)
+    if attn_sink is not None:
+        probs = probs[..., :max_topk]
+    out[active_rows].copy_(
+        torch.einsum("rhk,rkd->rhd", probs, gathered_kv).to(out.dtype)
+    )
+
+
 def build_pcp_sparse_prefill_rows(
     *,
     combined_lens: torch.Tensor,

@@ -11,12 +11,10 @@ def test_flashmla_pcp_swa_prefill_consumes_metadata_helper():
               "flashmla.py").read_text()
 
     assert "build_pcp_swa_prefill_segments" in source
+    assert "pcp_swa_torch_sparse_fwd" in source
     assert "runtime_metadata=swa_metadata.pcp_prefill_metadata" in source
-    assert "def _pcp_swa_torch_sparse_fwd(" in source
-    assert "_pcp_swa_torch_sparse_fwd(" in source
-    assert "active_rows = topk_length > 0" in source
-    assert "out.zero_()" in source
-    assert "out[active_rows].copy_(" in source
+    assert "def _pcp_swa_torch_sparse_fwd(" not in source
+    assert "pcp_swa_torch_sparse_fwd(" in source
     assert "seg_q = segment_q[segment.valid_mask]" in source
     assert "seg_indices = segment.shifted_indices[segment.valid_mask]" in source
     assert "seg_output[segment.valid_mask] = seg_out" in source
@@ -24,6 +22,14 @@ def test_flashmla_pcp_swa_prefill_consumes_metadata_helper():
     assert "seg_out.index_select(" not in source
     assert "seg_base_pos" not in source
     assert "shifted_indices = torch.where" not in source
+
+    helper_source = (_VLLM_ROOT / "models" / "deepseek_v4" /
+                     "pcp_metadata.py").read_text()
+    assert "def pcp_swa_torch_sparse_fwd(" in helper_source
+    assert "active_rows = topk_length > 0" in helper_source
+    assert "out.zero_()" in helper_source
+    assert "out[active_rows].copy_(" in helper_source
+    assert "torch.nan_to_num(" in helper_source
 
 
 def test_sparse_swa_builder_constructs_pcp_prefill_metadata():
