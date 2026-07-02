@@ -49,6 +49,19 @@ def test_attention_pcp_cache_insert_skips_padding_slots():
     assert "padded_q[insert_mask] = q" in source
 
 
+def test_attention_pcp_fp8_insert_uses_storage_block_size():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" /
+              "attention.py").read_text()
+
+    assert "swa_storage_block_size = (" in source
+    assert "int(swa_kv_cache.shape[1])" in source
+    assert "self.eps,\n                    swa_storage_block_size," in source
+    assert (
+        "self.eps,\n                    self.swa_cache_layer.block_size,"
+        not in source
+    )
+
+
 def test_flashinfer_pcp_prefill_fails_closed_without_metadata():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
               "flashinfer_sparse.py").read_text()

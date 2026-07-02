@@ -699,6 +699,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     xpu_qnorm_rope_kv_fp8_insert,
                 )
 
+                swa_storage_block_size = (
+                    int(swa_kv_cache.shape[1])
+                    if swa_kv_cache.dim() >= 3
+                    else int(self.swa_cache_layer.block_size)
+                )
                 xpu_qnorm_rope_kv_fp8_insert(
                     q,
                     kv,
@@ -707,7 +712,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     positions,
                     cos_sin_cache,
                     self.eps,
-                    self.swa_cache_layer.block_size,
+                    swa_storage_block_size,
                 )
                 if self.n_local_heads < self.padded_heads:
                     q = F.pad(
