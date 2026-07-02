@@ -2207,8 +2207,9 @@ class GPUModelRunner(
             )
         if self.pcp_world_size > 1:
             assert local_cu_num_tokens_for_pcp is not None
-            # Slot mapping is computed on this rank's local PCP token order.
-            # Metadata construction below will write the same local ranges.
+            # Slot mapping is computed on this rank's local PCP token order,
+            # while the block table still uses the global CP-interleaved KV
+            # layout for block lookup.
             self.query_start_loc.np[0] = 0
             self.query_start_loc.np[1 : num_reqs + 1] = local_cu_num_tokens_for_pcp
             self.query_start_loc.np[num_reqs + 1 :].fill(
@@ -2219,7 +2220,6 @@ class GPUModelRunner(
                 num_reqs,
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
-                use_pcp=False,
             )
         else:
             self.input_batch.block_table.compute_slot_mapping(
