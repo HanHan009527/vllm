@@ -363,8 +363,10 @@ def dequantize_and_gather_k_cache(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    *,
+    force_triton: bool = False,
 ) -> None:
-    if has_cutedsl():
+    if not force_triton and has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

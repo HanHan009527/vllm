@@ -268,6 +268,23 @@ def test_dequantize_and_gather_k_cache(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_dequantize_and_gather_k_cache_force_triton_bypasses_cutedsl(monkeypatch):
+    import vllm.models.deepseek_v4.common.ops.cache_utils as cache_utils
+
+    calls = []
+
+    def fake_triton(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(cache_utils, "has_cutedsl", lambda: True)
+    monkeypatch.setattr(cache_utils, "dequantize_and_gather_k_cache_triton", fake_triton)
+
+    args = (None, None, None, None, None, 64, 19)
+    cache_utils.dequantize_and_gather_k_cache(*args, force_triton=True)
+
+    assert calls == [args]
+
+
 # ── Test C: Indexer path ────────────────────────────────────────────────────
 
 

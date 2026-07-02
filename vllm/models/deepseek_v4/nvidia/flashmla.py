@@ -464,6 +464,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
                 offset=chunk_N,
+                force_triton=is_pcp_prefill,
             )
 
             # Combine the topk indices and SWA indices for gathered KV cache
