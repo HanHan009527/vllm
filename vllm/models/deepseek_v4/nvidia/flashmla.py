@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
+    finite = torch.isfinite(tensor)
+    if not finite.any():
+        return float("nan")
+    return float(torch.amax(torch.abs(tensor[finite].float())).item())
+
+
 class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
     """FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA)."""
 
@@ -398,11 +405,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     chunk_n=chunk_N,
                     chunk_m=chunk_M,
                 )
-            if (
-                envs.VLLM_DSV4_NONFINITE_DIAG
-                and is_pcp_prefill
-                and self.prefix == "model.layers.0.attn"
-            ):
+            pcp_diag_layer = self.prefix in (
+                "model.layers.0.attn",
+                "model.layers.2.attn",
+            )
+            if envs.VLLM_DSV4_NONFINITE_DIAG and is_pcp_prefill and pcp_diag_layer:
                 assert pcp_sparse_rows is not None
                 valid_offsets = torch.arange(
                     combined_indices.shape[1],
@@ -430,7 +437,8 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "lens_min=%d lens_max=%d lens_over_128=%d "
                     "indices_min=%d indices_max=%d invalid_indices=%d "
                     "pcp_kernel_rows_min=%d pcp_kernel_rows_max=%d "
-                    "pcp_sparse_rows=%d",
+                    "pcp_sparse_rows=%d q_finite=%s q_amax=%s "
+                    "kv_finite=%s kv_amax=%s",
                     self.prefix,
                     chunk_start,
                     chunk_end,
@@ -452,6 +460,10 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     pcp_sparse_rows.rows_min,
                     pcp_sparse_rows.rows_max,
                     pcp_sparse_rows.sparse_rows,
+                    bool(torch.isfinite(q[query_start:query_end]).all().item()),
+                    _finite_amax_for_diag(q[query_start:query_end]),
+                    bool(torch.isfinite(kv).all().item()),
+                    _finite_amax_for_diag(kv),
                 )
             if is_pcp_prefill:
                 assert pcp_sparse_rows is not None
@@ -500,16 +512,19 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                             topk_length=seg_lens,
                             out=seg_out,
                         )
+                        seg_out_finite = torch.isfinite(seg_out).all()
                         if (
                             envs.VLLM_DSV4_NONFINITE_DIAG
-                            and self.prefix == "model.layers.0.attn"
-                            and not torch.isfinite(seg_out).all()
+                            and pcp_diag_layer
+                            and (self.prefix == "model.layers.2.attn"
+                                 or not bool(seg_out_finite.item()))
                         ):
                             logger.error(
-                                "DeepSeek V4 PCP SWA segment non-finite at %s: "
+                                "DeepSeek V4 PCP SWA segment diag at %s: "
                                 "query=(%d,%d) kv=(%d,%d) sparse_rows=%d "
                                 "q_finite=%s kv_finite=%s "
                                 "valid_out_finite=%s bad_valid_out=%d "
+                                "q_amax=%s kv_amax=%s out_amax=%s "
                                 "indices_min=%d indices_max=%d "
                                 "lens_min=%d lens_max=%d",
                                 self.prefix,
@@ -520,8 +535,11 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                                 segment.sparse_rows,
                                 bool(torch.isfinite(seg_q).all().item()),
                                 bool(torch.isfinite(seg_kv).all().item()),
-                                bool(torch.isfinite(seg_out).all().item()),
+                                bool(seg_out_finite.item()),
                                 int((~torch.isfinite(seg_out)).sum().item()),
+                                _finite_amax_for_diag(seg_q),
+                                _finite_amax_for_diag(seg_kv),
+                                _finite_amax_for_diag(seg_out),
                                 int(seg_indices.min().item()),
                                 int(seg_indices.max().item()),
                                 int(seg_lens.min().item()),
