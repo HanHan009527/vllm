@@ -553,6 +553,23 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 else:
                     indices_min = -1
                     indices_max = -1
+                kv_flat = kv.view(-1, q.shape[-1])
+                kv_row_finite = torch.isfinite(kv_flat).all(dim=1)
+                bad_kv_rows = torch.nonzero(
+                    ~kv_row_finite, as_tuple=False
+                ).flatten()
+                if bad_kv_rows.numel() > 0:
+                    bad_kv_rows_sample = bad_kv_rows[:16].detach().cpu().tolist()
+                    bad_kv_rows_min = int(bad_kv_rows.min().item())
+                    bad_kv_rows_max = int(bad_kv_rows.max().item())
+                    bad_kv_compressed = int((bad_kv_rows < chunk_N).sum().item())
+                    bad_kv_swa = int((bad_kv_rows >= chunk_N).sum().item())
+                else:
+                    bad_kv_rows_sample = []
+                    bad_kv_rows_min = -1
+                    bad_kv_rows_max = -1
+                    bad_kv_compressed = 0
+                    bad_kv_swa = 0
                 logger.error(
                     "DeepSeek V4 PCP sparse prefill diag at %s: "
                     "chunk=(%d,%d) q_tokens=%d positions_min=%d "
@@ -563,6 +580,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     "pcp_kernel_rows_min=%d pcp_kernel_rows_max=%d "
                     "pcp_sparse_rows=%d q_finite=%s q_amax=%s "
                     "kv_finite=%s kv_amax=%s "
+                    "bad_kv_rows=%d bad_kv_min=%d bad_kv_max=%d "
+                    "bad_kv_compressed=%d bad_kv_swa=%d "
+                    "bad_kv_sample=%s "
                     "read_slots=%d write_slots=%d write_unique=%d "
                     "missing_read_slots=%d missing_min=%d missing_max=%d "
                     "read_slot_min=%d read_slot_max=%d "
@@ -595,6 +615,12 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     _finite_amax_for_diag(q[query_start:query_end]),
                     bool(torch.isfinite(kv).all().item()),
                     _finite_amax_for_diag(kv),
+                    bad_kv_rows.numel(),
+                    bad_kv_rows_min,
+                    bad_kv_rows_max,
+                    bad_kv_compressed,
+                    bad_kv_swa,
+                    bad_kv_rows_sample,
                     slot_coverage["read_slots"],
                     slot_coverage["write_slots"],
                     slot_coverage["write_unique"],
