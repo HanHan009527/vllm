@@ -694,6 +694,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
+            if local_q_indices is not None:
+                from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
+                    xpu_qnorm_rope_kv_fp8_insert,
+                )
+
+                xpu_qnorm_rope_kv_fp8_insert(
+                    q,
+                    kv,
+                    swa_kv_cache,
+                    slot_mapping,
+                    positions,
+                    cos_sin_cache,
+                    self.eps,
+                    self.swa_cache_layer.block_size,
+                )
+                if self.n_local_heads < self.padded_heads:
+                    q = F.pad(
+                        q,
+                        (0, 0, 0, self.padded_heads - self.n_local_heads),
+                        value=0.0,
+                    )
+                assert insert_mask is not None
+                padded_q = q.new_zeros(
+                    (insert_mask.shape[0], self.padded_heads, self.head_dim)
+                )
+                padded_q[insert_mask] = q
+                return restore_pcp_local_tensor_to_padded_tokens(
+                    padded_q, local_q_indices, num_padded_local_tokens
+                )
+
             # Legacy FlashMLA UE8M0 paged path. Horizontally fused:
             #   Q side:  per-head RMSNorm (no weight) + GPT-J RoPE, zero-filling
             #            the padding head slots; the kernel allocates and returns
