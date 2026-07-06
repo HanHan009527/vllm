@@ -279,6 +279,53 @@ def test_transfer_plan_diff_summary_separates_old_and_new_group_selection():
     assert new_summary["sample"][0]["groups"] == (1,)
     assert new_summary["sample"][0]["local_blocks"]["ids"] == [21, 22]
     assert old_summary["signature"] != new_summary["signature"]
+    assert old_summary["sample"][0]["remote"]["base_addr"] == 0xB000
+    assert old_summary["sample"][0]["remote"]["block_len"] == 256
+    assert old_summary["sample"][0]["remote"]["kv_block_len"] == 128
+    assert old_summary["sample"][0]["remote_descriptor_ranges"] == {
+        "count": 2,
+        "contiguous_blocks": True,
+        "span_start": 0xB000 + 100 * 256,
+        "span_end": 0xB000 + 101 * 256 + 128,
+        "ranges": [
+            {
+                "block": 100,
+                "start": 0xB000 + 100 * 256,
+                "end": 0xB000 + 100 * 256 + 128,
+                "bytes": 128,
+            },
+            {
+                "block": 101,
+                "start": 0xB000 + 101 * 256,
+                "end": 0xB000 + 101 * 256 + 128,
+                "bytes": 128,
+            },
+        ],
+    }
+    assert new_summary["sample"][0]["remote_descriptor_ranges"] == {
+        "count": 2,
+        "contiguous_blocks": True,
+        "span_start": 0xB000 + 200 * 256,
+        "span_end": 0xB000 + 201 * 256 + 128,
+        "ranges": [
+            {
+                "block": 200,
+                "start": 0xB000 + 200 * 256,
+                "end": 0xB000 + 200 * 256 + 128,
+                "bytes": 128,
+            },
+            {
+                "block": 201,
+                "start": 0xB000 + 201 * 256,
+                "end": 0xB000 + 201 * 256 + 128,
+                "bytes": 128,
+            },
+        ],
+    }
+    assert new_summary["target_group_blocks"]["remote"][1] == {
+        "count": 2,
+        "ids": [200, 201],
+    }
 
 
 @pytest.mark.asyncio

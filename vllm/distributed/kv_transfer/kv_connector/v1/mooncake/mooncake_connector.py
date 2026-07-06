@@ -69,6 +69,7 @@ logger = init_logger(__name__)
 
 _MOONCAKE_TRANSFER_PLAN_DIFF_ENV = "VLLM_MOONCAKE_TRANSFER_PLAN_DIFF"
 _TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT = 16
+_TRANSFER_PLAN_DIFF_TARGET_GROUPS = (0, 1, 3, 4)
 
 try:
     from mooncake.engine import TransferEngine
@@ -667,10 +668,59 @@ def _summarize_block_ids(block_ids: list[int]) -> dict[str, Any]:
     }
 
 
+def _summarize_descriptor_ranges(
+    region: TransferRegion,
+    block_ids: list[int],
+) -> dict[str, Any]:
+    if not block_ids:
+        return {"count": 0, "ranges": []}
+
+    contiguous = all(
+        next_block_id == block_id + 1
+        for block_id, next_block_id in zip(block_ids, block_ids[1:])
+    )
+
+    def make_range(block_id: int) -> dict[str, int]:
+        start = region.base_addr + block_id * region.block_len
+        return {
+            "block": block_id,
+            "start": start,
+            "end": start + region.kv_block_len,
+            "bytes": region.kv_block_len,
+        }
+
+    ranges = [make_range(block_id) for block_id in block_ids]
+    if len(ranges) <= 6:
+        range_sample: dict[str, Any] = {"ranges": ranges}
+    else:
+        range_sample = {"first": ranges[:3], "last": ranges[-3:]}
+
+    return {
+        "count": len(block_ids),
+        "contiguous_blocks": contiguous,
+        "span_start": ranges[0]["start"],
+        "span_end": ranges[-1]["end"],
+        **range_sample,
+    }
+
+
+def _summarize_target_group_blocks(
+    block_ids_by_group: list[list[int]],
+) -> dict[int, dict[str, Any]]:
+    return {
+        group_idx: _summarize_block_ids(block_ids_by_group[group_idx])
+        for group_idx in _TRANSFER_PLAN_DIFF_TARGET_GROUPS
+        if group_idx < len(block_ids_by_group)
+    }
+
+
 def _region_debug_identity(region: TransferRegion) -> dict[str, Any]:
     return {
         "name": region.layer_name,
         "index": region.layer_index,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+        "kv_block_len": region.kv_block_len,
         "group": region.group_index,
         "aliases": region.layer_aliases,
         "alias_indices": region.layer_indices,
@@ -773,6 +823,12 @@ def _summarize_transfer_plan_selection(
                     "remote": _region_debug_identity(remote_region),
                     "local_blocks": _summarize_block_ids(local_block_ids),
                     "remote_blocks": _summarize_block_ids(remote_block_ids),
+                    "local_descriptor_ranges": _summarize_descriptor_ranges(
+                        local_region, local_block_ids
+                    ),
+                    "remote_descriptor_ranges": _summarize_descriptor_ranges(
+                        remote_region, remote_block_ids
+                    ),
                     "error": select_err,
                 }
             )
@@ -784,6 +840,10 @@ def _summarize_transfer_plan_selection(
         "selected_local_blocks": selected_local_block_count,
         "selected_remote_blocks": selected_remote_block_count,
         "errors": errors,
+        "target_group_blocks": {
+            "local": _summarize_target_group_blocks(local_block_ids_by_group),
+            "remote": _summarize_target_group_blocks(remote_block_ids_by_group),
+        },
         "signature": tuple(signature),
         "sample": sample_regions[:_TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT],
     }
