@@ -228,7 +228,9 @@ def test_legacy_align_transfer_regions_models_occurrence_group_path():
     assert "old occurrence/group path" in err
 
 
-def test_transfer_plan_diff_summary_separates_old_and_new_group_selection():
+def test_transfer_plan_diff_summary_separates_old_and_new_group_selection(
+    monkeypatch: pytest.MonkeyPatch,
+):
     local_region = TransferRegion(
         layer_name="model.layers.0.self_attn",
         layer_index=0,
@@ -326,6 +328,49 @@ def test_transfer_plan_diff_summary_separates_old_and_new_group_selection():
         "count": 2,
         "ids": [200, 201],
     }
+    assert "coverage" not in old_summary
+    assert "coverage" not in new_summary
+
+    monkeypatch.setenv("VLLM_MOONCAKE_TRANSFER_PLAN_DIFF_FULL", "1")
+    old_full_summary = _summarize_transfer_plan_selection(
+        [local_region],
+        [remote_region],
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+        use_old_occurrence_group=True,
+    )
+    new_full_summary = _summarize_transfer_plan_selection(
+        [local_region],
+        [remote_region],
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+        use_old_occurrence_group=False,
+    )
+
+    old_coverage = old_full_summary["coverage"]
+    new_coverage = new_full_summary["coverage"]
+    assert old_coverage["selected_remote_descriptor_count"] == 2
+    assert new_coverage["selected_remote_descriptor_count"] == 2
+    assert old_coverage["selected_remote_total_bytes"] == 256
+    assert new_coverage["selected_remote_total_bytes"] == 256
+    assert (
+        old_coverage["selected_remote_range_hash"]
+        != new_coverage["selected_remote_range_hash"]
+    )
+    assert (
+        old_coverage["selected_region_signature_hash"]
+        != new_coverage["selected_region_signature_hash"]
+    )
+    assert old_coverage["target_group_coverage"][0]["count"] == 2
+    assert old_coverage["target_group_coverage"][1]["count"] == 2
+    assert (
+        old_coverage["target_group_coverage"][0]["block_hash"]
+        != old_coverage["target_group_coverage"][1]["block_hash"]
+    )
+    assert (
+        new_coverage["target_group_coverage"][1]["block_hash"]
+        == old_coverage["target_group_coverage"][1]["block_hash"]
+    )
 
 
 @pytest.mark.asyncio

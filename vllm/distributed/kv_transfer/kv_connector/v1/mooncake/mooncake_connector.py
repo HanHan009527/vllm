@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -68,6 +69,7 @@ from vllm.v1.worker.utils import select_common_block_size
 logger = init_logger(__name__)
 
 _MOONCAKE_TRANSFER_PLAN_DIFF_ENV = "VLLM_MOONCAKE_TRANSFER_PLAN_DIFF"
+_MOONCAKE_TRANSFER_PLAN_DIFF_FULL_ENV = "VLLM_MOONCAKE_TRANSFER_PLAN_DIFF_FULL"
 _TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT = 16
 _TRANSFER_PLAN_DIFF_TARGET_GROUPS = (0, 1, 3, 4)
 
@@ -668,6 +670,59 @@ def _summarize_block_ids(block_ids: list[int]) -> dict[str, Any]:
     }
 
 
+def _transfer_plan_diff_full_enabled() -> bool:
+    return os.getenv(_MOONCAKE_TRANSFER_PLAN_DIFF_FULL_ENV, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _stable_digest(items: list[tuple[Any, ...]]) -> str:
+    digest = hashlib.blake2s(digest_size=16)
+    for item in items:
+        digest.update(repr(item).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _remote_range_coverage_items(
+    region: TransferRegion,
+    block_ids: list[int],
+) -> list[tuple[Any, ...]]:
+    return [
+        (
+            region.layer_name,
+            region.layer_index,
+            region.group_index,
+            region.kv_block_len,
+            block_id,
+            block_id * region.block_len,
+            block_id * region.block_len + region.kv_block_len,
+        )
+        for block_id in block_ids
+    ]
+
+
+def _summarize_target_group_coverage(
+    block_ids_by_group: list[list[int]],
+) -> dict[int, dict[str, Any]]:
+    coverage: dict[int, dict[str, Any]] = {}
+    for group_idx in _TRANSFER_PLAN_DIFF_TARGET_GROUPS:
+        if group_idx >= len(block_ids_by_group):
+            continue
+        block_ids = block_ids_by_group[group_idx]
+        coverage[group_idx] = {
+            "count": len(block_ids),
+            "min_block": min(block_ids) if block_ids else None,
+            "max_block": max(block_ids) if block_ids else None,
+            "block_hash": _stable_digest(
+                [(position, block_id) for position, block_id in enumerate(block_ids)]
+            ),
+        }
+    return coverage
+
+
 def _summarize_descriptor_ranges(
     region: TransferRegion,
     block_ids: list[int],
@@ -749,6 +804,8 @@ def _summarize_transfer_plan_selection(
     selected_region_count = 0
     selected_local_block_count = 0
     selected_remote_block_count = 0
+    full_coverage_enabled = _transfer_plan_diff_full_enabled()
+    remote_range_coverage_items: list[tuple[Any, ...]] = []
 
     for region_idx, (local_region, remote_region) in enumerate(
         zip(local_regions, remote_regions)
@@ -795,6 +852,10 @@ def _summarize_transfer_plan_selection(
             selected_region_count += 1
             selected_local_block_count += len(local_block_ids)
             selected_remote_block_count += len(remote_block_ids)
+            if full_coverage_enabled:
+                remote_range_coverage_items.extend(
+                    _remote_range_coverage_items(remote_region, remote_block_ids)
+                )
 
         signature.append(
             (
@@ -833,7 +894,7 @@ def _summarize_transfer_plan_selection(
                 }
             )
 
-    return {
+    summary: dict[str, Any] = {
         "path": path_name,
         "pairs": len(signature),
         "selected_regions": selected_region_count,
@@ -847,6 +908,19 @@ def _summarize_transfer_plan_selection(
         "signature": tuple(signature),
         "sample": sample_regions[:_TRANSFER_PLAN_DIFF_REGION_SAMPLE_LIMIT],
     }
+    if full_coverage_enabled:
+        summary["coverage"] = {
+            "selected_remote_descriptor_count": len(remote_range_coverage_items),
+            "selected_remote_total_bytes": sum(
+                item[-1] - item[-2] for item in remote_range_coverage_items
+            ),
+            "selected_remote_range_hash": _stable_digest(remote_range_coverage_items),
+            "selected_region_signature_hash": _stable_digest(list(signature)),
+            "target_group_coverage": _summarize_target_group_coverage(
+                remote_block_ids_by_group
+            ),
+        }
+    return summary
 
 
 def _log_transfer_plan_diff_diagnostic(
