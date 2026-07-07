@@ -101,6 +101,19 @@ def test_flashmla_pcp_prefill_overlays_restored_dense_kv_workspace():
     assert "pcp_metadata.restored_swa_valid_mask" in source
 
 
+def test_flashmla_pcp_slot_coverage_diag_handles_empty_owner_slots():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
+              "flashmla.py").read_text()
+
+    assert "if valid_write_slots.numel() == 0:" in source
+    empty_owner_return = source.split("if valid_write_slots.numel() == 0:",
+                                      1)[1].split("}", 1)[0]
+    assert '"block0": block0' in empty_owner_return
+    assert '"block1": block1' in empty_owner_return
+    assert '"write0": -1' in empty_owner_return
+    assert '"write1": -1' in empty_owner_return
+
+
 def test_flashinfer_pcp_prefill_fails_closed_without_metadata():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
               "flashinfer_sparse.py").read_text()

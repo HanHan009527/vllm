@@ -60,6 +60,17 @@ def _pcp_cache_slot_coverage_diag(
     chunk_start: int,
     chunk_end: int,
 ) -> dict[str, int]:
+    block_table_cpu = block_table.detach().cpu()
+    block0 = (
+        int(block_table_cpu[chunk_start, 0].item())
+        if chunk_start < block_table_cpu.shape[0] and block_table_cpu.shape[1] > 0
+        else -1
+    )
+    block1 = (
+        int(block_table_cpu[chunk_start, 1].item())
+        if chunk_start < block_table_cpu.shape[0] and block_table_cpu.shape[1] > 1
+        else -1
+    )
     valid_write_slots = write_slot_mapping[write_slot_mapping >= 0].detach().cpu()
     if valid_write_slots.numel() == 0:
         return {
@@ -79,9 +90,12 @@ def _pcp_cache_slot_coverage_diag(
             "scale_gt240": 0,
             "scale_oob": 0,
             "scale_cache_block_size": -1,
+            "block0": block0,
+            "block1": block1,
+            "write0": -1,
+            "write1": -1,
         }
 
-    block_table_cpu = block_table.detach().cpu()
     seq_lens_cpu = seq_lens.detach().cpu()
     gather_lens_cpu = gather_lens.detach().cpu()
     read_slots: list[int] = []
@@ -160,18 +174,8 @@ def _pcp_cache_slot_coverage_diag(
         "scale_gt240": scale_gt240,
         "scale_oob": scale_oob,
         "scale_cache_block_size": scale_cache_block_size,
-        "block0": (
-            int(block_table_cpu[chunk_start, 0].item())
-            if chunk_start < block_table_cpu.shape[0]
-            and block_table_cpu.shape[1] > 0
-            else -1
-        ),
-        "block1": (
-            int(block_table_cpu[chunk_start, 1].item())
-            if chunk_start < block_table_cpu.shape[0]
-            and block_table_cpu.shape[1] > 1
-            else -1
-        ),
+        "block0": block0,
+        "block1": block1,
         "write0": (
             int(valid_write_slots[0].item()) if valid_write_slots.numel() > 0 else -1
         ),
