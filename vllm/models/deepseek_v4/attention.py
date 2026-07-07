@@ -699,7 +699,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 positions=positions,
                 req_indices=req_indices,
                 block_table=swa_metadata.block_table,
-                block_size=swa_metadata.block_size,
+                block_size=swa_storage_block_size,
                 valid_mask=restored_valid_mask,
             )
             kv_insert_mask = slot_mapping >= 0

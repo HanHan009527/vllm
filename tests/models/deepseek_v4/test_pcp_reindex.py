@@ -89,6 +89,25 @@ def test_build_pcp_full_slot_mapping_masks_restored_padding_rows():
     )
 
 
+def test_build_pcp_full_slot_mapping_uses_storage_block_size_for_swa_cache():
+    # DeepSeek V4 SWA cache storage blocks can be smaller than the logical
+    # metadata block size. Restored PCP KV writes must use the storage block
+    # size so the slots match the sparse prefill read path.
+    block_table = torch.tensor([[1]], dtype=torch.int32)
+
+    slot_mapping = build_pcp_full_slot_mapping(
+        positions=torch.tensor([0, 1, 2], dtype=torch.int64),
+        req_indices=torch.tensor([0, 0, 0], dtype=torch.int64),
+        block_table=block_table,
+        block_size=64,
+    )
+
+    torch.testing.assert_close(
+        slot_mapping,
+        torch.tensor([64, 65, 66], dtype=torch.int64),
+    )
+
+
 def test_build_pcp_restored_req_indices_uses_view_restore_lengths():
     req_indices = build_pcp_restored_req_indices(
         positions=torch.arange(7, dtype=torch.int64),
