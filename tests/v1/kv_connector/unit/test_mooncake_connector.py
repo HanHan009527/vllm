@@ -269,17 +269,18 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("pcp_rank", "local_blocks"),
+    ("pcp_rank", "local_blocks", "expected_remote_blocks"),
     [
-        (0, [10, 11, 12]),
-        (1, [10, 11, 12]),
+        (0, [10, 11], [20, 22]),
+        (1, [12], [21]),
     ],
 )
-async def test_build_transfer_params_keeps_remote_blocks_for_replicated_prefill_pcp(
+async def test_build_transfer_params_filters_remote_blocks_by_prefill_pcp_rank(
     pcp_rank: int,
     local_blocks: list[int],
+    expected_remote_blocks: list[int],
 ):
-    """PCP producer ranks export full restored KV cache blocks."""
+    """PCP producer ranks should pair only their CP-owned remote blocks."""
 
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.async_zmq_ctx = MagicMock()
@@ -347,7 +348,7 @@ async def test_build_transfer_params_keeps_remote_blocks_for_replicated_prefill_
     ]
     assert dst_ptrs == [
         remote_region.base_addr + block_id * block_len
-        for block_id in [20, 21, 22]
+        for block_id in expected_remote_blocks
     ]
     assert lengths == [block_len] * len(local_blocks)
 
@@ -409,11 +410,11 @@ def test_remote_prefill_pcp_filter_uses_external_start_token():
 @pytest.mark.parametrize(
     ("pcp_rank", "local_blocks", "expected_remote_blocks"),
     [
-        (0, [11], [20]),
+        (0, [], []),
         (1, [11], [20]),
     ],
 )
-async def test_build_transfer_params_keeps_partial_remote_prefill_block_for_pcp(
+async def test_build_transfer_params_uses_remote_prefill_start_token_for_pcp(
     pcp_rank: int,
     local_blocks: list[int],
     expected_remote_blocks: list[int],
