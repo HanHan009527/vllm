@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.models.deepseek_v4.pcp_metadata import (
     build_pcp_sparse_prefill_rows,
     build_pcp_swa_prefill_segments,
+    compact_pcp_sparse_indices,
     overlay_pcp_restored_swa_kv_workspace,
     pcp_swa_torch_sparse_fwd,
 )
@@ -737,6 +738,9 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 )
             pcp_sparse_rows = None
             if is_pcp_prefill:
+                combined_indices, combined_lens = compact_pcp_sparse_indices(
+                    combined_indices, combined_lens
+                )
                 local_query_start_loc = query_start_loc[
                     num_decodes + chunk_start : num_decodes + chunk_end + 1
                 ]

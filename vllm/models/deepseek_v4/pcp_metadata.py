@@ -55,6 +55,31 @@ class DeepseekV4PcpPrefillMetadata:
     restored_swa_valid_mask: torch.Tensor | None = None
 
 
+def compact_pcp_sparse_indices(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep the sparse kernel valid prefix free of padding sentinels."""
+    if indices.numel() == 0:
+        return indices, lengths
+
+    offsets = torch.arange(indices.shape[1], device=indices.device)
+    valid_prefix = offsets.unsqueeze(0) < lengths.unsqueeze(1)
+    valid_indices = valid_prefix & (indices >= 0)
+    new_lengths = valid_indices.sum(dim=1).to(lengths.dtype)
+    if torch.equal(new_lengths, lengths):
+        return indices, lengths
+
+    compacted = torch.full_like(indices, -1)
+    compacted_offsets = valid_indices.to(torch.long).cumsum(dim=1) - 1
+    row_ids = torch.arange(indices.shape[0], device=indices.device).unsqueeze(1)
+    row_ids = row_ids.expand_as(indices)
+    compacted[row_ids[valid_indices], compacted_offsets[valid_indices]] = indices[
+        valid_indices
+    ]
+    return compacted, new_lengths
+
+
 def overlay_pcp_restored_swa_kv_workspace(
     *,
     out: torch.Tensor,

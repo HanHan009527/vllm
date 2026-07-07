@@ -20,9 +20,34 @@ _PCP_METADATA_SPEC.loader.exec_module(_PCP_METADATA)
 
 build_pcp_sparse_prefill_rows = _PCP_METADATA.build_pcp_sparse_prefill_rows
 build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
+compact_pcp_sparse_indices = _PCP_METADATA.compact_pcp_sparse_indices
 overlay_pcp_restored_swa_kv_workspace = (
     _PCP_METADATA.overlay_pcp_restored_swa_kv_workspace
 )
+
+
+def test_compact_pcp_sparse_indices_removes_sentinels_from_valid_prefix():
+    indices = torch.tensor(
+        [[0, -1, 2, -1], [-1, 4, 5, -1], [7, 8, -1, -1]],
+        dtype=torch.int32,
+    )
+    lengths = torch.tensor([3, 3, 2], dtype=torch.int32)
+
+    compacted, new_lengths = compact_pcp_sparse_indices(indices, lengths)
+
+    torch.testing.assert_close(
+        compacted,
+        torch.tensor(
+            [[0, 2, -1, -1], [4, 5, -1, -1], [7, 8, -1, -1]],
+            dtype=torch.int32,
+        ),
+    )
+    torch.testing.assert_close(
+        new_lengths,
+        torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+
+
 def test_overlay_pcp_restored_swa_kv_workspace_ignores_padding_rows():
     restored_positions = torch.tensor([0, 0, 1, 2, 3, 4, 5, 6, 7, 0])
     restored_valid_mask = torch.tensor(
