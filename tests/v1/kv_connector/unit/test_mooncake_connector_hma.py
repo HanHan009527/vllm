@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _common_group_indices_for_regions,
     _select_region_block_ids,
 )
+from vllm.v1.request import RequestStatus
 
 from .test_mooncake_connector import FakeMooncakeWrapper, patch_worker_dependencies
 from .utils import create_request, create_vllm_config, make_kv_cache_config
@@ -922,7 +923,11 @@ async def test_build_transfer_params_group_count_mismatch(monkeypatch):
 #  test_request_finished_with_hma_groups
 # ---------------------------------------------------------------------------
 @pytest.mark.cpu_test
-def test_request_finished_with_hma_groups():
+@pytest.mark.parametrize(
+    "finished_status",
+    [RequestStatus.FINISHED_LENGTH_CAPPED, RequestStatus.FINISHED_STOPPED],
+)
+def test_request_finished_with_hma_groups(finished_status: RequestStatus):
     """request_finished correctly handles per-group block_ids."""
     block_size = 16
     vllm_config = create_vllm_config(
@@ -944,9 +949,7 @@ def test_request_finished_with_hma_groups():
     request = create_request(request_id=1, do_remote_decode=True)
     request.kv_transfer_params["transfer_id"] = request.request_id
 
-    from vllm.v1.request import RequestStatus
-
-    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    request.status = finished_status
 
     # 2 groups: FA with 10 blocks, SW with 20 blocks (will be clipped)
     fa_blocks = list(range(10))

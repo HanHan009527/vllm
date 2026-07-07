@@ -1186,7 +1186,11 @@ def test_get_mooncake_bootstrap_addr_selects_expected_host(
     )
 
 
-def test_scheduler_request_finished():
+@pytest.mark.parametrize(
+    "finished_status",
+    [RequestStatus.FINISHED_LENGTH_CAPPED, RequestStatus.FINISHED_STOPPED],
+)
+def test_scheduler_request_finished(finished_status: RequestStatus):
     """
     Tests the scheduler-side logic when a request finishes.
 
@@ -1214,8 +1218,8 @@ def test_scheduler_request_finished():
     request = create_request(request_id=1, do_remote_decode=True)
     request.kv_transfer_params["transfer_id"] = request.request_id
 
-    # Case: Capped length (Successful prefill, need to send to decoder)
-    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    # Case: successful prefill, need to send to decoder.
+    request.status = finished_status
     delay_free, kv_transfer_params = scheduler_connector.request_finished(
         request, block_ids=([10, 11],)
     )
