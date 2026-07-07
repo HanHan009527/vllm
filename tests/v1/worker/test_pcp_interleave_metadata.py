@@ -90,7 +90,7 @@ def test_pcp_prefill_slot_mapping_uses_restored_full_cache_slots():
     assert "gathered_positions = pcp_group.all_gather(" in runner_source
     assert "gathered_slot_mapping = pcp_group.all_gather(" not in runner_source
     assert "pcp_padded_query_start_loc" in runner_source
-    assert "use_pcp=False" in runner_source
+    assert "use_pcp_slot_mapping=False" in runner_source
     assert "out=slot_mapping" in runner_source
     assert "get_pcp_padded_slot_mapping(" in runner_source
 
