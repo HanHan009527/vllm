@@ -682,10 +682,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cache_dtype = swa_kv_cache.dtype
         slot_mapping = swa_metadata.slot_mapping
         kv_insert_mask = None
+        pcp_prefill_metadata = None
         if local_q_indices is not None:
             assert swa_metadata.pcp_prefill_metadata is not None
             pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
-            pcp_prefill_metadata.restored_swa_kv = kv
             pcp_prefill_metadata.restored_swa_positions = positions
             pcp_prefill_metadata.restored_swa_valid_mask = _pcp_restored_valid_mask(
                 positions, pcp_prefill_metadata.views
@@ -737,7 +737,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     xpu_qnorm_rope_kv_fp8_insert,
                 )
 
-                xpu_qnorm_rope_kv_fp8_insert(
+                kv_roped = xpu_qnorm_rope_kv_fp8_insert(
                     q,
                     kv,
                     swa_kv_cache,
@@ -747,7 +747,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     self.eps,
                     swa_storage_block_size,
                     insert_mask=kv_insert_mask,
+                    return_kv_roped=True,
                 )
+                assert pcp_prefill_metadata is not None
+                assert kv_roped is not None
+                pcp_prefill_metadata.restored_swa_kv = kv_roped
                 if self.n_local_heads < self.padded_heads:
                     q = F.pad(
                         q,
