@@ -21,6 +21,7 @@ _PCP_METADATA_SPEC.loader.exec_module(_PCP_METADATA)
 build_pcp_sparse_prefill_rows = _PCP_METADATA.build_pcp_sparse_prefill_rows
 build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
 build_pcp_full_slot_mapping = _PCP_METADATA.build_pcp_full_slot_mapping
+build_pcp_restored_req_indices = _PCP_METADATA.build_pcp_restored_req_indices
 compact_pcp_sparse_indices = _PCP_METADATA.compact_pcp_sparse_indices
 overlay_pcp_restored_swa_kv_workspace = (
     _PCP_METADATA.overlay_pcp_restored_swa_kv_workspace
@@ -68,6 +69,21 @@ def test_build_pcp_full_slot_mapping_uses_restored_positions():
     torch.testing.assert_close(
         slot_mapping,
         torch.tensor([128, 159, 224, 319, 352, -1], dtype=torch.int64),
+    )
+
+
+def test_build_pcp_restored_req_indices_uses_view_restore_lengths():
+    req_indices = build_pcp_restored_req_indices(
+        positions=torch.arange(7, dtype=torch.int64),
+        views=[
+            SimpleNamespace(req_idx=0, restore_idx=torch.arange(4)),
+            SimpleNamespace(req_idx=1, restore_idx=torch.arange(2)),
+        ],
+    )
+
+    torch.testing.assert_close(
+        req_indices,
+        torch.tensor([0, 0, 0, 0, 1, 1, -1], dtype=torch.int64),
     )
 
 

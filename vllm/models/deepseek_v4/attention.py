@@ -26,7 +26,11 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
-from vllm.models.deepseek_v4.pcp_metadata import build_pcp_full_slot_mapping
+from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_full_slot_mapping,
+    build_pcp_restored_req_indices,
+)
+
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
@@ -686,12 +690,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             pcp_prefill_metadata.restored_swa_valid_mask = _pcp_restored_valid_mask(
                 positions, pcp_prefill_metadata.views
             )
-            req_indices = torch.full_like(positions, -1, dtype=torch.long)
-            query_start_loc = pcp_prefill_metadata.local_query_start_loc
-            for req_idx in range(query_start_loc.numel() - 1):
-                start = int(query_start_loc[req_idx].item())
-                end = int(query_start_loc[req_idx + 1].item())
-                req_indices[start:end] = req_idx
+            req_indices = build_pcp_restored_req_indices(
+                positions=positions,
+                views=pcp_prefill_metadata.views,
+            )
             slot_mapping = build_pcp_full_slot_mapping(
                 positions=positions,
                 req_indices=req_indices,

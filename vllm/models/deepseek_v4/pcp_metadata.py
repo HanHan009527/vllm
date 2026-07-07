@@ -98,6 +98,23 @@ def build_pcp_full_slot_mapping(
     return slot_mapping
 
 
+def build_pcp_restored_req_indices(
+    *,
+    positions: torch.Tensor,
+    views: list[PCPInterleaveRequestView],
+) -> torch.Tensor:
+    """Build request indices aligned to a PCP all-gather restored buffer."""
+    req_indices = torch.full_like(positions, -1, dtype=torch.long)
+    row_start = 0
+    for view in views:
+        row_end = row_start + int(view.restore_idx.numel())
+        req_indices[row_start : min(row_end, positions.numel())] = int(view.req_idx)
+        row_start = row_end
+        if row_start >= positions.numel():
+            break
+    return req_indices
+
+
 def compact_pcp_sparse_indices(
     indices: torch.Tensor,
     lengths: torch.Tensor,
