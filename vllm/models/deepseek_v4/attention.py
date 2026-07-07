@@ -687,9 +687,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             assert swa_metadata.pcp_prefill_metadata is not None
             pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
             pcp_prefill_metadata.restored_swa_positions = positions
-            pcp_prefill_metadata.restored_swa_valid_mask = _pcp_restored_valid_mask(
+            restored_valid_mask = _pcp_restored_valid_mask(
                 positions, pcp_prefill_metadata.views
             )
+            pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
             req_indices = build_pcp_restored_req_indices(
                 positions=positions,
                 views=pcp_prefill_metadata.views,
@@ -699,6 +700,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 req_indices=req_indices,
                 block_table=swa_metadata.block_table,
                 block_size=swa_metadata.block_size,
+                valid_mask=restored_valid_mask,
             )
             kv_insert_mask = slot_mapping >= 0
 

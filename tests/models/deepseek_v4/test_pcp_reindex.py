@@ -68,7 +68,24 @@ def test_build_pcp_full_slot_mapping_uses_restored_positions():
 
     torch.testing.assert_close(
         slot_mapping,
-        torch.tensor([128, 159, 224, 319, 352, -1], dtype=torch.int64),
+        torch.tensor([128, 159, 224, 351, 352, -1], dtype=torch.int64),
+    )
+
+
+def test_build_pcp_full_slot_mapping_masks_restored_padding_rows():
+    block_table = torch.tensor([[4]], dtype=torch.int32)
+
+    slot_mapping = build_pcp_full_slot_mapping(
+        positions=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+        req_indices=torch.tensor([0, 0, 0, 0], dtype=torch.int64),
+        block_table=block_table,
+        block_size=8,
+        valid_mask=torch.tensor([True, True, True, False]),
+    )
+
+    torch.testing.assert_close(
+        slot_mapping,
+        torch.tensor([32, 33, 34, -1], dtype=torch.int64),
     )
 
 

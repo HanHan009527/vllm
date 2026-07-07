@@ -61,6 +61,7 @@ def build_pcp_full_slot_mapping(
     req_indices: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map restored PCP positions to physical cache slots for every valid row."""
     if positions.numel() == 0:
@@ -73,6 +74,10 @@ def build_pcp_full_slot_mapping(
     slot_mapping = torch.full_like(positions_long, -1)
 
     valid = (positions_long >= 0) & (req_indices >= 0)
+    if valid_mask is not None:
+        valid &= valid_mask[: positions.numel()].to(
+            device=positions.device, dtype=torch.bool
+        )
     if not valid.any():
         return slot_mapping
 
