@@ -22,6 +22,7 @@ build_pcp_sparse_prefill_rows = _PCP_METADATA.build_pcp_sparse_prefill_rows
 build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
 build_pcp_full_slot_mapping = _PCP_METADATA.build_pcp_full_slot_mapping
 build_pcp_restored_req_indices = _PCP_METADATA.build_pcp_restored_req_indices
+build_pcp_restored_valid_mask = _PCP_METADATA.build_pcp_restored_valid_mask
 compact_pcp_sparse_indices = _PCP_METADATA.compact_pcp_sparse_indices
 overlay_pcp_restored_swa_kv_workspace = (
     _PCP_METADATA.overlay_pcp_restored_swa_kv_workspace
@@ -120,6 +121,21 @@ def test_build_pcp_restored_req_indices_uses_view_restore_lengths():
     torch.testing.assert_close(
         req_indices,
         torch.tensor([0, 0, 0, 0, 1, 1, -1], dtype=torch.int64),
+    )
+
+
+def test_build_pcp_restored_valid_mask_drops_per_rank_padding_rows():
+    valid_mask = build_pcp_restored_valid_mask(
+        positions=torch.tensor([0, 1, 2, 3, 0, 1], dtype=torch.int64),
+        views=[
+            SimpleNamespace(global_seq_len=3, restore_idx=torch.arange(4)),
+            SimpleNamespace(global_seq_len=2, restore_idx=torch.arange(2)),
+        ],
+    )
+
+    torch.testing.assert_close(
+        valid_mask,
+        torch.tensor([True, True, True, False, True, True]),
     )
 
 

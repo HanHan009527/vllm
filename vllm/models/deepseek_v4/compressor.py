@@ -20,7 +20,10 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
-from vllm.models.deepseek_v4.pcp_metadata import build_pcp_full_slot_mapping
+from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_full_slot_mapping,
+    build_pcp_restored_valid_mask,
+)
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backend import (
@@ -90,6 +93,7 @@ class CompressorMetadata:
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     pcp_allgather_restore_idx: torch.Tensor | None = None
+    pcp_request_views: list[Any] | None = None
 
 
 def _get_compressor_metadata_block_size(
@@ -137,6 +141,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
             pcp_allgather_restore_idx=common_attn_metadata.pcp_allgather_restore_idx,
+            pcp_request_views=common_attn_metadata.pcp_request_views,
         )
 
 
@@ -342,11 +347,16 @@ class DeepseekCompressor(nn.Module):
                 [self.coff * self.head_dim, self.coff * self.head_dim],
                 dim=-1,
             )
+            assert state_metadata.pcp_request_views is not None
             slot_mapping = build_pcp_full_slot_mapping(
                 positions=positions,
                 req_indices=token_to_req_indices,
                 block_table=block_table,
                 block_size=block_size,
+                valid_mask=build_pcp_restored_valid_mask(
+                    positions=positions,
+                    views=state_metadata.pcp_request_views,
+                ),
             )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim

@@ -29,6 +29,7 @@ from vllm.models.deepseek_v4.common.ops import (
 from vllm.models.deepseek_v4.pcp_metadata import (
     build_pcp_full_slot_mapping,
     build_pcp_restored_req_indices,
+    build_pcp_restored_valid_mask,
 )
 
 if TYPE_CHECKING:
@@ -70,20 +71,6 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
-
-
-def _pcp_restored_valid_mask(
-    positions: torch.Tensor,
-    views: list[Any],
-) -> torch.Tensor:
-    valid_mask = torch.zeros_like(positions, dtype=torch.bool)
-    row_start = 0
-    for view in views:
-        row_end = row_start + int(view.restore_idx.numel())
-        req_positions = positions[row_start:row_end]
-        valid_mask[row_start:row_end] = req_positions < int(view.global_seq_len)
-        row_start = row_end
-    return valid_mask
 
 
 def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
@@ -687,8 +674,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             assert swa_metadata.pcp_prefill_metadata is not None
             pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
             pcp_prefill_metadata.restored_swa_positions = positions
-            restored_valid_mask = _pcp_restored_valid_mask(
-                positions, pcp_prefill_metadata.views
+            restored_valid_mask = build_pcp_restored_valid_mask(
+                positions=positions, views=pcp_prefill_metadata.views
             )
             pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
             req_indices = build_pcp_restored_req_indices(

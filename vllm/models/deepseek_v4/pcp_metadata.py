@@ -120,6 +120,24 @@ def build_pcp_restored_req_indices(
     return req_indices
 
 
+def build_pcp_restored_valid_mask(
+    *,
+    positions: torch.Tensor,
+    views: list[PCPInterleaveRequestView],
+) -> torch.Tensor:
+    """Mark real restored rows and exclude per-rank padding rows."""
+    valid_mask = torch.zeros_like(positions, dtype=torch.bool)
+    row_start = 0
+    for view in views:
+        row_end = row_start + int(view.restore_idx.numel())
+        req_positions = positions[row_start:row_end]
+        valid_mask[row_start:row_end] = req_positions < int(view.global_seq_len)
+        row_start = row_end
+        if row_start >= positions.numel():
+            break
+    return valid_mask
+
+
 def compact_pcp_sparse_indices(
     indices: torch.Tensor,
     lengths: torch.Tensor,
