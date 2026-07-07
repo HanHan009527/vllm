@@ -20,6 +20,7 @@ _PCP_METADATA_SPEC.loader.exec_module(_PCP_METADATA)
 
 build_pcp_sparse_prefill_rows = _PCP_METADATA.build_pcp_sparse_prefill_rows
 build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
+build_pcp_compressed_slot_mapping = _PCP_METADATA.build_pcp_compressed_slot_mapping
 build_pcp_full_slot_mapping = _PCP_METADATA.build_pcp_full_slot_mapping
 build_pcp_restored_req_indices = _PCP_METADATA.build_pcp_restored_req_indices
 build_pcp_restored_valid_mask = _PCP_METADATA.build_pcp_restored_valid_mask
@@ -106,6 +107,26 @@ def test_build_pcp_full_slot_mapping_uses_storage_block_size_for_swa_cache():
     torch.testing.assert_close(
         slot_mapping,
         torch.tensor([64, 65, 66], dtype=torch.int64),
+    )
+
+
+def test_build_pcp_compressed_slot_mapping_uses_compressed_boundaries():
+    block_table = torch.tensor([[3, 4]], dtype=torch.int32)
+
+    slot_mapping = build_pcp_compressed_slot_mapping(
+        positions=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64),
+        req_indices=torch.zeros(8, dtype=torch.int64),
+        block_table=block_table,
+        block_size=4,
+        compress_ratio=4,
+        valid_mask=torch.tensor(
+            [True, True, True, True, True, True, True, False],
+        ),
+    )
+
+    torch.testing.assert_close(
+        slot_mapping,
+        torch.tensor([-1, -1, -1, 12, -1, -1, -1, -1], dtype=torch.int64),
     )
 
 

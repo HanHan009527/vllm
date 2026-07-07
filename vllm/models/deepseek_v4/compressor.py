@@ -21,7 +21,9 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
 from vllm.models.deepseek_v4.pcp_metadata import (
+    build_pcp_compressed_slot_mapping,
     build_pcp_full_slot_mapping,
+    build_pcp_restored_req_indices,
     build_pcp_restored_valid_mask,
 )
 from vllm.platforms import current_platform
@@ -94,6 +96,17 @@ class CompressorMetadata:
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
     pcp_allgather_restore_idx: torch.Tensor | None = None
     pcp_request_views: list[Any] | None = None
+
+
+class _SlotMappingMetadataOverride:
+    """Proxy metadata while replacing only the slot mapping used by kernels."""
+
+    def __init__(self, base: Any, slot_mapping: torch.Tensor) -> None:
+        self._base = base
+        self.slot_mapping = slot_mapping
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
 
 
 def _get_compressor_metadata_block_size(
@@ -325,6 +338,7 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        k_cache_slot_mapping = None
         if state_metadata.pcp_allgather_restore_idx is not None:
             restore_idx = state_metadata.pcp_allgather_restore_idx
             pcp_group = get_pcp_group()
@@ -348,15 +362,31 @@ class DeepseekCompressor(nn.Module):
                 dim=-1,
             )
             assert state_metadata.pcp_request_views is not None
+            restored_valid_mask = build_pcp_restored_valid_mask(
+                positions=positions,
+                views=state_metadata.pcp_request_views,
+            )
+            restored_req_indices = build_pcp_restored_req_indices(
+                positions=positions,
+                views=state_metadata.pcp_request_views,
+            )
             slot_mapping = build_pcp_full_slot_mapping(
                 positions=positions,
-                req_indices=token_to_req_indices,
+                req_indices=restored_req_indices,
                 block_table=block_table,
                 block_size=block_size,
-                valid_mask=build_pcp_restored_valid_mask(
-                    positions=positions,
-                    views=state_metadata.pcp_request_views,
-                ),
+                valid_mask=restored_valid_mask,
+            )
+            k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+            k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+            kv_cache = k_cache_layer.kv_cache
+            k_cache_slot_mapping = build_pcp_compressed_slot_mapping(
+                positions=positions,
+                req_indices=restored_req_indices,
+                block_table=k_cache_metadata.block_table,
+                block_size=int(kv_cache.shape[1]),
+                compress_ratio=self.compress_ratio,
+                valid_mask=restored_valid_mask,
             )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
@@ -399,6 +429,11 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
+        if k_cache_slot_mapping is not None:
+            k_cache_metadata = _SlotMappingMetadataOverride(
+                k_cache_metadata,
+                k_cache_slot_mapping,
+            )
 
         # FlashInfer V4 reads a contiguous bf16 / per-tensor fp8 cache row; the
         # legacy FlashMLA path uses the UE8M0 paged uint8 layout.
