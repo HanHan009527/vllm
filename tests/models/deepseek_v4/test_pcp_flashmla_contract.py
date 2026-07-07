@@ -40,13 +40,13 @@ def test_sparse_swa_builder_constructs_pcp_prefill_metadata():
     assert "pcp_request_views" in source
 
 
-def test_attention_pcp_cache_insert_skips_padding_slots():
+def test_attention_pcp_cache_insert_keeps_query_rows():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" /
               "attention.py").read_text()
 
-    assert "insert_mask = slot_mapping >= 0" in source
-    assert "slot_mapping = slot_mapping[insert_mask]" in source
-    assert "padded_q[insert_mask] = q" in source
+    assert "kv_insert_mask = slot_mapping >= 0" in source
+    assert "insert_mask=kv_insert_mask" in source
+    assert "padded_q[kv_insert_mask] = q" not in source
 
 
 def test_attention_pcp_fp8_insert_uses_storage_block_size():
@@ -62,18 +62,32 @@ def test_attention_pcp_fp8_insert_uses_storage_block_size():
     )
 
 
-def test_attention_pcp_insert_preserves_metadata_slot_identity():
+def test_attention_pcp_insert_uses_owner_slots_and_restored_valid_mask():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" /
               "attention.py").read_text()
 
-    assert (
-        "Preserve the metadata slot mapping as the global KV write identity"
-        in source
-    )
+    assert "_pcp_restored_valid_mask(" in source
     assert "pcp_slot_mapping_from_metadata_block_table" not in source
     assert "block_table=swa_metadata.block_table" not in source
     assert "total_cp_rank=self.pcp_rank" not in source
-    assert "insert_mask = slot_mapping >= 0" in source
+    assert "kv_insert_mask = slot_mapping >= 0" in source
+    assert "insert_slots = slot_mapping[kv_insert_mask]" in source
+
+
+def test_pcp_slot_mapping_preserves_cp_owner_mask():
+    source = (_VLLM_ROOT / "v1" / "worker" /
+              "gpu_model_runner.py").read_text()
+
+    assert "use_pcp=False,\n                        out=slot_mapping," not in source
+    assert "KV cache\n                    # writes must still follow" in source
+
+
+def test_xpu_pcp_fp8_insert_masks_only_kv_insert():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" / "xpu" /
+              "xpu_qnorm_rope_kv_fp8_insert.py").read_text()
+
+    assert "insert_mask: torch.Tensor | None = None" in source
+    assert "kv_roped = kv_roped[insert_mask]" in source
     assert "slot_mapping = slot_mapping[insert_mask]" in source
 
 

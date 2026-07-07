@@ -4202,11 +4202,10 @@ class GPUModelRunner(
                     valid_mask = torch.index_select(
                         gathered_valid_mask, 0, restore_idx
                     )
-                    # PCP prefill all-gathers q/kv before the fused KV insert,
-                    # and the current FlashMLA sparse prefill path reads a
-                    # complete local KV cache. Compute slots from restored full
-                    # positions while ignoring PCP ownership; padding rows are
-                    # masked below.
+                    # PCP prefill all-gathers q/kv before attention, but KV cache
+                    # writes must still follow the CP-interleaved ownership. The
+                    # attention layer keeps all restored query rows for compute
+                    # and uses this slot mapping only to mask KV insert rows.
                     num_reqs = self.input_batch.num_reqs
                     blk_table.compute_slot_mapping(
                         num_reqs,
@@ -4214,7 +4213,6 @@ class GPUModelRunner(
                             : num_reqs + 1
                         ],
                         self.pcp_manager.pcp_padded_positions[:pcp_full_tokens],
-                        use_pcp=False,
                         out=slot_mapping,
                     )
                     slot_mapping[~valid_mask] = -1

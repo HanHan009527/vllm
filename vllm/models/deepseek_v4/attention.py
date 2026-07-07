@@ -67,6 +67,20 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 logger = init_logger(__name__)
 
 
+def _pcp_restored_valid_mask(
+    positions: torch.Tensor,
+    views: list[Any],
+) -> torch.Tensor:
+    valid_mask = torch.zeros_like(positions, dtype=torch.bool)
+    row_start = 0
+    for view in views:
+        row_end = row_start + int(view.restore_idx.numel())
+        req_positions = positions[row_start:row_end]
+        valid_mask[row_start:row_end] = req_positions < int(view.global_seq_len)
+        row_start = row_end
+    return valid_mask
+
+
 def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
     finite = torch.isfinite(tensor)
     if not finite.any():
@@ -662,31 +676,27 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
         slot_mapping = swa_metadata.slot_mapping
-        insert_mask = None
+        kv_insert_mask = None
         if local_q_indices is not None:
             assert swa_metadata.pcp_prefill_metadata is not None
             pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
-            restored_valid_mask = slot_mapping >= 0
             pcp_prefill_metadata.restored_swa_kv = kv
             pcp_prefill_metadata.restored_swa_positions = positions
-            pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
-            # Preserve the metadata slot mapping as the global KV write identity.
-            # FlashMLA PCP prefill reads the restored dense workspace for the
-            # current step; Mooncake/decode still relies on the original slot
-            # mapping to receive the same KV rows that the scheduler assigned.
-            # Only padding rows from the all-gather/restore buffer are filtered.
-            insert_mask = slot_mapping >= 0
-            q = q[insert_mask]
-            kv = kv[insert_mask]
-            positions = positions[insert_mask]
-            slot_mapping = slot_mapping[insert_mask]
+            pcp_prefill_metadata.restored_swa_valid_mask = _pcp_restored_valid_mask(
+                positions, pcp_prefill_metadata.views
+            )
+            # KV insert is CP-owner masked, while query rows stay intact for the
+            # PCP prefill attention output that is restored below.
+            kv_insert_mask = slot_mapping >= 0
 
             if envs.VLLM_DSV4_NONFINITE_DIAG and self.prefix in (
                 "model.layers.0.attn",
                 "model.layers.2.attn",
             ):
-                unique_slots = torch.unique(slot_mapping)
-                duplicate_slots = slot_mapping.numel() - unique_slots.numel()
+                insert_slots = slot_mapping[kv_insert_mask]
+                insert_positions = positions[kv_insert_mask]
+                unique_slots = torch.unique(insert_slots)
+                duplicate_slots = insert_slots.numel() - unique_slots.numel()
                 logger.error(
                     "DeepSeek V4 PCP KV insert diag at %s: "
                     "tokens=%d valid_slots=%d duplicate_slots=%d "
@@ -695,12 +705,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     "kv_finite=%s kv_amax=%s",
                     self.prefix,
                     q.shape[0],
-                    slot_mapping.numel(),
+                    insert_slots.numel(),
                     duplicate_slots,
-                    int(positions.min().item()) if positions.numel() else -1,
-                    int(positions.max().item()) if positions.numel() else -1,
-                    int(slot_mapping.min().item()) if slot_mapping.numel() else -1,
-                    int(slot_mapping.max().item()) if slot_mapping.numel() else -1,
+                    int(insert_positions.min().item()) if insert_positions.numel() else -1,
+                    int(insert_positions.max().item()) if insert_positions.numel() else -1,
+                    int(insert_slots.min().item()) if insert_slots.numel() else -1,
+                    int(insert_slots.max().item()) if insert_slots.numel() else -1,
                     bool(torch.isfinite(q).all().item()),
                     _finite_amax_for_diag(q),
                     bool(torch.isfinite(kv).all().item()),
@@ -723,6 +733,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     cos_sin_cache,
                     self.eps,
                     swa_storage_block_size,
+                    insert_mask=kv_insert_mask,
                 )
                 if self.n_local_heads < self.padded_heads:
                     q = F.pad(
@@ -730,13 +741,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         (0, 0, 0, self.padded_heads - self.n_local_heads),
                         value=0.0,
                     )
-                assert insert_mask is not None
-                padded_q = q.new_zeros(
-                    (insert_mask.shape[0], self.padded_heads, self.head_dim)
-                )
-                padded_q[insert_mask] = q
                 return restore_pcp_local_tensor_to_padded_tokens(
-                    padded_q, local_q_indices, num_padded_local_tokens
+                    q, local_q_indices, num_padded_local_tokens
                 )
 
             # Legacy FlashMLA UE8M0 paged path. Horizontally fused:
@@ -758,12 +764,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 self.swa_cache_layer.block_size,
             )
-            if insert_mask is not None:
-                padded_q = q.new_zeros(
-                    (insert_mask.shape[0], self.padded_heads, self.head_dim)
-                )
-                padded_q[insert_mask] = q
-                q = padded_q
             return restore_pcp_local_tensor_to_padded_tokens(
                 q, local_q_indices, num_padded_local_tokens
             )
@@ -785,10 +785,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 block_size,
             )
-            if insert_mask is not None:
-                padded_q = q.new_zeros((insert_mask.shape[0], *q.shape[1:]))
-                padded_q[insert_mask] = q
-                q = padded_q
             return restore_pcp_local_tensor_to_padded_tokens(
                 q, local_q_indices, num_padded_local_tokens
             )
@@ -808,10 +804,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.eps,
             block_size,
         )
-        if insert_mask is not None:
-            padded_q_fp8 = q_fp8.new_zeros((insert_mask.shape[0], *q_fp8.shape[1:]))
-            padded_q_fp8[insert_mask] = q_fp8
-            q_fp8 = padded_q_fp8
         return restore_pcp_local_tensor_to_padded_tokens(
             q_fp8, local_q_indices, num_padded_local_tokens
         )
