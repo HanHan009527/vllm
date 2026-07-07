@@ -41,15 +41,13 @@ def test_pcp_slot_mapping_uses_virtual_cp_blocks_without_duplicates():
         block_size=64,
         total_cp_world_size=2,
         total_cp_rank=0,
-        cp_kv_cache_interleave_size=64,
+        cp_kv_cache_interleave_size=256,
     )
 
     valid = remapped[remapped >= 0]
-    assert valid.numel() == 196
+    assert valid.numel() == 256
     assert torch.unique(valid).numel() == valid.numel()
-    torch.testing.assert_close(valid[:64], torch.arange(64, dtype=torch.int64))
-    torch.testing.assert_close(valid[64:128], torch.arange(64, 128))
-    torch.testing.assert_close(valid[-4:], torch.arange(192, 196))
+    torch.testing.assert_close(valid, torch.arange(256, dtype=torch.int64))
 
 
 def test_overlay_pcp_restored_swa_kv_workspace_ignores_padding_rows():

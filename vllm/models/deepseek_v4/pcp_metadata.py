@@ -74,28 +74,24 @@ def pcp_slot_mapping_from_metadata_block_table(
         torch.tensor(restore_lengths, device=positions.device),
     )
     req_indices = req_indices[: positions.shape[0]]
-    virtual_block_size = block_size * total_cp_world_size
-    block_indices = torch.div(positions, virtual_block_size, rounding_mode="floor")
-    block_numbers = block_table[req_indices, block_indices].to(torch.int64)
-
-    virtual_block_offsets = positions - block_indices * virtual_block_size
-    is_local = (
-        torch.div(
-            virtual_block_offsets,
-            cp_kv_cache_interleave_size,
-            rounding_mode="floor",
-        )
-        % total_cp_world_size
-    ) == total_cp_rank
-    local_block_offsets = (
-        torch.div(
-            virtual_block_offsets,
-            total_cp_world_size * cp_kv_cache_interleave_size,
-            rounding_mode="floor",
-        )
-        * cp_kv_cache_interleave_size
-        + (virtual_block_offsets % cp_kv_cache_interleave_size)
+    stripe_indices = torch.div(
+        positions,
+        cp_kv_cache_interleave_size,
+        rounding_mode="floor",
     )
+    is_local = (stripe_indices % total_cp_world_size) == total_cp_rank
+    local_stripe_indices = torch.div(
+        stripe_indices,
+        total_cp_world_size,
+        rounding_mode="floor",
+    )
+    local_positions = (
+        local_stripe_indices * cp_kv_cache_interleave_size
+        + (positions % cp_kv_cache_interleave_size)
+    )
+    block_indices = torch.div(local_positions, block_size, rounding_mode="floor")
+    block_numbers = block_table[req_indices, block_indices].to(torch.int64)
+    local_block_offsets = local_positions % block_size
     remapped = block_numbers * block_size + local_block_offsets
     valid = (slot_mapping >= 0) & is_local
     return torch.where(valid, remapped, torch.full_like(slot_mapping, -1))
