@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import hashlib
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -66,6 +68,9 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
+_MOONCAKE_RUNTIME_REAL_DESCRIPTOR_ENV = "VLLM_MOONCAKE_RUNTIME_REAL_DESCRIPTOR_DIAG"
+_RUNTIME_REAL_DESCRIPTOR_SAMPLE_LIMIT = 16
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -93,6 +98,133 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+
+
+def _runtime_real_descriptor_diag_enabled() -> bool:
+    return os.environ.get(_MOONCAKE_RUNTIME_REAL_DESCRIPTOR_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(repr(value).encode()).hexdigest()[:16]
+
+
+def _region_debug_identity(region: TransferRegion) -> dict[str, Any]:
+    return {
+        "layer_name": region.layer_name,
+        "layer_index": region.layer_index,
+        "group_index": region.group_index,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+        "kv_block_len": region.kv_block_len,
+    }
+
+
+def _summarize_transfer_region_inputs(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+) -> dict[str, Any]:
+    def summarize(regions: list[TransferRegion]) -> dict[str, Any]:
+        signature = [
+            (
+                region.layer_name,
+                region.layer_index,
+                region.group_index,
+                region.base_addr,
+                region.block_len,
+                region.kv_block_len,
+            )
+            for region in regions
+        ]
+        return {
+            "regions": len(regions),
+            "unique_base_addrs": len({region.base_addr for region in regions}),
+            "groups": sorted({region.group_index for region in regions}),
+            "signature_hash": _stable_digest(signature),
+            "sample": [
+                _region_debug_identity(region)
+                for region in regions[:_RUNTIME_REAL_DESCRIPTOR_SAMPLE_LIMIT]
+            ],
+        }
+
+    return {
+        "local": summarize(local_regions),
+        "remote": summarize(remote_regions),
+    }
+
+
+def _summarize_block_ids(block_ids: list[int]) -> dict[str, Any]:
+    return {
+        "count": len(block_ids),
+        "head": block_ids[:4],
+        "tail": block_ids[-4:] if len(block_ids) > 4 else [],
+    }
+
+
+def _summarize_runtime_real_transfer_selection(
+    local_regions: list[TransferRegion],
+    remote_regions: list[TransferRegion],
+    local_block_ids_by_group: list[list[int]],
+    remote_block_ids_by_group: list[list[int]],
+) -> dict[str, Any]:
+    signature: list[tuple[Any, ...]] = []
+    sample: list[dict[str, Any]] = []
+    for local_region, remote_region in zip(local_regions, remote_regions):
+        group_index = local_region.group_index
+        if group_index >= len(local_block_ids_by_group):
+            continue
+        local_block_ids = local_block_ids_by_group[group_index]
+        remote_block_ids = remote_block_ids_by_group[group_index]
+        if not local_block_ids:
+            continue
+        signature.append(
+            (
+                local_region.layer_name,
+                local_region.layer_index,
+                group_index,
+                local_region.base_addr,
+                remote_region.base_addr,
+                tuple(local_block_ids),
+                tuple(remote_block_ids),
+            )
+        )
+        if len(sample) < _RUNTIME_REAL_DESCRIPTOR_SAMPLE_LIMIT:
+            sample.append(
+                {
+                    "group_index": group_index,
+                    "local": _region_debug_identity(local_region),
+                    "remote": _region_debug_identity(remote_region),
+                    "local_blocks": _summarize_block_ids(local_block_ids),
+                    "remote_blocks": _summarize_block_ids(remote_block_ids),
+                }
+            )
+    return {
+        "path": "runtime real occurrence/group",
+        "selected_regions": len(signature),
+        "signature_hash": _stable_digest(signature),
+        "sample": sample,
+    }
+
+
+def _summarize_descriptors(
+    src_ptrs: list[int],
+    dst_ptrs: list[int],
+    lengths: list[int],
+) -> dict[str, Any]:
+    descriptors = list(zip(src_ptrs, dst_ptrs, lengths))
+    return {
+        "count": len(descriptors),
+        "total_bytes": sum(lengths),
+        "signature_hash": _stable_digest(descriptors),
+        "sample": [
+            {"src": src, "dst": dst, "length": length}
+            for src, dst, length in descriptors[:_RUNTIME_REAL_DESCRIPTOR_SAMPLE_LIMIT]
+        ],
+    }
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -1520,6 +1652,7 @@ class MooncakeConnectorWorker:
                 remote_block_ids_by_group
             )
 
+            descriptor_start = len(src_ptrs)
             for local_region, remote_region in zip(local_regions, remote_regions):
                 assert local_region.group_index == remote_region.group_index, (
                     "Aligned Mooncake transfer regions must belong to the same "
@@ -1603,6 +1736,25 @@ class MooncakeConnectorWorker:
                                 + dst_region_offset
                             )
                             lengths.append(transfer_len)
+
+            if _runtime_real_descriptor_diag_enabled():
+                logger.info(
+                    "Mooncake runtime-real descriptor diagnostic for request %s: "
+                    "region_inputs=%s selected=%s descriptors=%s",
+                    d_req_id,
+                    _summarize_transfer_region_inputs(local_regions, remote_regions),
+                    _summarize_runtime_real_transfer_selection(
+                        local_regions,
+                        remote_regions,
+                        local_block_ids_by_group,
+                        remote_block_ids_by_group,
+                    ),
+                    _summarize_descriptors(
+                        src_ptrs[descriptor_start:],
+                        dst_ptrs[descriptor_start:],
+                        lengths[descriptor_start:],
+                    ),
+                )
 
             logger.debug(
                 "Sending kv_caches for request %s (%d blocks) to %s",

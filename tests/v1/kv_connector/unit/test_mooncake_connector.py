@@ -25,6 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     SendBlockMeta,
     TransferRegion,
     _align_transfer_regions,
+    _summarize_descriptors,
+    _summarize_runtime_real_transfer_selection,
+    _summarize_transfer_region_inputs,
     get_mooncake_bootstrap_addr,
     should_launch_bootstrap_server,
 )
@@ -137,6 +140,70 @@ def test_align_transfer_regions_uses_layer_name_occurrences():
     assert err is None
     assert [r.base_addr for r in aligned_local] == [0x1000, 0x1100]
     assert [r.base_addr for r in aligned_remote] == [0xB000, 0xB100]
+
+
+def test_runtime_real_descriptor_summary_marks_occurrence_group_path():
+    local_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0x1000,
+            block_len=256,
+            kv_block_len=128,
+            group_index=0,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0x1100,
+            block_len=256,
+            kv_block_len=128,
+            group_index=1,
+        ),
+    ]
+    remote_regions = [
+        TransferRegion(
+            layer_name="model.layers.0.self_attn",
+            layer_index=0,
+            base_addr=0xA000,
+            block_len=256,
+            kv_block_len=128,
+            group_index=0,
+        ),
+        TransferRegion(
+            layer_name="model.layers.1.self_attn",
+            layer_index=1,
+            base_addr=0xB000,
+            block_len=256,
+            kv_block_len=128,
+            group_index=1,
+        ),
+    ]
+    local_block_ids_by_group = [[10], [20, 21]]
+    remote_block_ids_by_group = [[30], [40]]
+
+    input_summary = _summarize_transfer_region_inputs(local_regions, remote_regions)
+    selected_summary = _summarize_runtime_real_transfer_selection(
+        local_regions,
+        remote_regions,
+        local_block_ids_by_group,
+        remote_block_ids_by_group,
+    )
+    descriptor_summary = _summarize_descriptors(
+        [0x1000 + 10 * 256, 0x1100 + 20 * 256],
+        [0xA000 + 30 * 256, 0xB000 + 40 * 256],
+        [128, 128],
+    )
+
+    assert input_summary["local"]["regions"] == 2
+    assert input_summary["local"]["unique_base_addrs"] == 2
+    assert input_summary["local"]["groups"] == [0, 1]
+    assert selected_summary["path"] == "runtime real occurrence/group"
+    assert selected_summary["selected_regions"] == 2
+    assert selected_summary["sample"][1]["group_index"] == 1
+    assert selected_summary["sample"][1]["remote_blocks"]["head"] == [40]
+    assert descriptor_summary["count"] == 2
+    assert descriptor_summary["total_bytes"] == 256
 
 
 @pytest.mark.asyncio
