@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
+from vllm.models.deepseek_v4.pcp_metadata import build_pcp_full_slot_mapping
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_cutedsl
 from vllm.v1.attention.backend import (
@@ -340,6 +341,12 @@ class DeepseekCompressor(nn.Module):
             kv, score = kv_score.split(
                 [self.coff * self.head_dim, self.coff * self.head_dim],
                 dim=-1,
+            )
+            slot_mapping = build_pcp_full_slot_mapping(
+                positions=positions,
+                req_indices=token_to_req_indices,
+                block_table=block_table,
+                block_size=block_size,
             )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim

@@ -26,6 +26,7 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.models.deepseek_v4.pcp_metadata import build_pcp_full_slot_mapping
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
@@ -685,8 +686,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             pcp_prefill_metadata.restored_swa_valid_mask = _pcp_restored_valid_mask(
                 positions, pcp_prefill_metadata.views
             )
-            # KV insert is CP-owner masked, while query rows stay intact for the
-            # PCP prefill attention output that is restored below.
+            req_indices = torch.full_like(positions, -1, dtype=torch.long)
+            query_start_loc = pcp_prefill_metadata.local_query_start_loc
+            for req_idx in range(query_start_loc.numel() - 1):
+                start = int(query_start_loc[req_idx].item())
+                end = int(query_start_loc[req_idx + 1].item())
+                req_indices[start:end] = req_idx
+            slot_mapping = build_pcp_full_slot_mapping(
+                positions=positions,
+                req_indices=req_indices,
+                block_table=swa_metadata.block_table,
+                block_size=swa_metadata.block_size,
+            )
             kv_insert_mask = slot_mapping >= 0
 
             if envs.VLLM_DSV4_NONFINITE_DIAG and self.prefix in (

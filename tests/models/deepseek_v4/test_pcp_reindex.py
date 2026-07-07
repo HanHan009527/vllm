@@ -20,6 +20,7 @@ _PCP_METADATA_SPEC.loader.exec_module(_PCP_METADATA)
 
 build_pcp_sparse_prefill_rows = _PCP_METADATA.build_pcp_sparse_prefill_rows
 build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
+build_pcp_full_slot_mapping = _PCP_METADATA.build_pcp_full_slot_mapping
 compact_pcp_sparse_indices = _PCP_METADATA.compact_pcp_sparse_indices
 overlay_pcp_restored_swa_kv_workspace = (
     _PCP_METADATA.overlay_pcp_restored_swa_kv_workspace
@@ -45,6 +46,28 @@ def test_compact_pcp_sparse_indices_removes_sentinels_from_valid_prefix():
     torch.testing.assert_close(
         new_lengths,
         torch.tensor([2, 2, 2], dtype=torch.int32),
+    )
+
+
+def test_build_pcp_full_slot_mapping_uses_restored_positions():
+    block_table = torch.tensor(
+        [
+            [4, 7, -1],
+            [9, 10, 11],
+        ],
+        dtype=torch.int32,
+    )
+
+    slot_mapping = build_pcp_full_slot_mapping(
+        positions=torch.tensor([0, 31, 32, 63, 64, 0], dtype=torch.int64),
+        req_indices=torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.int64),
+        block_table=block_table,
+        block_size=32,
+    )
+
+    torch.testing.assert_close(
+        slot_mapping,
+        torch.tensor([128, 159, 224, 319, 352, -1], dtype=torch.int64),
     )
 
 

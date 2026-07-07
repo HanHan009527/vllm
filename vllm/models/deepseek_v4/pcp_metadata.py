@@ -55,6 +55,49 @@ class DeepseekV4PcpPrefillMetadata:
     restored_swa_valid_mask: torch.Tensor | None = None
 
 
+def build_pcp_full_slot_mapping(
+    *,
+    positions: torch.Tensor,
+    req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Map restored PCP positions to physical cache slots for every valid row."""
+    if positions.numel() == 0:
+        return torch.empty_like(positions, dtype=torch.long)
+
+    req_indices = req_indices[: positions.numel()].to(
+        device=positions.device, dtype=torch.long
+    )
+    positions_long = positions.to(dtype=torch.long)
+    slot_mapping = torch.full_like(positions_long, -1)
+
+    valid = (positions_long >= 0) & (req_indices >= 0)
+    if not valid.any():
+        return slot_mapping
+
+    block_indices = positions_long // block_size
+    block_offsets = positions_long % block_size
+    valid &= block_indices < block_table.shape[1]
+    valid &= req_indices < block_table.shape[0]
+    if not valid.any():
+        return slot_mapping
+
+    valid_req_indices = req_indices[valid]
+    valid_block_indices = block_indices[valid]
+    physical_blocks = block_table[valid_req_indices, valid_block_indices].to(
+        dtype=torch.long
+    )
+    valid_physical = physical_blocks >= 0
+    if valid_physical.any():
+        valid_slots = physical_blocks[valid_physical] * block_size + block_offsets[
+            valid
+        ][valid_physical]
+        valid_positions = torch.nonzero(valid, as_tuple=False).flatten()[valid_physical]
+        slot_mapping[valid_positions] = valid_slots
+    return slot_mapping
+
+
 def compact_pcp_sparse_indices(
     indices: torch.Tensor,
     lengths: torch.Tensor,
