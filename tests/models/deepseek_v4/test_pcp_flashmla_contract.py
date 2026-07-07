@@ -66,10 +66,26 @@ def test_attention_pcp_insert_remaps_slots_from_metadata_block_table():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" /
               "attention.py").read_text()
 
-    assert "def _pcp_slot_mapping_from_metadata_block_table(" in source
+    assert "pcp_slot_mapping_from_metadata_block_table(" in source
     assert "block_table=swa_metadata.block_table" in source
     assert "restore_lengths = [" in source
     assert "slot_mapping=slot_mapping" in source
+    assert "total_cp_world_size=self.pcp_world_size" in source
+    assert "total_cp_rank=self.pcp_rank" in source
+    assert (
+        "cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size"
+        in source
+    )
+
+
+def test_flashmla_pcp_prefill_overlays_restored_dense_kv_workspace():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
+              "flashmla.py").read_text()
+
+    assert "overlay_pcp_restored_swa_kv_workspace(" in source
+    assert "pcp_metadata.restored_swa_kv" in source
+    assert "pcp_metadata.restored_swa_positions" in source
+    assert "pcp_metadata.restored_swa_valid_mask" in source
 
 
 def test_flashinfer_pcp_prefill_fails_closed_without_metadata():

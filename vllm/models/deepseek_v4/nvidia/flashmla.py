@@ -22,6 +22,7 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.models.deepseek_v4.pcp_metadata import (
     build_pcp_sparse_prefill_rows,
     build_pcp_swa_prefill_segments,
+    overlay_pcp_restored_swa_kv_workspace,
     pcp_swa_torch_sparse_fwd,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
@@ -649,6 +650,25 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 offset=chunk_N,
                 force_triton=is_pcp_prefill,
             )
+            if is_pcp_prefill:
+                assert swa_metadata.pcp_prefill_metadata is not None
+                pcp_metadata = swa_metadata.pcp_prefill_metadata
+                assert pcp_metadata.restored_swa_kv is not None
+                assert pcp_metadata.restored_swa_positions is not None
+                assert pcp_metadata.restored_swa_valid_mask is not None
+                overlay_pcp_restored_swa_kv_workspace(
+                    out=kv[:chunk_size],
+                    restored_kv=pcp_metadata.restored_swa_kv,
+                    restored_positions=pcp_metadata.restored_swa_positions,
+                    restored_valid_mask=pcp_metadata.restored_swa_valid_mask,
+                    views=pcp_metadata.views,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    seq_lens=seq_lens[chunk_start:chunk_end],
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    chunk_n=chunk_N,
+                    chunk_m=chunk_M,
+                )
             pcp_diag_layer = self.prefix in (
                 "model.layers.0.attn",
                 "model.layers.2.attn",

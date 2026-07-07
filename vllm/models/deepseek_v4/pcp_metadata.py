@@ -50,6 +50,99 @@ class DeepseekV4PcpPrefillMetadata:
     debug_global_positions: torch.Tensor | None
     sparse_rows: DeepseekV4PcpSparseRows | None = None
     swa_segments: list[DeepseekV4PcpSwaSegment] | None = None
+    restored_swa_kv: torch.Tensor | None = None
+    restored_swa_positions: torch.Tensor | None = None
+    restored_swa_valid_mask: torch.Tensor | None = None
+
+
+def pcp_slot_mapping_from_metadata_block_table(
+    *,
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    restore_lengths: list[int],
+    block_size: int,
+    total_cp_world_size: int,
+    total_cp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> torch.Tensor:
+    """Map restored global PCP positions into this rank's CP-local cache slots."""
+    if not restore_lengths:
+        return slot_mapping
+    req_indices = torch.repeat_interleave(
+        torch.arange(len(restore_lengths), device=positions.device),
+        torch.tensor(restore_lengths, device=positions.device),
+    )
+    req_indices = req_indices[: positions.shape[0]]
+    virtual_block_size = block_size * total_cp_world_size
+    block_indices = torch.div(positions, virtual_block_size, rounding_mode="floor")
+    block_numbers = block_table[req_indices, block_indices].to(torch.int64)
+
+    virtual_block_offsets = positions - block_indices * virtual_block_size
+    is_local = (
+        torch.div(
+            virtual_block_offsets,
+            cp_kv_cache_interleave_size,
+            rounding_mode="floor",
+        )
+        % total_cp_world_size
+    ) == total_cp_rank
+    local_block_offsets = (
+        torch.div(
+            virtual_block_offsets,
+            total_cp_world_size * cp_kv_cache_interleave_size,
+            rounding_mode="floor",
+        )
+        * cp_kv_cache_interleave_size
+        + (virtual_block_offsets % cp_kv_cache_interleave_size)
+    )
+    remapped = block_numbers * block_size + local_block_offsets
+    valid = (slot_mapping >= 0) & is_local
+    return torch.where(valid, remapped, torch.full_like(slot_mapping, -1))
+
+
+def overlay_pcp_restored_swa_kv_workspace(
+    *,
+    out: torch.Tensor,
+    restored_kv: torch.Tensor,
+    restored_positions: torch.Tensor,
+    restored_valid_mask: torch.Tensor,
+    views: list[PCPInterleaveRequestView],
+    chunk_start: int,
+    chunk_end: int,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    chunk_n: int,
+    chunk_m: int,
+) -> None:
+    """Overlay all-gather restored current-step SWA KV into a dense workspace."""
+    if chunk_start >= chunk_end:
+        return
+
+    flat_out = out.view(-1, out.shape[-1])
+    row_start = sum(int(view.restore_idx.numel()) for view in views[:chunk_start])
+    for req_offset, req_idx in enumerate(range(chunk_start, chunk_end)):
+        view = views[req_idx]
+        row_end = row_start + int(view.restore_idx.numel())
+        req_positions = restored_positions[row_start:row_end].to(torch.long)
+        req_valid = restored_valid_mask[row_start:row_end].to(torch.bool)
+        req_kv = restored_kv[row_start:row_end]
+
+        seq_len = int(seq_lens[req_offset].item())
+        gather_len = int(gather_lens[req_offset].item())
+        gather_start = seq_len - gather_len
+        req_valid = req_valid & (req_positions >= gather_start) & (
+            req_positions < seq_len
+        )
+        if req_valid.any():
+            valid_positions = req_positions[req_valid]
+            valid_kv = req_kv[req_valid]
+            target_rows = (
+                req_offset * chunk_m + chunk_n + valid_positions - gather_start
+            )
+            flat_out.index_copy_(0, target_rows.to(torch.long), valid_kv)
+
+        row_start = row_end
 
 
 def pcp_swa_torch_sparse_fwd(

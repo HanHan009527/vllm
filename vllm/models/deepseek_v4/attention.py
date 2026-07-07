@@ -26,6 +26,9 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.models.deepseek_v4.pcp_metadata import (
+    pcp_slot_mapping_from_metadata_block_table,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -73,28 +76,6 @@ def _finite_amax_for_diag(tensor: torch.Tensor) -> float:
     if not finite.any():
         return float("nan")
     return float(torch.amax(torch.abs(tensor[finite].float())).item())
-
-
-def _pcp_slot_mapping_from_metadata_block_table(
-    *,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    restore_lengths: list[int],
-    block_size: int,
-) -> torch.Tensor:
-    if not restore_lengths:
-        return slot_mapping
-    req_indices = torch.repeat_interleave(
-        torch.arange(len(restore_lengths), device=positions.device),
-        torch.tensor(restore_lengths, device=positions.device),
-    )
-    req_indices = req_indices[: positions.shape[0]]
-    block_indices = torch.div(positions, block_size, rounding_mode="floor")
-    block_offsets = positions % block_size
-    physical_blocks = block_table[req_indices, block_indices]
-    remapped = physical_blocks.to(torch.int64) * block_size + block_offsets
-    return torch.where(slot_mapping >= 0, remapped, slot_mapping)
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -316,6 +297,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.pcp_rank = 0
         if self.pcp_world_size > 1:
             self.pcp_rank = get_pcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
@@ -685,16 +669,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         insert_mask = None
         if local_q_indices is not None:
             assert swa_metadata.pcp_prefill_metadata is not None
+            pcp_prefill_metadata = swa_metadata.pcp_prefill_metadata
+            restored_valid_mask = slot_mapping >= 0
+            pcp_prefill_metadata.restored_swa_kv = kv
+            pcp_prefill_metadata.restored_swa_positions = positions
+            pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
             restore_lengths = [
                 int(view.restore_idx.numel())
-                for view in swa_metadata.pcp_prefill_metadata.views
+                for view in pcp_prefill_metadata.views
             ]
-            slot_mapping = _pcp_slot_mapping_from_metadata_block_table(
+            slot_mapping = pcp_slot_mapping_from_metadata_block_table(
                 slot_mapping=slot_mapping,
                 positions=positions,
                 block_table=swa_metadata.block_table,
                 restore_lengths=restore_lengths,
                 block_size=swa_storage_block_size,
+                total_cp_world_size=self.pcp_world_size,
+                total_cp_rank=self.pcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
             # PCP all-gather/restore includes padding rows so every rank has a
             # uniform input shape. The fused KV insert kernels only support real
