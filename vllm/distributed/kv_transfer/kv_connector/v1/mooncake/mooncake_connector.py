@@ -1821,31 +1821,16 @@ class MooncakeConnectorWorker:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
             num_external_tokens = agent_meta.req_num_tokens.get(d_req_id)
             external_start_token = agent_meta.req_start_tokens.get(d_req_id, 0)
-            remote_block_token_counts_per_group = (
-                _remote_block_token_counts_for_pcp_rank(
-                    remote_block_ids_per_group,
-                    num_external_tokens=num_external_tokens,
-                    pcp_size=getattr(self, "pcp_size", 1),
-                    pcp_rank=getattr(self, "pcp_rank", 0),
-                    block_size=getattr(
-                        self, "kv_manager_block_size", getattr(self, "block_size", 1)
-                    ),
-                    cp_kv_cache_interleave_size=getattr(
-                        self, "cp_kv_cache_interleave_size", 1
-                    ),
-                    start_token=external_start_token,
-                )
-            )
-            remote_block_ids_per_group = _filter_remote_block_ids_for_pcp_rank(
+            # DeepSeek V4 prefill PCP restores and writes the full request KV
+            # cache on every PCP worker before Mooncake export. Keep the decode
+            # destination block list intact; filtering by pcp_rank would make
+            # each replicated sender transfer only a subset of the blocks.
+            remote_block_token_counts_per_group = _remote_block_token_counts(
                 remote_block_ids_per_group,
-                pcp_size=getattr(self, "pcp_size", 1),
-                pcp_rank=getattr(self, "pcp_rank", 0),
                 block_size=getattr(
                     self, "kv_manager_block_size", getattr(self, "block_size", 1)
                 ),
-                cp_kv_cache_interleave_size=getattr(
-                    self, "cp_kv_cache_interleave_size", 1
-                ),
+                num_external_tokens=num_external_tokens,
                 start_token=external_start_token,
             )
             logger.debug(
