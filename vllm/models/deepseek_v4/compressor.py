@@ -380,14 +380,15 @@ class DeepseekCompressor(nn.Module):
             k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
             k_cache_layer = self._static_forward_context[self.k_cache_prefix]
             kv_cache = k_cache_layer.kv_cache
-            k_cache_slot_mapping = build_pcp_compressed_slot_mapping(
-                positions=positions,
-                req_indices=restored_req_indices,
-                block_table=k_cache_metadata.block_table,
-                block_size=int(kv_cache.shape[1]),
-                compress_ratio=self.compress_ratio,
-                valid_mask=restored_valid_mask,
-            )
+            if hasattr(k_cache_metadata, "block_table"):
+                k_cache_slot_mapping = build_pcp_compressed_slot_mapping(
+                    positions=positions,
+                    req_indices=restored_req_indices,
+                    block_table=k_cache_metadata.block_table,
+                    block_size=int(kv_cache.shape[1]),
+                    compress_ratio=self.compress_ratio,
+                    valid_mask=restored_valid_mask,
+                )
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
