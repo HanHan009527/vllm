@@ -26,10 +26,6 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_q_kv_rmsnorm,
 )
-from vllm.models.deepseek_v4.pcp_metadata import (
-    pcp_slot_mapping_from_metadata_block_table,
-)
-
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
@@ -674,23 +670,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             pcp_prefill_metadata.restored_swa_kv = kv
             pcp_prefill_metadata.restored_swa_positions = positions
             pcp_prefill_metadata.restored_swa_valid_mask = restored_valid_mask
-            restore_lengths = [
-                int(view.restore_idx.numel())
-                for view in pcp_prefill_metadata.views
-            ]
-            slot_mapping = pcp_slot_mapping_from_metadata_block_table(
-                slot_mapping=slot_mapping,
-                positions=positions,
-                block_table=swa_metadata.block_table,
-                restore_lengths=restore_lengths,
-                block_size=swa_storage_block_size,
-                total_cp_world_size=self.pcp_world_size,
-                total_cp_rank=self.pcp_rank,
-                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
-            )
-            # PCP all-gather/restore includes padding rows so every rank has a
-            # uniform input shape. The fused KV insert kernels only support real
-            # cache slots; passing -1 padding slots can corrupt valid tail rows.
+            # Preserve the metadata slot mapping as the global KV write identity.
+            # FlashMLA PCP prefill reads the restored dense workspace for the
+            # current step; Mooncake/decode still relies on the original slot
+            # mapping to receive the same KV rows that the scheduler assigned.
+            # Only padding rows from the all-gather/restore buffer are filtered.
             insert_mask = slot_mapping >= 0
             q = q[insert_mask]
             kv = kv[insert_mask]

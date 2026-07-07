@@ -62,20 +62,19 @@ def test_attention_pcp_fp8_insert_uses_storage_block_size():
     )
 
 
-def test_attention_pcp_insert_remaps_slots_from_metadata_block_table():
+def test_attention_pcp_insert_preserves_metadata_slot_identity():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" /
               "attention.py").read_text()
 
-    assert "pcp_slot_mapping_from_metadata_block_table(" in source
-    assert "block_table=swa_metadata.block_table" in source
-    assert "restore_lengths = [" in source
-    assert "slot_mapping=slot_mapping" in source
-    assert "total_cp_world_size=self.pcp_world_size" in source
-    assert "total_cp_rank=self.pcp_rank" in source
     assert (
-        "cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size"
+        "Preserve the metadata slot mapping as the global KV write identity"
         in source
     )
+    assert "pcp_slot_mapping_from_metadata_block_table" not in source
+    assert "block_table=swa_metadata.block_table" not in source
+    assert "total_cp_rank=self.pcp_rank" not in source
+    assert "insert_mask = slot_mapping >= 0" in source
+    assert "slot_mapping = slot_mapping[insert_mask]" in source
 
 
 def test_flashmla_pcp_prefill_overlays_restored_dense_kv_workspace():

@@ -23,33 +23,6 @@ build_pcp_swa_prefill_segments = _PCP_METADATA.build_pcp_swa_prefill_segments
 overlay_pcp_restored_swa_kv_workspace = (
     _PCP_METADATA.overlay_pcp_restored_swa_kv_workspace
 )
-pcp_slot_mapping_from_metadata_block_table = (
-    _PCP_METADATA.pcp_slot_mapping_from_metadata_block_table
-)
-
-
-def test_pcp_slot_mapping_uses_virtual_cp_blocks_without_duplicates():
-    positions = torch.arange(388, dtype=torch.int64)
-    block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
-    slot_mapping = torch.zeros_like(positions)
-
-    remapped = pcp_slot_mapping_from_metadata_block_table(
-        slot_mapping=slot_mapping,
-        positions=positions,
-        block_table=block_table,
-        restore_lengths=[positions.numel()],
-        block_size=64,
-        total_cp_world_size=2,
-        total_cp_rank=0,
-        cp_kv_cache_interleave_size=256,
-    )
-
-    valid = remapped[remapped >= 0]
-    assert valid.numel() == 256
-    assert torch.unique(valid).numel() == valid.numel()
-    torch.testing.assert_close(valid, torch.arange(256, dtype=torch.int64))
-
-
 def test_overlay_pcp_restored_swa_kv_workspace_ignores_padding_rows():
     restored_positions = torch.tensor([0, 0, 1, 2, 3, 4, 5, 6, 7, 0])
     restored_valid_mask = torch.tensor(

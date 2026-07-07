@@ -55,48 +55,6 @@ class DeepseekV4PcpPrefillMetadata:
     restored_swa_valid_mask: torch.Tensor | None = None
 
 
-def pcp_slot_mapping_from_metadata_block_table(
-    *,
-    slot_mapping: torch.Tensor,
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    restore_lengths: list[int],
-    block_size: int,
-    total_cp_world_size: int,
-    total_cp_rank: int,
-    cp_kv_cache_interleave_size: int,
-) -> torch.Tensor:
-    """Map restored global PCP positions into this rank's CP-local cache slots."""
-    if not restore_lengths:
-        return slot_mapping
-    req_indices = torch.repeat_interleave(
-        torch.arange(len(restore_lengths), device=positions.device),
-        torch.tensor(restore_lengths, device=positions.device),
-    )
-    req_indices = req_indices[: positions.shape[0]]
-    stripe_indices = torch.div(
-        positions,
-        cp_kv_cache_interleave_size,
-        rounding_mode="floor",
-    )
-    is_local = (stripe_indices % total_cp_world_size) == total_cp_rank
-    local_stripe_indices = torch.div(
-        stripe_indices,
-        total_cp_world_size,
-        rounding_mode="floor",
-    )
-    local_positions = (
-        local_stripe_indices * cp_kv_cache_interleave_size
-        + (positions % cp_kv_cache_interleave_size)
-    )
-    block_indices = torch.div(local_positions, block_size, rounding_mode="floor")
-    block_numbers = block_table[req_indices, block_indices].to(torch.int64)
-    local_block_offsets = local_positions % block_size
-    remapped = block_numbers * block_size + local_block_offsets
-    valid = (slot_mapping >= 0) & is_local
-    return torch.where(valid, remapped, torch.full_like(slot_mapping, -1))
-
-
 def overlay_pcp_restored_swa_kv_workspace(
     *,
     out: torch.Tensor,
