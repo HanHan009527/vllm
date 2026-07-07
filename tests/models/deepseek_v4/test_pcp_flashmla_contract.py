@@ -103,6 +103,18 @@ def test_pcp_overlay_uses_roped_kv_after_insert():
     assert "pcp_prefill_metadata.restored_swa_kv = kv_roped" in source
 
 
+def test_compressor_pcp_updates_num_actual_after_restore():
+    source = (_VLLM_ROOT / "models" / "deepseek_v4" /
+              "compressor.py").read_text()
+
+    pcp_branch = source.split(
+        "if state_metadata.pcp_allgather_restore_idx is not None:", 1
+    )[1].split("# [num_blocks, block_size, kv_dim+score_dim]", 1)[0]
+
+    assert "slot_mapping = build_pcp_full_slot_mapping(" in pcp_branch
+    assert "num_actual = slot_mapping.shape[0]" in pcp_branch
+
+
 def test_flashmla_pcp_prefill_overlays_restored_dense_kv_workspace():
     source = (_VLLM_ROOT / "models" / "deepseek_v4" / "nvidia" /
               "flashmla.py").read_text()

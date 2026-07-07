@@ -377,6 +377,7 @@ class DeepseekCompressor(nn.Module):
                 block_size=block_size,
                 valid_mask=restored_valid_mask,
             )
+            num_actual = slot_mapping.shape[0]
             k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
             k_cache_layer = self._static_forward_context[self.k_cache_prefix]
             kv_cache = k_cache_layer.kv_cache
