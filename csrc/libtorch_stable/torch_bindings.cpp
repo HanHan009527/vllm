@@ -706,6 +706,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("top_k_per_row_prefill", TORCH_BOX(&top_k_per_row_prefill));
   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
+  ops.impl("persistent_topk_with_page_table",
+           TORCH_BOX(&persistent_topk_with_page_table));
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
 #endif
