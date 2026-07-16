@@ -66,6 +66,17 @@ from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
 
+
+def _summarize_block_groups(block_ids: Any, limit: int = 8) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for group in block_ids or []:
+        values = list(group)
+        item: dict[str, Any] = {"len": len(values), "head": values[:limit]}
+        if len(values) > limit:
+            item["tail"] = values[-limit:]
+        summary.append(item)
+    return summary
+
 try:
     from mooncake.engine import TransferEngine
 except ImportError:
@@ -662,6 +673,8 @@ def _select_region_block_ids(
 ) -> tuple[list[int], list[int], str | None]:
     local_block_ids: list[int] = []
     remote_block_ids: list[int] = []
+    skipped_remote_only_groups: list[int] = []
+    allow_remote_only_skip = len(group_indices) > 1
 
     for group_idx in group_indices:
         local_group = local_block_ids_per_group[group_idx]
@@ -670,12 +683,22 @@ def _select_region_block_ids(
         n_remote = len(remote_group)
         if n_remote == 0:
             continue
+        if n_local == 0 and allow_remote_only_skip:
+            skipped_remote_only_groups.append(group_idx)
+            continue
         if n_local < n_remote:
             return [], [], "P num blocks less than D"
         if n_local > n_remote:
             local_group = local_group[-n_remote:]
         local_block_ids.extend(local_group)
         remote_block_ids.extend(remote_group)
+
+    if skipped_remote_only_groups:
+        logger.debug(
+            "Skipping remote-only KV groups %s for producer-owned groups %s",
+            skipped_remote_only_groups,
+            group_indices,
+        )
 
     return local_block_ids, remote_block_ids, None
 
@@ -1806,7 +1829,6 @@ class MooncakeConnectorWorker:
             # reused for every registered region.
             local_block_ids_by_group: list[list[int]] = []
             remote_block_ids_by_group: list[list[int]] = []
-            has_block_error = False
             group_specs = self.kv_cache_config.kv_cache_groups
             for group_index, (local_group, remote_group) in enumerate(
                 zip(send_meta.local_block_ids, remote_block_ids_per_group)
@@ -1833,27 +1855,28 @@ class MooncakeConnectorWorker:
                 n_local = len(local_group)
                 n_remote = len(remote_group)
                 if n_local < n_remote:
-                    logger.error(
-                        "req %s: local blocks(%d) < remote blocks(%d) "
-                        "in a KV cache group (is_mamba_group=%s)",
+                    spec_name = type(group_specs[group_index].kv_cache_spec).__name__
+                    logger.debug(
+                        "req %s: deferring local blocks(%d) < remote blocks(%d) "
+                        "check for KV cache group index=%d spec=%s "
+                        "(is_mamba_group=%s), p_req_id=%s transfer_id=%s "
+                        "local_groups=%s remote_groups=%s",
                         d_req_id,
                         n_local,
                         n_remote,
+                        group_index,
+                        spec_name,
                         is_mamba_group,
+                        send_meta.p_req_id,
+                        send_meta.transfer_id,
+                        _summarize_block_groups(send_meta.local_block_ids),
+                        _summarize_block_groups(remote_block_ids_per_group),
                     )
-                    has_block_error = True
-                    break
                 elif n_local > n_remote:
                     # Partial prefix cache hit: just read uncomputed blocks.
                     local_group = local_group[-n_remote:] if n_remote > 0 else []
                 local_block_ids_by_group.append(local_group)
                 remote_block_ids_by_group.append(remote_group)
-
-            if has_block_error:
-                err_reqs.append(d_req_id)
-                if err_msg is None:
-                    err_msg = "P num blocks less than D"
-                continue
 
             if not any(local_block_ids_by_group):
                 continue
@@ -1887,9 +1910,12 @@ class MooncakeConnectorWorker:
                 )
                 if select_err is not None:
                     logger.error(
-                        "req %s: local blocks < remote blocks for KV groups %s",
+                        "req %s: local blocks < remote blocks for KV groups %s, "
+                        "local_groups=%s remote_groups=%s",
                         d_req_id,
                         region_group_indices,
+                        _summarize_block_groups(local_block_ids_by_group),
+                        _summarize_block_groups(remote_block_ids_by_group),
                     )
                     err_reqs.append(d_req_id)
                     if err_msg is None:
