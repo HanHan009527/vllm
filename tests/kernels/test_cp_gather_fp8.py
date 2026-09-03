@@ -857,12 +857,38 @@ def test_pcp_dual_chunk_fp8_context_suffix_merge(monkeypatch, seq_len, pcp_rank)
         dequantized_global[:, NOPE_DIM:].unsqueeze(1),
     )
     fresh_key, fresh_value = _project_test_latents(global_kv_c, global_k_pe)
+    suffix_references = []
+    suffix_lse_references = []
+    context_references = []
+    context_lse_references = []
     mixed_outputs = []
     mixed_lses = []
     full_bf16_outputs = []
     for segment in segments:
         segment_start = segment.global_batch_slice.start
         for position in range(segment_start, segment.global_batch_slice.stop):
+            suffix_reference, suffix_lse_reference = _attention_reference(
+                global_query[position],
+                fresh_key[segment_start : position + 1],
+                fresh_value[segment_start : position + 1],
+                scale,
+            )
+            suffix_references.append(suffix_reference)
+            suffix_lse_references.append(suffix_lse_reference)
+            if segment_start:
+                context_reference, context_lse_reference = _attention_reference(
+                    global_query[position],
+                    cached_key[:segment_start],
+                    cached_value[:segment_start],
+                    scale,
+                )
+            else:
+                context_reference = torch.zeros_like(suffix_reference)
+                context_lse_reference = torch.full_like(
+                    suffix_lse_reference, float("-inf")
+                )
+            context_references.append(context_reference)
+            context_lse_references.append(context_lse_reference)
             mixed_key = torch.cat(
                 (cached_key[:segment_start], fresh_key[segment_start : position + 1])
             )
@@ -885,9 +911,27 @@ def test_pcp_dual_chunk_fp8_context_suffix_merge(monkeypatch, seq_len, pcp_rank)
             mixed_lses.append(mixed_lse)
             full_bf16_outputs.append(full_output)
 
+    suffix_reference = torch.stack(suffix_references)
+    suffix_lse_reference = torch.stack(suffix_lse_references, dim=1)
+    context_reference = torch.stack(context_references)
+    context_lse_reference = torch.stack(context_lse_references, dim=1)
     mixed_reference = torch.stack(mixed_outputs)
     mixed_lse_reference = torch.stack(mixed_lses, dim=1)
     full_bf16_reference = torch.stack(full_bf16_outputs)
+    torch.testing.assert_close(
+        suffix_output[..., :V_HEAD_DIM].float(),
+        suffix_reference,
+        atol=3e-2,
+        rtol=3e-2,
+    )
+    torch.testing.assert_close(suffix_lse, suffix_lse_reference, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        context_output[..., :V_HEAD_DIM].float(),
+        context_reference,
+        atol=3e-2,
+        rtol=3e-2,
+    )
+    torch.testing.assert_close(context_lse, context_lse_reference, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(output.float(), mixed_reference, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(output_lse, mixed_lse_reference, atol=2e-2, rtol=2e-2)
 
