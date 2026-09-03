@@ -820,6 +820,37 @@ def test_pcp_dual_chunk_fp8_context_suffix_merge(monkeypatch, seq_len, pcp_rank)
             k=context_key,
             v=context_value,
         )
+        chunk_outputs = []
+        chunk_lses = []
+        for query_idx in range(chunk.token_slice.start, chunk.token_slice.stop):
+            chunk_query_idx = query_idx - chunk.token_slice.start
+            chunk_request_idx = int(
+                torch.searchsorted(
+                    chunk.query_start_loc[1:], chunk_query_idx, right=True
+                ).item()
+            )
+            request_idx = chunk.request_slice.start + chunk_request_idx
+            context_start = int(chunk.starts[chunk_request_idx])
+            context_len = int(chunk.seq_lens[chunk_request_idx])
+            context_base = int(chunk.cu_seq_lens[chunk_request_idx])
+            query_output, query_lse = _attention_reference(
+                local_query[query_idx],
+                context_key[context_base : context_base + context_len],
+                context_value[context_base : context_base + context_len],
+                scale,
+            )
+            assert context_start + context_len <= context_lens_cpu[request_idx]
+            chunk_outputs.append(query_output)
+            chunk_lses.append(query_lse)
+        torch.testing.assert_close(
+            chunk_output[..., :V_HEAD_DIM].float(),
+            torch.stack(chunk_outputs),
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(
+            chunk_lse, torch.stack(chunk_lses, dim=1), atol=2e-2, rtol=2e-2
+        )
         if context_output is None:
             context_output, context_lse = init_mla_context_partial(
                 chunked_context,
