@@ -71,6 +71,10 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
 
 class _TestAttentionBackend:
     @staticmethod
+    def get_name() -> str:
+        return "TEST"
+
+    @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         return [16]
 
