@@ -111,6 +111,67 @@ def test_merge_attn_states_both_empty(merge_fn, output_dtype) -> None:
     assert not output.isnan().any()
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA kernel regression")
+@torch.inference_mode()
+def test_merge_attn_states_native_strided_output_lse() -> None:
+    """The native kernel must honor an output LSE view's strides."""
+    torch.manual_seed(0)
+    num_tokens, num_heads, head_size = 4, 3, 128
+    prefix_output = torch.randn(
+        num_tokens, num_heads, head_size, device=DEVICE, dtype=torch.bfloat16
+    )
+    suffix_output = torch.randn_like(prefix_output)
+    prefix_lse = torch.randn(num_heads, num_tokens, device=DEVICE)
+    suffix_lse = torch.randn_like(prefix_lse)
+
+    expected_output = torch.empty_like(prefix_output)
+    expected_lse = torch.empty_like(prefix_lse)
+    expected_output, expected_lse = merge_attn_states_torch(
+        expected_output,
+        prefix_output,
+        prefix_lse.clone(),
+        suffix_output,
+        suffix_lse.clone(),
+        expected_lse,
+    )
+
+    lse_offset = 2
+    lse_parent = torch.full(
+        (num_heads, num_tokens + 2 * lse_offset),
+        12345.0,
+        device=DEVICE,
+    )
+    lse_parent_before = lse_parent.clone()
+    output_lse = lse_parent[:, lse_offset : lse_offset + num_tokens]
+    assert output_lse.storage_offset() == lse_offset
+    assert output_lse.stride() == (num_tokens + 2 * lse_offset, 1)
+
+    output = torch.empty_like(prefix_output)
+    merge_attn_states_native(
+        output,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        output_lse,
+    )
+
+    torch.testing.assert_close(output, expected_output, atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(output_lse, expected_lse, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        lse_parent[:, :lse_offset],
+        lse_parent_before[:, :lse_offset],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        lse_parent[:, lse_offset + num_tokens :],
+        lse_parent_before[:, lse_offset + num_tokens :],
+        atol=0,
+        rtol=0,
+    )
+
+
 def generate_markdown_table():
     global all_case_info
     table_header = (
