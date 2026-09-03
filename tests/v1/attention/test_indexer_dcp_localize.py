@@ -708,9 +708,7 @@ def test_sparse_prefill_pcp_dual_chunk_metadata_uses_global_causal_bounds(
 
             expected_k_starts.extend([gathered_k_row_start] * query_len)
             expected_k_ends.extend(
-                gathered_k_row_start
-                + global_pos
-                + 1
+                gathered_k_row_start + global_pos + 1
                 for global_pos in range(
                     segment.global_batch_slice.start,
                     segment.global_batch_slice.stop,
@@ -724,9 +722,7 @@ def test_sparse_prefill_pcp_dual_chunk_metadata_uses_global_causal_bounds(
         assert chunk.total_seq_lens == gathered_k_row_start
         torch.testing.assert_close(
             chunk.cu_seq_lens.cpu(),
-            torch.tensor(
-                [0, *np.cumsum(seq_lens_cpu.tolist())], dtype=torch.int32
-            ),
+            torch.tensor([0, *np.cumsum(seq_lens_cpu.tolist())], dtype=torch.int32),
         )
         torch.testing.assert_close(
             chunk.cu_seqlen_ks.cpu(),
