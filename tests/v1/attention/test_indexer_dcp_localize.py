@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -13,6 +14,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 
 def _local_count(length: int, rank: int, world: int, interleave: int) -> int:
@@ -639,6 +641,105 @@ def test_sparse_prefill_dcp_metadata_localizes_causal_bounds():
         chunk.cu_seqlen_ke.cpu(),
         torch.tensor([1, 2, 2, 2, 2, 2, 2, 2], dtype=torch.int32),
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("seq_len", [7, 8, 8192])
+def test_sparse_prefill_pcp_dual_chunk_metadata_uses_global_causal_bounds(
+    seq_len: int,
+):
+    """PCP virtual rows must retain their global causal extent.
+
+    DualChunkSwap turns one request into two virtual rows per PCP rank.  The
+    suffix row is deliberately ordered before the pure-prefix row on rank 0,
+    so using local row lengths or offsets as sequence lengths would silently
+    shorten its visible context.
+    """
+    device = torch.device("cuda")
+    manager = PCPManager(pcp_world_size=2, pcp_rank=0, device=device)
+    segments_by_rank, _ = manager._build_batch_layout(
+        num_scheduled_tokens=np.array([seq_len], dtype=np.int32),
+        num_computed_tokens=np.zeros(1, dtype=np.int32),
+        is_prefilling=np.ones(1, dtype=np.bool_),
+        query_start_loc_np=np.array([0, seq_len], dtype=np.int32),
+    )
+
+    for segments in segments_by_rank:
+        query_lens = [segment.num_tokens for segment in segments]
+        query_start_loc_cpu = torch.tensor(
+            [0, *np.cumsum(query_lens)], dtype=torch.int32
+        )
+        query_start_loc = query_start_loc_cpu.to(device)
+
+        # partition_batch() produces exactly these virtual-row sequence lengths:
+        # local start position + local query length == global chunk end.
+        seq_lens_cpu = torch.tensor(
+            [segment.global_batch_slice.stop for segment in segments],
+            dtype=torch.int32,
+        )
+        seq_lens = seq_lens_cpu.to(device)
+        block_table = torch.arange(
+            len(segments), dtype=torch.int32, device=device
+        ).unsqueeze(1)
+
+        chunk = build_prefill_chunk_metadata(
+            start_idx=0,
+            end_idx=len(segments),
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            uncompressed_seq_lens=seq_lens,
+            compressed_seq_lens=seq_lens,
+            compressed_seq_lens_cpu=seq_lens_cpu,
+            block_table=block_table,
+            compress_ratio=1,
+        )
+        assert chunk is not None
+        torch.accelerator.synchronize()
+
+        expected_k_starts = []
+        expected_k_ends = []
+        expected_token_to_seq = []
+        gathered_k_row_start = 0
+        for row_idx, segment in enumerate(segments):
+            query_len = segment.num_tokens
+            row_seq_len = segment.global_batch_slice.stop
+            start_pos = row_seq_len - query_len
+            assert start_pos == segment.global_batch_slice.start
+
+            expected_k_starts.extend([gathered_k_row_start] * query_len)
+            expected_k_ends.extend(
+                gathered_k_row_start
+                + global_pos
+                + 1
+                for global_pos in range(
+                    segment.global_batch_slice.start,
+                    segment.global_batch_slice.stop,
+                )
+            )
+            expected_token_to_seq.extend([row_idx] * row_seq_len)
+            gathered_k_row_start += row_seq_len
+
+        assert chunk.token_start == 0
+        assert chunk.token_end == sum(query_lens)
+        assert chunk.total_seq_lens == gathered_k_row_start
+        torch.testing.assert_close(
+            chunk.cu_seq_lens.cpu(),
+            torch.tensor(
+                [0, *np.cumsum(seq_lens_cpu.tolist())], dtype=torch.int32
+            ),
+        )
+        torch.testing.assert_close(
+            chunk.cu_seqlen_ks.cpu(),
+            torch.tensor(expected_k_starts, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            chunk.cu_seqlen_ke.cpu(),
+            torch.tensor(expected_k_ends, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            chunk.token_to_seq.cpu(),
+            torch.tensor(expected_token_to_seq, dtype=torch.int32),
+        )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
