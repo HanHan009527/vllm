@@ -1110,6 +1110,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefill = attn_metadata.prefill
         if prefill is None:
             return False
+        if envs.VLLM_SPARSE_MLA_FORCE_DENSE_MHA:
+            return True
         use_masked_mha = (
             self.prefill_backend is not None
             and self.impl.masked_mha_available  # type: ignore[attr-defined]

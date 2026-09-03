@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.model_executor.layers.attention.mla_attention as mla_attention
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
@@ -43,6 +45,39 @@ def make_mla_metadata(*, use_dense_mha: bool = True, num_decode_tokens: int = 0)
         num_decode_tokens=num_decode_tokens,
         prefill=SimpleNamespace(use_dense_mha=use_dense_mha),
     )
+
+
+@pytest.mark.parametrize(
+    ("force_dense", "use_dense_mha", "force_mqa", "expected"),
+    [
+        (False, False, False, False),
+        (False, True, False, True),
+        (False, True, True, False),
+        (True, False, True, True),
+    ],
+)
+def test_sparse_mla_force_dense_diagnostic_override(
+    monkeypatch: pytest.MonkeyPatch,
+    force_dense: bool,
+    use_dense_mha: bool,
+    force_mqa: bool,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        mla_attention.envs,
+        "VLLM_SPARSE_MLA_FORCE_DENSE_MHA",
+        force_dense,
+    )
+    layer = SimpleNamespace(
+        _vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(sparse_mla_force_mqa=force_mqa)
+        ),
+        prefill_backend=None,
+        impl=SimpleNamespace(masked_mha_available=False, dcp_world_size=1),
+    )
+    metadata = make_mla_metadata(use_dense_mha=use_dense_mha)
+
+    assert MLAAttention._use_sparse_mha(layer, metadata) is expected
 
 
 @pytest.mark.parametrize(

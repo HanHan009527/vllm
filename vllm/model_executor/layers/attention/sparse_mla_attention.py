@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.distributed import (
     get_dcp_group,
     get_tensor_model_parallel_world_size,
@@ -305,8 +306,11 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 output_dtype=self.model_config.dtype,
                 prefill_backend=self._prefill_backend,
                 use_dense_mha=(
-                    prefill_max_seq_len <= self.topk_tokens
-                    and not self.vllm_config.attention_config.sparse_mla_force_mqa
+                    envs.VLLM_SPARSE_MLA_FORCE_DENSE_MHA
+                    or (
+                        prefill_max_seq_len <= self.topk_tokens
+                        and not self.vllm_config.attention_config.sparse_mla_force_mqa
+                    )
                 ),
                 topk_mask_workspace=self.topk_mask_workspace,
             )
@@ -558,6 +562,13 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], Generic[T]):
             v_head_dim=v_head_dim,
             kv_cache_dtype=kv_cache_dtype,
         )
+        self._sparse_mla_force_dense_mha = envs.VLLM_SPARSE_MLA_FORCE_DENSE_MHA
+        if self._sparse_mla_force_dense_mha:
+            logger.warning_once(
+                "VLLM_SPARSE_MLA_FORCE_DENSE_MHA is enabled; all sparse-MLA "
+                "prefill requests will use dense MHA. This diagnostic path "
+                "has quadratic memory and compute cost."
+            )
 
     @staticmethod
     def masked_mha_workspace_fits(prefill: MLACommonPrefillMetadata) -> bool:

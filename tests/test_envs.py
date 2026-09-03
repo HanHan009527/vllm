@@ -307,6 +307,16 @@ def test_gdn_decode_kernel_env(monkeypatch: pytest.MonkeyPatch):
             env_func()
 
 
+def test_sparse_mla_force_dense_mha_env(monkeypatch: pytest.MonkeyPatch):
+    env_func = environment_variables["VLLM_SPARSE_MLA_FORCE_DENSE_MHA"]
+    monkeypatch.delenv("VLLM_SPARSE_MLA_FORCE_DENSE_MHA", raising=False)
+    assert env_func() is False
+
+    for value, expected in (("0", False), ("1", True)):
+        monkeypatch.setenv("VLLM_SPARSE_MLA_FORCE_DENSE_MHA", value)
+        assert env_func() is expected
+
+
 class TestEnvListWithChoices:
     """Test cases for env_list_with_choices function."""
 
