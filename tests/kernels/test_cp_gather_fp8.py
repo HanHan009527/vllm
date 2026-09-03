@@ -2,10 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.attention.mla_attention import (
+    build_mla_chunked_context_metadata,
+)
+from vllm.v1.attention.ops import pcp as pcp_ops
+from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 # DeepSeek V3 MLA dimensions
 NOPE_DIM = 512  # NoPE latent dimension (FP8 quantized in cache)
@@ -372,6 +378,185 @@ def test_cp_gather_fp8_with_sequence_starts(gather_seq_lens, seq_starts):
         dst[:, :NOPE_DIM], expected[:, :NOPE_DIM], atol=1e-3, rtol=1e-2
     )
     assert torch.equal(dst[:, NOPE_DIM:], expected[:, NOPE_DIM:])
+
+
+@pytest.mark.parametrize("seq_len", [7, 8])
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+def test_pcp_dual_chunk_fp8_cache_round_trip(monkeypatch, seq_len, pcp_rank):
+    """PCP writes and per-row context gathers preserve global token order."""
+    device = torch.device("cuda")
+    pcp_size = 2
+    block_size = 4
+    manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=pcp_rank,
+        device=device,
+    )
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        num_scheduled_tokens=np.array([seq_len], dtype=np.int32),
+        num_computed_tokens=np.zeros(1, dtype=np.int32),
+        is_prefilling=np.ones(1, dtype=np.bool_),
+        query_start_loc_np=np.array([0, seq_len], dtype=np.int32),
+    )
+    padded_num_tokens = max(per_rank_num_tokens)
+
+    torch.manual_seed(42)
+    global_kv_c = torch.randn(seq_len, NOPE_DIM, dtype=torch.bfloat16, device=device)
+    global_k_pe = torch.randn(seq_len, 1, ROPE_DIM, dtype=torch.bfloat16, device=device)
+
+    rank_kv_c = []
+    rank_k_pe = []
+    for rank, segments in enumerate(segments_by_rank):
+        indices = torch.tensor(
+            [
+                token
+                for segment in segments
+                for token in range(
+                    segment.global_batch_slice.start,
+                    segment.global_batch_slice.stop,
+                )
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        padding = padded_num_tokens - indices.numel()
+        rank_kv_c.append(
+            torch.cat(
+                (
+                    global_kv_c[indices],
+                    torch.full(
+                        (padding, NOPE_DIM),
+                        rank + 10,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+            )
+        )
+        rank_k_pe.append(
+            torch.cat(
+                (
+                    global_k_pe[indices],
+                    torch.full(
+                        (padding, 1, ROPE_DIM),
+                        rank + 20,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+            )
+        )
+
+    gathered_kv_c = torch.cat(rank_kv_c)
+    gathered_k_pe = torch.cat(rank_k_pe)
+
+    class FakePCPGroup:
+        world_size = pcp_size
+
+        def all_gather(self, tensor, dim):
+            assert dim == 0
+            if tensor.shape[1] == NOPE_DIM:
+                assert torch.equal(tensor, rank_kv_c[pcp_rank])
+                return gathered_kv_c
+            assert tensor.shape[1] == ROPE_DIM
+            assert torch.equal(tensor, rank_k_pe[pcp_rank].flatten(1))
+            return gathered_k_pe.flatten(1)
+
+    monkeypatch.setattr(pcp_ops, "get_pcp_group", lambda: FakePCPGroup())
+
+    # Use a shuffled physical page table so logical slot order cannot be
+    # mistaken for cache storage order.
+    block_table = torch.tensor([[2, 0]], dtype=torch.int32, device=device)
+    positions = torch.arange(seq_len, dtype=torch.long, device=device)
+    global_slots = (
+        block_table[0, positions // block_size].long() * block_size
+        + positions % block_size
+    ).unsqueeze(0)
+    gathered_slots = manager._convert_to_gathered_slot_mappings(global_slots)[0]
+    cache_kv_c, cache_k_pe, cache_slots = pcp_ops.maybe_gather_mla_latent_cache_inputs(
+        rank_kv_c[pcp_rank],
+        rank_k_pe[pcp_rank],
+        gathered_slots,
+        num_decode_tokens=0,
+        use_pcp=True,
+    )
+    assert cache_slots is not None
+
+    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    pcp_cache = torch.zeros(
+        3, block_size, ENTRY_BYTES, dtype=torch.uint8, device=device
+    )
+    reference_cache = torch.zeros_like(pcp_cache)
+    ops.concat_and_cache_mla(
+        cache_kv_c,
+        cache_k_pe.squeeze(1),
+        pcp_cache,
+        cache_slots,
+        "fp8_ds_mla",
+        scale,
+    )
+    ops.concat_and_cache_mla(
+        global_kv_c,
+        global_k_pe.squeeze(1),
+        reference_cache,
+        global_slots[0],
+        "fp8_ds_mla",
+        scale,
+    )
+    assert torch.equal(pcp_cache, reference_cache)
+
+    full_reference = torch.empty(
+        seq_len, NOPE_DIM + ROPE_DIM, dtype=torch.bfloat16, device=device
+    )
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        reference_cache,
+        full_reference,
+        block_table,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        1,
+    )
+
+    segments = segments_by_rank[pcp_rank]
+    query_lens = [segment.num_tokens for segment in segments]
+    query_start_loc = torch.tensor([0, *np.cumsum(query_lens)], dtype=torch.int32)
+    context_lens = torch.tensor(
+        [segment.global_batch_slice.start for segment in segments],
+        dtype=torch.int32,
+    )
+    workspace = torch.empty(
+        seq_len, NOPE_DIM + ROPE_DIM, dtype=torch.bfloat16, device=device
+    )
+    metadata = build_mla_chunked_context_metadata(
+        context_lens_cpu=context_lens,
+        prefill_query_start_loc_cpu=query_start_loc,
+        chunked_prefill_workspace=workspace,
+        chunked_prefill_workspace_size=seq_len,
+        block_size=block_size,
+        align_chunk_to_block=True,
+        device=device,
+        dcp_world_size=1,
+        dcp_local_block_size=1,
+        dcp_virtual_block_size=1,
+    )
+    assert metadata is not None
+    virtual_block_table = block_table.expand(len(segments), -1)
+    for chunk in metadata.chunks:
+        dst = workspace[: chunk.num_context_tokens]
+        ops.cp_gather_and_upconvert_fp8_kv_cache(
+            pcp_cache,
+            dst,
+            virtual_block_table[chunk.request_slice],
+            chunk.cu_seq_lens,
+            chunk.num_requests,
+            chunk.starts,
+        )
+        expected = torch.cat(
+            [
+                full_reference[start : start + length]
+                for start, length in zip(chunk.starts.tolist(), chunk.seq_lens.tolist())
+            ]
+        )
+        assert torch.equal(dst, expected)
 
 
 @pytest.mark.parametrize(
