@@ -156,7 +156,9 @@ def test_merge_attn_states_native_strided_output_lse() -> None:
         output_lse,
     )
 
-    torch.testing.assert_close(output, expected_output, atol=1e-3, rtol=1e-2)
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), atol=1e-3, rtol=1e-2
+    )
     torch.testing.assert_close(output_lse, expected_lse, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(
         lse_parent[:, :lse_offset],
