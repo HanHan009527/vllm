@@ -69,6 +69,12 @@ def _make_test_kv_cache_config() -> KVCacheConfig:
     )
 
 
+class _TestAttentionBackend:
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [16]
+
+
 class FakeMooncakeWrapper:
     """Mock Mooncake TransferEngine for unit testing environments."""
 
@@ -1384,7 +1390,7 @@ def test_register_kv_caches_starts_sender_only_on_canonical_pcp_rank(
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
             "mooncake_connector.get_current_attn_backends",
-            return_value=[object()],
+            return_value=[_TestAttentionBackend],
         ),
         patch("asyncio.run_coroutine_threadsafe") as mock_run_coroutine,
     ):
