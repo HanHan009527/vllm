@@ -8,9 +8,16 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonPrefillMetadata,
+    accumulate_mla_context_chunk,
     build_mla_chunked_context_metadata,
+    init_mla_context_partial,
+)
+from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+    FlashAttnPrefillBackend,
 )
 from vllm.v1.attention.ops import pcp as pcp_ops
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 # DeepSeek V3 MLA dimensions
@@ -19,6 +26,9 @@ ROPE_DIM = 64  # RoPE dimension (stored as BF16 in cache)
 NUM_TILES = 4  # NOPE_DIM / GROUP_SIZE = 512 / 128
 GROUP_SIZE = 128  # FP8 quantization group size (one scale per group)
 ENTRY_BYTES = 656  # 512 (FP8) + 16 (4×float32 scales) + 128 (64×BF16 RoPE)
+NUM_HEADS = 4
+QK_NOPE_DIM = 128
+V_HEAD_DIM = 128
 
 
 def _build_test_case(seq_lens, block_size, seed=42):
@@ -557,6 +567,338 @@ def test_pcp_dual_chunk_fp8_cache_round_trip(monkeypatch, seq_len, pcp_rank):
             ]
         )
         assert torch.equal(dst, expected)
+
+
+def _project_test_latents(
+    kv_c: torch.Tensor, k_pe: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project synthetic MLA latents without constructing model weights."""
+    k_nope = kv_c[:, :QK_NOPE_DIM].unsqueeze(1).expand(-1, NUM_HEADS, -1).contiguous()
+    value = (
+        kv_c[:, QK_NOPE_DIM : QK_NOPE_DIM + V_HEAD_DIM]
+        .unsqueeze(1)
+        .expand(-1, NUM_HEADS, -1)
+        .contiguous()
+    )
+    key = torch.cat((k_nope, k_pe.expand(-1, NUM_HEADS, -1)), dim=-1)
+    return key, value
+
+
+def _attention_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.einsum("hd,thd->ht", query.float(), key.float()) * scale
+    return (
+        torch.einsum("ht,thd->hd", scores.softmax(dim=-1), value.float()),
+        scores.logsumexp(dim=-1),
+    )
+
+
+@pytest.mark.parametrize("seq_len", [7, 8])
+@pytest.mark.parametrize("pcp_rank", [0, 1])
+def test_pcp_dual_chunk_fp8_context_suffix_merge(monkeypatch, seq_len, pcp_rank):
+    """PCP context/suffix partials merge to the global causal result.
+
+    A non-initial PCP virtual row attends to an FP8-cache prefix and its fresh
+    BF16 suffix. This exercises the real FlashAttention partials, empty-context
+    neutralization, continuation accumulation, and CUDA LSE merge.
+    """
+    device = torch.device("cuda")
+    pcp_size = 2
+    block_size = 4
+    manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=pcp_rank,
+        device=device,
+    )
+    segments_by_rank, per_rank_num_tokens = manager._build_batch_layout(
+        num_scheduled_tokens=np.array([seq_len], dtype=np.int32),
+        num_computed_tokens=np.zeros(1, dtype=np.int32),
+        is_prefilling=np.ones(1, dtype=np.bool_),
+        query_start_loc_np=np.array([0, seq_len], dtype=np.int32),
+    )
+    padded_num_tokens = max(per_rank_num_tokens)
+
+    torch.manual_seed(20260904)
+    global_kv_c = torch.randn(seq_len, NOPE_DIM, dtype=torch.bfloat16, device=device)
+    global_k_pe = torch.randn(seq_len, 1, ROPE_DIM, dtype=torch.bfloat16, device=device)
+    global_query = torch.randn(
+        seq_len,
+        NUM_HEADS,
+        QK_NOPE_DIM + ROPE_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    rank_kv_c = []
+    rank_k_pe = []
+    for rank, segments in enumerate(segments_by_rank):
+        indices = torch.tensor(
+            [
+                token
+                for segment in segments
+                for token in range(
+                    segment.global_batch_slice.start,
+                    segment.global_batch_slice.stop,
+                )
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        padding = padded_num_tokens - indices.numel()
+        rank_kv_c.append(
+            torch.cat(
+                (
+                    global_kv_c[indices],
+                    torch.full(
+                        (padding, NOPE_DIM),
+                        rank + 10,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+            )
+        )
+        rank_k_pe.append(
+            torch.cat(
+                (
+                    global_k_pe[indices],
+                    torch.full(
+                        (padding, 1, ROPE_DIM),
+                        rank + 20,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+            )
+        )
+
+    gathered_kv_c = torch.cat(rank_kv_c)
+    gathered_k_pe = torch.cat(rank_k_pe)
+
+    class FakePCPGroup:
+        world_size = pcp_size
+
+        def all_gather(self, tensor, dim):
+            assert dim == 0
+            if tensor.shape[1] == NOPE_DIM:
+                assert torch.equal(tensor, rank_kv_c[pcp_rank])
+                return gathered_kv_c
+            assert tensor.shape[1] == ROPE_DIM
+            assert torch.equal(tensor, rank_k_pe[pcp_rank].flatten(1))
+            return gathered_k_pe.flatten(1)
+
+    monkeypatch.setattr(pcp_ops, "get_pcp_group", lambda: FakePCPGroup())
+
+    block_table = torch.tensor([[2, 0]], dtype=torch.int32, device=device)
+    positions = torch.arange(seq_len, dtype=torch.long, device=device)
+    global_slots = (
+        block_table[0, positions // block_size].long() * block_size
+        + positions % block_size
+    ).unsqueeze(0)
+    gathered_slots = manager._convert_to_gathered_slot_mappings(global_slots)[0]
+    cache_kv_c, cache_k_pe, cache_slots = pcp_ops.maybe_gather_mla_latent_cache_inputs(
+        rank_kv_c[pcp_rank],
+        rank_k_pe[pcp_rank],
+        gathered_slots,
+        num_decode_tokens=0,
+        use_pcp=True,
+    )
+    assert cache_slots is not None
+
+    cache = torch.zeros(3, block_size, ENTRY_BYTES, dtype=torch.uint8, device=device)
+    ops.concat_and_cache_mla(
+        cache_kv_c,
+        cache_k_pe.squeeze(1),
+        cache,
+        cache_slots,
+        "fp8_ds_mla",
+        torch.tensor(1.0, dtype=torch.float32, device=device),
+    )
+
+    dequantized_global = torch.empty(
+        seq_len, NOPE_DIM + ROPE_DIM, dtype=torch.bfloat16, device=device
+    )
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        cache,
+        dequantized_global,
+        block_table,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        1,
+    )
+
+    segments = segments_by_rank[pcp_rank]
+    local_indices = torch.tensor(
+        [
+            token
+            for segment in segments
+            for token in range(
+                segment.global_batch_slice.start,
+                segment.global_batch_slice.stop,
+            )
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    query_lens = [segment.num_tokens for segment in segments]
+    query_start_loc_cpu = torch.tensor([0, *np.cumsum(query_lens)], dtype=torch.int32)
+    context_lens_cpu = torch.tensor(
+        [segment.global_batch_slice.start for segment in segments],
+        dtype=torch.int32,
+    )
+    workspace = torch.empty(
+        block_size, NOPE_DIM + ROPE_DIM, dtype=torch.bfloat16, device=device
+    )
+    chunked_context = build_mla_chunked_context_metadata(
+        context_lens_cpu=context_lens_cpu,
+        prefill_query_start_loc_cpu=query_start_loc_cpu,
+        chunked_prefill_workspace=workspace,
+        chunked_prefill_workspace_size=block_size,
+        block_size=block_size,
+        align_chunk_to_block=True,
+        device=device,
+        dcp_world_size=1,
+        dcp_local_block_size=1,
+        dcp_virtual_block_size=1,
+    )
+    assert chunked_context is not None
+
+    scale = (QK_NOPE_DIM + ROPE_DIM) ** -0.5
+    backend = FlashAttnPrefillBackend(
+        num_heads=NUM_HEADS,
+        scale=scale,
+        kv_lora_rank=NOPE_DIM,
+        qk_nope_head_dim=QK_NOPE_DIM,
+        qk_rope_head_dim=ROPE_DIM,
+        v_head_dim=V_HEAD_DIM,
+        vllm_config=None,  # type: ignore[arg-type]
+    )
+    prefill_metadata = MLACommonPrefillMetadata(
+        block_table=block_table.expand(len(segments), -1),
+        query_start_loc=query_start_loc_cpu.to(device),
+        max_query_len=max(query_lens),
+        chunked_context=chunked_context,
+        q_data_type=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        prefill_backend=backend,
+    )
+    backend.prepare_metadata(prefill_metadata)
+
+    local_query = global_query[local_indices]
+    suffix_key, suffix_value = _project_test_latents(
+        global_kv_c[local_indices], global_k_pe[local_indices]
+    )
+    suffix_output, suffix_lse = backend.run_prefill_new_tokens(
+        q=local_query,
+        k=suffix_key,
+        v=suffix_value,
+        return_softmax_lse=True,
+    )
+
+    context_output = None
+    context_lse = None
+    for chunk in chunked_context.chunks:
+        gathered_context = workspace[: chunk.num_context_tokens]
+        ops.cp_gather_and_upconvert_fp8_kv_cache(
+            cache,
+            gathered_context,
+            prefill_metadata.block_table[chunk.request_slice],
+            chunk.cu_seq_lens,
+            chunk.num_requests,
+            chunk.starts,
+        )
+        context_key, context_value = _project_test_latents(
+            gathered_context[:, :NOPE_DIM],
+            gathered_context[:, NOPE_DIM:].unsqueeze(1),
+        )
+        chunk_output, chunk_lse = backend.run_prefill_context_chunk(
+            chunk=chunk,
+            q=local_query[chunk.token_slice],
+            k=context_key,
+            v=context_value,
+        )
+        if context_output is None:
+            context_output, context_lse = init_mla_context_partial(
+                chunked_context,
+                chunk_output,
+                chunk_lse,
+                num_tokens=local_indices.numel(),
+            )
+        accumulate_mla_context_chunk(
+            chunk, chunk_output, chunk_lse, context_output, context_lse
+        )
+
+    assert context_output is not None
+    assert context_lse is not None
+    output = torch.empty(
+        local_indices.numel(),
+        NUM_HEADS,
+        V_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    output_lse = torch.empty(
+        NUM_HEADS, local_indices.numel(), dtype=torch.float32, device=device
+    )
+    merge_attn_states(
+        output=output,
+        output_lse=output_lse,
+        prefix_output=context_output[..., :V_HEAD_DIM],
+        prefix_lse=context_lse,
+        suffix_output=suffix_output[..., :V_HEAD_DIM],
+        suffix_lse=suffix_lse,
+    )
+
+    cached_key, cached_value = _project_test_latents(
+        dequantized_global[:, :NOPE_DIM],
+        dequantized_global[:, NOPE_DIM:].unsqueeze(1),
+    )
+    fresh_key, fresh_value = _project_test_latents(global_kv_c, global_k_pe)
+    mixed_outputs = []
+    mixed_lses = []
+    full_bf16_outputs = []
+    for segment in segments:
+        segment_start = segment.global_batch_slice.start
+        for position in range(segment_start, segment.global_batch_slice.stop):
+            mixed_key = torch.cat(
+                (cached_key[:segment_start], fresh_key[segment_start : position + 1])
+            )
+            mixed_value = torch.cat(
+                (
+                    cached_value[:segment_start],
+                    fresh_value[segment_start : position + 1],
+                )
+            )
+            mixed_output, mixed_lse = _attention_reference(
+                global_query[position], mixed_key, mixed_value, scale
+            )
+            full_output, _ = _attention_reference(
+                global_query[position],
+                fresh_key[: position + 1],
+                fresh_value[: position + 1],
+                scale,
+            )
+            mixed_outputs.append(mixed_output)
+            mixed_lses.append(mixed_lse)
+            full_bf16_outputs.append(full_output)
+
+    mixed_reference = torch.stack(mixed_outputs)
+    mixed_lse_reference = torch.stack(mixed_lses, dim=1)
+    full_bf16_reference = torch.stack(full_bf16_outputs)
+    torch.testing.assert_close(output.float(), mixed_reference, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(output_lse, mixed_lse_reference, atol=2e-2, rtol=2e-2)
+
+    mixed_max_abs = (output.float() - mixed_reference).abs().max().item()
+    full_bf16_max_abs = (output.float() - full_bf16_reference).abs().max().item()
+    assert math.isfinite(full_bf16_max_abs)
+    print(
+        f"pcp_rank={pcp_rank} seq_len={seq_len} "
+        f"mixed_max_abs={mixed_max_abs:.6f} "
+        f"full_bf16_max_abs={full_bf16_max_abs:.6f}"
+    )
 
 
 @pytest.mark.parametrize(
