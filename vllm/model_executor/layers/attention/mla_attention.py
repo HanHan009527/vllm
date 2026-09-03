@@ -2734,11 +2734,16 @@ def accumulate_mla_context_chunk(
         )
         init_start = chunk.continuation_token_end
         num_merged = init_start - token_start
+        # The CUDA merge kernel uses multiple threads for each token/head and
+        # writes output_lse from one of them. Keep the old prefix LSE in a
+        # separate allocation so that the write cannot race the other threads'
+        # reads when accumulating into the same output buffer.
+        prefix_lse = output_lse[:, token_start:init_start].clone()
         merge_attn_states(
             output=output[token_start:init_start],
             output_lse=output_lse[:, token_start:init_start],
             prefix_output=output[token_start:init_start],
-            prefix_lse=output_lse[:, token_start:init_start],
+            prefix_lse=prefix_lse,
             suffix_output=attn_output[:num_merged],
             suffix_lse=attn_softmax_lse[:, :num_merged],
         )
