@@ -82,10 +82,24 @@ def _mock_sequence_parallel_collectives(monkeypatch, module):
     )
 
 
+def _record_boundaries(monkeypatch):
+    captured = []
+    monkeypatch.setattr(deepseek_v32_model.pcp_boundary_capture, "enabled", True)
+    monkeypatch.setattr(
+        deepseek_v32_model.pcp_boundary_capture,
+        "capture",
+        lambda layer_idx, stage, positions, tensor: captured.append(
+            (layer_idx, stage, positions.clone(), tensor.clone())
+        ),
+    )
+    return captured
+
+
 def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     layer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
     nn.Module.__init__(layer)
     layer.use_sequence_parallel = True
+    layer.layer_idx = 3
     layer.input_layernorm = _IdentityNorm()
     layer.post_attention_layernorm = _IdentityNorm()
     layer.self_attn = _RecordingModule()
@@ -107,6 +121,38 @@ def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     assert hidden_states.shape == residual.shape == (2, 2)
     assert layer.self_attn.num_tokens == 3
     assert layer.mlp.num_tokens == 2
+
+
+def test_decoder_layer_captures_nvidia_boundaries(monkeypatch):
+    layer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_sequence_parallel = False
+    layer.layer_idx = 3
+    layer.input_layernorm = _IdentityNorm()
+    layer.post_attention_layernorm = _IdentityNorm()
+    layer.self_attn = _RecordingModule()
+    layer.mlp = _RecordingModule()
+
+    monkeypatch.setattr(
+        deepseek_v32_model,
+        "fused_allreduce_rms_norm",
+        lambda hidden_states, residual, norm: norm(hidden_states, residual),
+    )
+    captured = _record_boundaries(monkeypatch)
+
+    positions = torch.arange(3)
+    hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
+    residual = torch.full_like(hidden_states, 10)
+    layer(positions, hidden_states, residual)
+
+    assert [(layer_idx, stage) for layer_idx, stage, _, _ in captured] == [
+        (3, "attention_input"),
+        (3, "post_attention_residual"),
+        (3, "mlp_input"),
+        (3, "mlp_output_local"),
+        (3, "decoder_output_local"),
+    ]
+    assert all(torch.equal(item[2], positions) for item in captured)
 
 
 def test_mtp_projects_sequence_shard_and_restores_full_output(monkeypatch):

@@ -32,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.model_executor.pcp_debug import pcp_boundary_capture
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -159,6 +160,7 @@ class DeepseekV32Attention(MLAAttention):
             scaling = scaling * mscale * mscale
 
         layer_id = extract_layer_index(prefix)
+        self.layer_idx = layer_id
         index_topk_freq = getattr(config, "index_topk_freq", 1)
         index_topk_pattern = getattr(config, "index_topk_pattern", None)
         index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
@@ -405,7 +407,19 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q,
             output,
         )
-        return self.o_proj(output)[0]
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "mla_output_local", positions, output
+            )
+        projected_output = self.o_proj(output)[0]
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx,
+                "attention_output_local",
+                positions,
+                projected_output,
+            )
+        return projected_output
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
