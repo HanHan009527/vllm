@@ -147,7 +147,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.mla_attn.layer_name if enable_short_prefill_scoring_skip else ""
             )
         self.prefix = prefix
-        self.layer_idx = next(int(part) for part in prefix.split(".") if part.isdigit())
+        self.layer_idx = next(
+            (int(part) for part in prefix.split(".") if part.isdigit()), -1
+        )
 
     def forward(
         self,
