@@ -157,12 +157,18 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
+        capture_positions = (
+            sp_shard(positions + 1) - 1 if self.use_sequence_parallel else positions
+        )
         if pcp_boundary_capture.enabled:
             pcp_boundary_capture.capture(
-                self.layer_idx, "post_attention_residual", positions, residual
+                self.layer_idx,
+                "post_attention_residual",
+                capture_positions,
+                residual,
             )
             pcp_boundary_capture.capture(
-                self.layer_idx, "mlp_input", positions, hidden_states
+                self.layer_idx, "mlp_input", capture_positions, hidden_states
             )
 
         if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
@@ -171,13 +177,16 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             hidden_states = self.mlp(hidden_states)
         if pcp_boundary_capture.enabled:
             pcp_boundary_capture.capture(
-                self.layer_idx, "mlp_output_local", positions, hidden_states
+                self.layer_idx,
+                "mlp_output_local",
+                capture_positions,
+                hidden_states,
             )
-            if hidden_states.shape[0] == residual.shape[0] == positions.shape[0]:
+            if hidden_states.shape[0] == residual.shape[0]:
                 pcp_boundary_capture.capture(
                     self.layer_idx,
                     "decoder_output_local",
-                    positions,
+                    capture_positions,
                     hidden_states + residual,
                 )
         return hidden_states, residual

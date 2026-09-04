@@ -106,6 +106,7 @@ def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     layer.mlp = _RecordingModule()
 
     _mock_sequence_parallel_collectives(monkeypatch, deepseek_v32_model)
+    captured = _record_boundaries(monkeypatch)
 
     positions = torch.arange(3)
     full_hidden_states = torch.arange(6, dtype=torch.float32).view(3, 2)
@@ -115,6 +116,16 @@ def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     assert hidden_states.shape == residual.shape == (2, 2)
     assert layer.self_attn.num_tokens == 3
     assert layer.mlp.num_tokens == 2
+    first_forward = captured[:5]
+    assert [stage for _, stage, _, _ in first_forward] == [
+        "attention_input",
+        "post_attention_residual",
+        "mlp_input",
+        "mlp_output_local",
+        "decoder_output_local",
+    ]
+    assert torch.equal(first_forward[0][2], positions)
+    assert all(torch.equal(item[2], positions[:2]) for item in first_forward[1:])
 
     hidden_states, residual = layer(positions, hidden_states, residual)
 
