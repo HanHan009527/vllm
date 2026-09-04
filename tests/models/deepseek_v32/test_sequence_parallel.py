@@ -62,17 +62,22 @@ class _SequenceParallelMTPBlock:
         return hidden_states * 2, hidden_states * 3
 
 
-def _mock_sequence_parallel_collectives(monkeypatch, module):
+def _mock_sequence_parallel_collectives(monkeypatch, module, rank: int = 0):
     monkeypatch.setattr(
         module,
         "sp_reduce_scatter",
-        lambda tensor: tensor.chunk(2, dim=0)[0],
+        lambda tensor: tensor.chunk(2, dim=0)[rank],
         raising=False,
     )
+
+    def shard(tensor):
+        pad = (0, 0) * (tensor.ndim - 1) + (0, (-tensor.shape[0]) % 2)
+        return torch.nn.functional.pad(tensor, pad).chunk(2, dim=0)[rank]
+
     monkeypatch.setattr(
         module,
         "sp_shard",
-        lambda tensor: torch.nn.functional.pad(tensor, (0, 0, 0, 1))[:2],
+        shard,
         raising=False,
     )
     monkeypatch.setattr(
@@ -105,7 +110,7 @@ def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
     layer.self_attn = _RecordingModule()
     layer.mlp = _RecordingModule()
 
-    _mock_sequence_parallel_collectives(monkeypatch, deepseek_v32_model)
+    _mock_sequence_parallel_collectives(monkeypatch, deepseek_v32_model, rank=1)
     captured = _record_boundaries(monkeypatch)
 
     positions = torch.arange(3)
@@ -125,7 +130,10 @@ def test_decoder_layer_keeps_dense_states_sequence_sharded(monkeypatch):
         "decoder_output_local",
     ]
     assert torch.equal(first_forward[0][2], positions)
-    assert all(torch.equal(item[2], positions[:2]) for item in first_forward[1:])
+    expected_sharded_positions = torch.tensor([2, -1])
+    assert all(
+        torch.equal(item[2], expected_sharded_positions) for item in first_forward[1:]
+    )
 
     hidden_states, residual = layer(positions, hidden_states, residual)
 
