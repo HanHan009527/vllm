@@ -51,6 +51,17 @@ from vllm.sequence import IntermediateTensors
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
 
 
+def _configure_cross_layer_allreduce(
+    layers: torch.nn.ModuleList, start_layer: int, end_layer: int
+) -> bool:
+    """Schedule fused input reductions from each producer's actual state."""
+    prev_defers = False
+    for idx, layer in enumerate(layers[start_layer:end_layer]):
+        layer.fuse_input_allreduce = idx > 0 and prev_defers
+        prev_defers = layer.ffn_all_reduce_deferred
+    return prev_defers
+
+
 class DeepseekV32DecoderLayer(torch.nn.Module):
     def __init__(
         self,
@@ -75,6 +86,8 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             parallel_config.use_sequence_parallel_moe
             and parallel_config.pipeline_parallel_size == 1
         )
+        self.fuse_input_allreduce = False
+        reduce_ffn_results = parallel_config.pipeline_parallel_size > 1
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,
@@ -88,13 +101,11 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % moe_layer_freq == 0
         ):
-            # Keep the MoE output un-reduced. Non-SP fuses its all-reduce into
-            # the next layer norm; SP keeps the token shard local.
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
-                reduce_results=False,
+                reduce_results=reduce_ffn_results,
                 prefix=f"{prefix}.mlp",
                 apply_routed_scale_to_output=False,
             )
@@ -105,7 +116,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                reduce_results=False,
+                reduce_results=reduce_ffn_results,
                 is_sequence_parallel=self.use_sequence_parallel,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -120,7 +131,11 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         attn_in: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        capture_aux: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         full_num_tokens = positions.shape[0]
 
         if residual is None:
@@ -133,12 +148,13 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             )
         elif self.use_sequence_parallel:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        else:
-            # The previous layer's MLP/MoE output is left un-reduced; fuse its
-            # all-reduce into this input_layernorm.
+        elif self.fuse_input_allreduce:
             hidden_states, residual = fused_allreduce_rms_norm(
                 hidden_states, residual, self.input_layernorm
             )
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        aux_hidden_state = residual.clone() if capture_aux else None
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         if pcp_boundary_capture.enabled:
@@ -189,7 +205,18 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                     capture_positions,
                     hidden_states + residual,
                 )
+        if aux_hidden_state is not None:
+            return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
+
+    @property
+    def ffn_all_reduce_deferred(self) -> bool:
+        """Whether this layer leaves its FFN TP reduction to its consumer."""
+        if self.use_sequence_parallel:
+            return False
+        if isinstance(self.mlp, DeepseekV2MoE):
+            return self.mlp.experts.moe_config.skip_final_all_reduce
+        return not self.mlp.down_proj.reduce_results
 
 
 class DeepseekV32Model(torch.nn.Module):
@@ -252,6 +279,10 @@ class DeepseekV32Model(torch.nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        self.fuse_final_norm_allreduce = _configure_cross_layer_allreduce(
+            self.layers, self.start_layer, self.end_layer
+        )
+
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
 
@@ -307,10 +338,14 @@ class DeepseekV32Model(torch.nn.Module):
             start=self.start_layer,
         ):
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    hidden_states if residual is None else hidden_states + residual
+                hidden_states, residual, aux_hidden_state = layer(
+                    positions, hidden_states, residual, attn_in, capture_aux=True
                 )
-            hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
+                aux_hidden_states.append(aux_hidden_state)
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, attn_in
+                )
             attn_in = None
 
         if not get_pp_group().is_last_rank:
@@ -335,10 +370,12 @@ class DeepseekV32Model(torch.nn.Module):
                 )
             else:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
-        else:
+        elif self.fuse_final_norm_allreduce:
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm
             )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
