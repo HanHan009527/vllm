@@ -676,7 +676,8 @@ def _pcp_args_tp_reduce_restore_worker(rank, world_size):
         )
         tokens_per_rank = max(per_rank_num_tokens)
         token_ids = torch.arange(seq_len, device=device, dtype=torch.float32)
-        token_values = torch.stack((token_ids + 1, token_ids + 101), dim=1)
+        feature_offsets = torch.arange(16, device=device, dtype=torch.float32)
+        token_values = token_ids.unsqueeze(1) * 100 + feature_offsets.unsqueeze(0)
         local_values = torch.zeros(
             (tokens_per_rank, token_values.shape[1]),
             device=device,
