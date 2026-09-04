@@ -31,7 +31,10 @@ class PCPBoundaryCapture:
 
     def __init__(self) -> None:
         output_dir = os.getenv("VLLM_PCP_DIAG_DIR")
-        trigger = os.getenv("VLLM_PCP_DIAG_TRIGGER")
+        trigger = os.getenv(
+            "VLLM_PCP_DIAG_TRIGGER",
+            str(Path(output_dir) / "trigger") if output_dir else None,
+        )
         self.enabled = bool(output_dir and trigger)
         self.output_dir = Path(output_dir) if output_dir else None
         self.trigger = Path(trigger) if trigger else None
