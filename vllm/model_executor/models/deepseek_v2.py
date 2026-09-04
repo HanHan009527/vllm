@@ -99,6 +99,7 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.pcp_debug import pcp_boundary_capture
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -1344,6 +1345,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             and residual is not None
             and hidden_states.shape[0] != full_num_tokens
         )
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx,
+                "decoder_input",
+                positions,
+                hidden_states if residual is None else hidden_states + residual,
+            )
 
         # Self Attention
         if residual is None:
@@ -1386,6 +1394,10 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "mlp_input", positions, hidden_states
+            )
         if self.use_sequence_parallel_moe:
             hidden_states = self.mlp(
                 hidden_states,
@@ -1393,6 +1405,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "mlp_output", positions, hidden_states
+            )
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -1402,6 +1418,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
 
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "decoder_output", positions, hidden_states + residual
+            )
         return hidden_states, residual
 
 

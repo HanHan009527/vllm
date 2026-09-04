@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.pcp_debug import pcp_boundary_capture
 from vllm.platforms import current_platform
 
 
@@ -146,6 +147,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.mla_attn.layer_name if enable_short_prefill_scoring_skip else ""
             )
         self.prefix = prefix
+        self.layer_idx = next(int(part) for part in prefix.split(".") if part.isdigit())
 
     def forward(
         self,
@@ -223,4 +225,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         if self.g_proj is not None:
             attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
 
-        return self.o_proj(attn_out)[0]
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "mla_output_local", positions, attn_out
+            )
+        output = self.o_proj(attn_out)[0]
+        if pcp_boundary_capture.enabled:
+            pcp_boundary_capture.capture(
+                self.layer_idx, "attention_output", positions, output
+            )
+        return output
