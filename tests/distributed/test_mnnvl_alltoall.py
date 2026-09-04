@@ -10,6 +10,7 @@ Run: pytest tests/distributed/test_mnnvl_alltoall.py -v
 import os
 import traceback
 
+import numpy as np
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -41,7 +42,7 @@ def _has_sys_ptrace() -> bool:
     return False
 
 
-def _spawn_workers(worker_fn, world_size, *, dp_size=None):
+def _spawn_workers(worker_fn, world_size, *, dp_size=None, tp_size=None, pcp_size=1):
     """Spawn one process per GPU, run worker_fn, assert all succeed.
 
     Uses an mp.Queue to propagate worker tracebacks back to the parent
@@ -59,7 +60,17 @@ def _spawn_workers(worker_fn, world_size, *, dp_size=None):
     for rank in range(world_size):
         p = mp.Process(
             target=_run_worker,
-            args=(rank, world_size, port, worker_fn, dp_size, dp_port, err_queue),
+            args=(
+                rank,
+                world_size,
+                port,
+                worker_fn,
+                dp_size,
+                dp_port,
+                tp_size,
+                pcp_size,
+                err_queue,
+            ),
         )
         p.start()
         procs.append(p)
@@ -79,7 +90,9 @@ def _spawn_workers(worker_fn, world_size, *, dp_size=None):
         pytest.fail("Worker(s) failed:\n" + combined)
 
 
-def _run_worker(rank, world_size, port, worker_fn, dp_size, dp_port, err_queue):
+def _run_worker(
+    rank, world_size, port, worker_fn, dp_size, dp_port, tp_size, pcp_size, err_queue
+):
     """Per-process setup: device, distributed env, then call worker_fn.
 
     Args:
@@ -91,7 +104,10 @@ def _run_worker(rank, world_size, port, worker_fn, dp_size, dp_port, err_queue):
     try:
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         torch.accelerator.set_device_index(rank)
-        if dp_size is not None:
+        if tp_size is not None:
+            assert dp_size is None
+            _init_pcp_environment(world_size, rank, port, tp_size, pcp_size)
+        elif dp_size is not None:
             _init_dp_environment(world_size, rank, port, dp_size, dp_port)
         else:
             init_test_distributed_environment(world_size, 1, rank, port)
@@ -104,6 +120,38 @@ def _run_worker(rank, world_size, port, worker_fn, dp_size, dp_port, err_queue):
         import sys
 
         sys.exit(1)
+
+
+def _init_pcp_environment(world_size, rank, port, tp_size, pcp_size):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.parallel import ParallelConfig
+    from vllm.distributed.parallel_state import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
+    assert world_size == tp_size * pcp_size
+    vllm_config = VllmConfig(
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            enable_expert_parallel=True,
+            all2all_backend="allgather_reducescatter",
+            is_moe_model=True,
+        )
+    )
+    with set_current_vllm_config(vllm_config):
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            distributed_init_method=f"tcp://localhost:{port}",
+            local_rank=rank,
+        )
+        ensure_model_parallel_initialized(
+            tp_size,
+            1,
+            prefill_context_model_parallel_size=pcp_size,
+        )
 
 
 def _init_dp_environment(world_size, rank, port, dp_size, dp_port):
@@ -185,6 +233,9 @@ def _make_forward_context(rank, world_size, num_tokens_per_rank):
 
 requires_multi_gpu = pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need >= 2 GPUs"
+)
+requires_four_gpus = pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need >= 4 GPUs"
 )
 requires_two_sided = pytest.mark.skipif(
     not has_flashinfer_nvlink_two_sided(),
@@ -590,6 +641,106 @@ def _args_dispatch_combine_worker(rank, world_size):
 def test_args_dispatch_combine(world_size):
     """Validate dispatch gathers all-rank data and combine reduces correctly."""
     _spawn_workers(_args_dispatch_combine_worker, world_size)
+
+
+def _pcp_args_tp_reduce_restore_worker(rank, world_size):
+    from vllm.distributed import get_pcp_group, get_tp_group
+    from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+    from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
+
+    tp_size = 2
+    pcp_size = 2
+    device = torch.device(f"cuda:{rank}")
+    tp_group = get_tp_group()
+    pcp_group = get_pcp_group()
+    pcp_rank = pcp_group.rank_in_group
+
+    assert pcp_group.ranks == [tp_group.rank_in_group, tp_group.rank_in_group + 2]
+    assert tp_group.ranks == list(range(pcp_rank * tp_size, (pcp_rank + 1) * tp_size))
+
+    manager = AgRsAll2AllManager(get_ep_group().cpu_group)
+    assert manager._get_comm_group(is_sequence_parallel=False) is pcp_group
+
+    for seq_len in (7, 8):
+        pcp = PCPManager(
+            pcp_world_size=pcp_size,
+            pcp_rank=pcp_rank,
+            device=device,
+        )
+        segments_by_rank, per_rank_num_tokens = pcp._build_batch_layout(
+            num_scheduled_tokens=np.array([seq_len], dtype=np.int32),
+            num_computed_tokens=np.zeros(1, dtype=np.int32),
+            is_prefilling=np.ones(1, dtype=np.bool_),
+            query_start_loc_np=np.array([0, seq_len], dtype=np.int32),
+        )
+        tokens_per_rank = max(per_rank_num_tokens)
+        token_ids = torch.arange(seq_len, device=device, dtype=torch.float32)
+        token_values = torch.stack((token_ids + 1, token_ids + 101), dim=1)
+        local_values = torch.zeros(
+            (tokens_per_rank, token_values.shape[1]),
+            device=device,
+            dtype=token_values.dtype,
+        )
+        for segment in segments_by_rank[pcp_rank]:
+            local_values[segment.rank_local_batch_slice] = token_values[
+                segment.global_batch_slice
+            ]
+
+        weights = local_values[:, :1].clone()
+        ids = torch.full(
+            (tokens_per_rank, 1),
+            rank,
+            device=device,
+            dtype=torch.int64,
+        )
+        dispatched, dispatched_weights, dispatched_ids = manager.dispatch(
+            local_values, weights, ids, is_sequence_parallel=False
+        )
+
+        expected_gathered = token_values[pcp._padded_gather_idx].masked_fill(
+            ~pcp._gathered_kv_write_mask.unsqueeze(1), 0
+        )
+        torch.testing.assert_close(dispatched, expected_gathered)
+        torch.testing.assert_close(dispatched_weights, expected_gathered[:, :1])
+        expected_ids = torch.cat(
+            [
+                torch.full(
+                    (tokens_per_rank, 1),
+                    peer_rank,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                for peer_rank in pcp_group.ranks
+            ]
+        )
+        assert torch.equal(dispatched_ids, expected_ids)
+
+        expert_partial = dispatched * float(rank + 1)
+        combined = manager.combine(expert_partial, is_sequence_parallel=False)
+        expected_local = expected_gathered[
+            pcp_rank * tokens_per_rank : (pcp_rank + 1) * tokens_per_rank
+        ] * sum(peer_rank + 1 for peer_rank in pcp_group.ranks)
+        torch.testing.assert_close(combined, expected_local)
+
+        reduced = tensor_model_parallel_all_reduce(combined)
+        expected_reduced = local_values * sum(range(1, world_size + 1))
+        torch.testing.assert_close(reduced, expected_reduced)
+        restored = pcp.restore_hidden_states(reduced)
+        torch.testing.assert_close(
+            restored, token_values * sum(range(1, world_size + 1))
+        )
+
+
+@requires_four_gpus
+def test_pcp_args_tp_reduce_restore():
+    """Validate the production PCP MoE communication and restore order."""
+    _spawn_workers(
+        _pcp_args_tp_reduce_restore_worker,
+        world_size=4,
+        tp_size=2,
+        pcp_size=2,
+    )
 
 
 # ---------------------------------------------------------------------------
