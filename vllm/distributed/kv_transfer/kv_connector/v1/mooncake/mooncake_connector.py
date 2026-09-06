@@ -1641,7 +1641,7 @@ class MooncakeConnectorWorker:
         kv_data_ptrs: list[int] = []
         kv_data_lens: list[int] = []
         region_base_addresses: list[int] = []
-        seen_storage_ptrs: set[int] = set()
+        storage_registration_indices: dict[int, int] = {}
         self.block_len_per_layer = []
         self.kv_block_len_per_layer = []
         self.registered_layer_names = []
@@ -1671,6 +1671,10 @@ class MooncakeConnectorWorker:
             else:
                 region_caches = [cache]
 
+            storage = cache.untyped_storage()
+            storage_addr = storage.data_ptr()
+            registration_end = storage_addr + storage.nbytes()
+
             for region_cache in region_caches:
                 base_addr = region_cache.data_ptr()
                 block_len = region_cache.stride(0) * region_cache.element_size()
@@ -1696,6 +1700,16 @@ class MooncakeConnectorWorker:
                         f"for {layer_name}: kv_block_len={kv_block_len}, "
                         f"block_len={block_len}."
                     )
+                # Transfers address blocks by stride. Register through the
+                # final legal transfer byte, but not a phantom full-stride
+                # tail after an offset view in shared layer storage.
+                if region_cache.shape[0] > 0:
+                    registration_end = max(
+                        registration_end,
+                        base_addr
+                        + (region_cache.shape[0] - 1) * block_len
+                        + kv_block_len,
+                    )
                 self.block_len_per_layer.append(block_len)
                 self.kv_block_len_per_layer.append(kv_block_len)
                 self.registered_layer_names.append(layer_name)
@@ -1703,12 +1717,16 @@ class MooncakeConnectorWorker:
                 self.registered_group_indices.append(
                     self._layer_group_indices[layer_name]
                 )
-            storage = cache.untyped_storage()
-            storage_addr = storage.data_ptr()
-            if storage_addr not in seen_storage_ptrs:
-                seen_storage_ptrs.add(storage_addr)
+            registration_len = registration_end - storage_addr
+            registration_idx = storage_registration_indices.get(storage_addr)
+            if registration_idx is None:
+                storage_registration_indices[storage_addr] = len(kv_data_ptrs)
                 kv_data_ptrs.append(storage_addr)
-                kv_data_lens.append(storage.nbytes())
+                kv_data_lens.append(registration_len)
+            else:
+                kv_data_lens[registration_idx] = max(
+                    kv_data_lens[registration_idx], registration_len
+                )
 
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs

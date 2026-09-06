@@ -1159,6 +1159,19 @@ def test_register_kv_caches(layout: KVCacheLayout, separate_kv_head_groups: bool
             assert registered_ptrs == [raw.data_ptr()]
             assert registered_lens == [raw.nbytes]
 
+            if layout == KVCacheLayout.BLHNC:
+                # Both layer views share one storage, and the second starts at
+                # a non-zero offset. Registration must deduplicate that storage
+                # without adding a phantom full-stride tail after layer 1.
+                assert tensor2.data_ptr() > raw.data_ptr()
+                required_end = max(
+                    cache.data_ptr()
+                    + (cache.shape[0] - 1) * cache.stride(0) * cache.element_size()
+                    + spec.page_size_bytes
+                    for cache in (tensor1, tensor2)
+                )
+                assert required_end == raw.data_ptr() + raw.nbytes
+
             if not layout.is_block_compact:
                 expected_addrs = [
                     cache[:, head_idx].data_ptr()
@@ -1243,6 +1256,60 @@ def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
             "model.layers.1.eagle_attn",
         ]
         assert worker.registered_layer_indices == [0, 1]
+
+
+def test_register_kv_caches_covers_trailing_block_stride_padding():
+    """The registered range must cover the final block's stride padding."""
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch_worker_dependencies(),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.threading.Event"
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.threading.Thread"
+        ) as mock_thread,
+    ):
+        connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        worker = connector.connector_worker
+        mock_thread.return_value.is_alive.return_value = False
+
+        layer_name = "model.layers.0.self_attn"
+        cache = torch.empty_strided(
+            (2, 16),
+            (32, 1),
+            dtype=torch.int8,
+        )
+        storage = cache.untyped_storage()
+        assert storage.nbytes() == 48
+
+        worker._layer_specs[layer_name] = FullAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=4,
+            dtype=torch.float16,
+            page_size_padded=32,
+        )
+
+        with patch.object(
+            worker.engine, "batch_register_memory", return_value=0
+        ) as mock_batch_register:
+            connector.register_kv_caches({layer_name: cache})
+
+        registered_ptrs, registered_lens = mock_batch_register.call_args[0]
+        assert registered_ptrs == [storage.data_ptr()]
+        assert registered_lens == [64]
 
 
 @pytest.mark.asyncio
