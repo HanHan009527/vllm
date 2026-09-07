@@ -10,6 +10,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.pcp_performance import pcp_performance_trace
 
 
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
@@ -21,10 +22,24 @@ def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
 
 
 def sp_all_gather(x: torch.Tensor) -> torch.Tensor:
-    output = _custom_collective("custom_all_gather", x)
-    if output is not None:
-        return output
-    return tensor_model_parallel_all_gather(x, 0)
+    if not pcp_performance_trace.enabled:
+        output = _custom_collective("custom_all_gather", x)
+        if output is not None:
+            return output
+        return tensor_model_parallel_all_gather(x, 0)
+
+    tp_size = get_tensor_model_parallel_world_size()
+    local_payload_bytes = x.numel() * x.element_size()
+    with pcp_performance_trace.region(
+        "tp.sp_all_gather",
+        local_payload_bytes=local_payload_bytes,
+        gathered_payload_bytes=local_payload_bytes * tp_size,
+        group_size=tp_size,
+    ):
+        output = _custom_collective("custom_all_gather", x)
+        if output is not None:
+            return output
+        return tensor_model_parallel_all_gather(x, 0)
 
 
 def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
@@ -33,10 +48,23 @@ def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     sp_pad = (-x.shape[0]) % tp_size
     if sp_pad > 0:
         x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
-    output = _custom_collective("custom_reduce_scatter", x)
-    if output is not None:
-        return output
-    return tensor_model_parallel_reduce_scatter(x, 0)
+    if not pcp_performance_trace.enabled:
+        output = _custom_collective("custom_reduce_scatter", x)
+        if output is not None:
+            return output
+        return tensor_model_parallel_reduce_scatter(x, 0)
+
+    local_payload_bytes = x.numel() * x.element_size()
+    with pcp_performance_trace.region(
+        "tp.sp_reduce_scatter",
+        local_payload_bytes=local_payload_bytes,
+        output_payload_bytes=local_payload_bytes // tp_size,
+        group_size=tp_size,
+    ):
+        output = _custom_collective("custom_reduce_scatter", x)
+        if output is not None:
+            return output
+        return tensor_model_parallel_reduce_scatter(x, 0)
 
 
 def sp_shard(x: torch.Tensor) -> torch.Tensor:

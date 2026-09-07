@@ -16,6 +16,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
@@ -388,22 +389,27 @@ def sparse_attn_indexer(
 
     if not skip_k_cache_insert:
         assert k is not None
-        k, slot_mapping_for_cache = maybe_gather_indexer_k(
-            k,
-            slot_mapping,
-            num_decode_tokens,
-            use_pcp,
-        )
-        # scale_fmt can be None, but the function expects str
-        assert scale_fmt is not None
-        assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
-        ops.indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping_for_cache,
-            quant_block_size,
-            scale_fmt,
-        )
+        with pcp_performance_trace.region(
+            "pcp.indexer_k_gather_cache",
+            layer_name=str(k_cache_prefix),
+            local_tokens=k.shape[0],
+        ):
+            k, slot_mapping_for_cache = maybe_gather_indexer_k(
+                k,
+                slot_mapping,
+                num_decode_tokens,
+                use_pcp,
+            )
+            # scale_fmt can be None, but the function expects str
+            assert scale_fmt is not None
+            assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
+            ops.indexer_k_quant_and_cache(
+                k,
+                kv_cache,
+                slot_mapping_for_cache,
+                quant_block_size,
+                scale_fmt,
+            )
 
     # The indexer and main MLA may classify the same short extend differently
     # because they use independent decode thresholds. Only the main MLA route

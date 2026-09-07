@@ -56,6 +56,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
+from vllm.pcp_performance import abort_pcp_trace_on_error, pcp_performance_trace
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
     CudaProfilerWrapper,
@@ -1101,6 +1102,7 @@ class Worker(WorkerBase):
             )
         return self.profiler.annotate_context_manager(annotation)
 
+    @abort_pcp_trace_on_error
     @torch.inference_mode()
     @with_gpu_sync_check
     def sample_tokens(
@@ -1108,6 +1110,7 @@ class Worker(WorkerBase):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)
 
+    @abort_pcp_trace_on_error
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
@@ -1437,6 +1440,7 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if ensure_ec_transfer_shutdown is not None:
             ensure_ec_transfer_shutdown()
+        pcp_performance_trace.close()
         if self.profiler is not None:
             self.profiler.shutdown()
 

@@ -34,6 +34,7 @@ from vllm.model_executor.models.deepseek_v2 import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.pcp_debug import pcp_boundary_capture
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.ops.pcp import (
@@ -484,23 +485,28 @@ class DeepseekV32Attention(MLAAttention):
 
         if self.use_pcp:
             assert kv_c is not None and k_pe is not None
-            kv_for_cache, kpe_for_cache, cache_slot_mapping = (
-                maybe_gather_mla_latent_cache_inputs(
-                    kv_c,
-                    k_pe.unsqueeze(1),
-                    layer_slot_mapping,
-                    attn_metadata.num_decode_tokens,
-                    True,
+            with pcp_performance_trace.region(
+                "pcp.mla_kv_gather_cache",
+                layer_idx=self.layer_idx,
+                local_tokens=kv_c.shape[0],
+            ):
+                kv_for_cache, kpe_for_cache, cache_slot_mapping = (
+                    maybe_gather_mla_latent_cache_inputs(
+                        kv_c,
+                        k_pe.unsqueeze(1),
+                        layer_slot_mapping,
+                        attn_metadata.num_decode_tokens,
+                        True,
+                    )
                 )
-            )
-            self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-                kv_for_cache,
-                kpe_for_cache,
-                kv_cache,
-                cache_slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-            )
+                self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                    kv_for_cache,
+                    kpe_for_cache,
+                    kv_cache,
+                    cache_slot_mapping,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         if num_actual == 0:
@@ -534,7 +540,19 @@ class DeepseekV32Attention(MLAAttention):
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+            tp_group = get_tp_group()
+            if not pcp_performance_trace.enabled:
+                mqa_q_arg = tp_group.all_gather(mqa_q_arg, dim=1)
+            else:
+                local_payload_bytes = mqa_q_arg.numel() * mqa_q_arg.element_size()
+                with pcp_performance_trace.region(
+                    "tp.mqa_query_all_gather",
+                    local_payload_bytes=local_payload_bytes,
+                    gathered_payload_bytes=(local_payload_bytes * tp_group.world_size),
+                    group_size=tp_group.world_size,
+                    dim=1,
+                ):
+                    mqa_q_arg = tp_group.all_gather(mqa_q_arg, dim=1)
         elif not self.use_pcp and self.impl.dcp_world_size > 1:
             assert self.dcp_manager is not None
             if isinstance(mqa_q_arg, tuple):

@@ -45,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -910,13 +911,16 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                shared_experts_overlapping=shared_experts_overlapping,
-            )
+            with pcp_performance_trace.region(
+                "moe.expert_path", layer_name=self.layer_name
+            ):
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                    shared_experts_overlapping=shared_experts_overlapping,
+                )
 
             return self._maybe_combine(
                 shared_output,

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import threading
 from unittest.mock import MagicMock
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
+    mooncake_connector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     MooncakeConnector,
     MooncakeConnectorWorker,
@@ -237,6 +241,43 @@ def test_send_blocks_records_failure():
     assert ret == 1
     assert worker.xfer_stats.num_successful_transfers == 0
     assert worker.xfer_stats.data["num_failed_transfers"] == [1]
+
+
+def test_send_blocks_preserves_contract_and_records_performance_event(monkeypatch):
+    worker = _bare_worker()
+    worker.engine.batch_transfer_sync_write.return_value = 7
+    trace = MagicMock()
+    monkeypatch.setattr(mooncake_connector, "pcp_performance_trace", trace)
+
+    signature = inspect.signature(MooncakeConnectorWorker._send_blocks)
+    assert list(signature.parameters) == [
+        "self",
+        "remote_session",
+        "src_ptrs",
+        "dst_ptrs",
+        "lengths",
+    ]
+
+    result = worker._send_blocks(
+        "host:1234",
+        src_ptrs=[0x1000, 0x2000],
+        dst_ptrs=[0x3000, 0x4000],
+        lengths=[1024, 2048],
+    )
+
+    assert result == 7
+    trace.record_host_event.assert_called_once()
+    name, duration_ms = trace.record_host_event.call_args.args
+    assert name == "mooncake.transfer"
+    assert duration_ms >= 0
+    metadata = trace.record_host_event.call_args.kwargs
+    assert metadata.pop("started_ns") <= metadata.pop("ended_ns")
+    assert metadata == {
+        "remote_session": "host:1234",
+        "total_bytes": 3072,
+        "num_descriptors": 2,
+        "return_code": 7,
+    }
 
 
 def test_get_kv_connector_stats_returns_none_when_empty():

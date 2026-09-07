@@ -59,6 +59,7 @@ from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
     get_dummy_encoder_profile_inputs,
 )
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
@@ -1366,17 +1367,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else None
             ),
         )
-        return pcp.maybe_partition_pcp_batch(
-            self.pcp_manager,
-            input_batch,
-            padded_num_tokens=batch_desc.num_tokens,
+        with pcp_performance_trace.region("pcp.partition_batch"):
+            input_batch = pcp.maybe_partition_pcp_batch(
+                self.pcp_manager,
+                input_batch,
+                padded_num_tokens=batch_desc.num_tokens,
+            )
+        pcp_performance_trace.update_step(
+            local_num_tokens=input_batch.num_tokens,
+            local_num_tokens_padded=input_batch.num_tokens_after_padding,
+            local_num_reqs=input_batch.num_reqs,
+            has_prefill=input_batch.has_prefill,
+            local_num_computed_tokens=input_batch.num_computed_tokens_np.tolist(),
         )
+        return input_batch
 
     def prepare_attn(
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         if self.pcp_manager is not None:
-            return self.pcp_manager.prepare_attn(input_batch)
+            with pcp_performance_trace.region("pcp.prepare_attn"):
+                return self.pcp_manager.prepare_attn(input_batch)
 
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(
@@ -1605,9 +1616,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc
+            pcp_performance_trace.start_step(
+                global_num_tokens=scheduler_output.total_num_scheduled_tokens,
+                num_reqs=len(scheduler_output.num_scheduled_tokens),
+                request_ids=list(scheduler_output.num_scheduled_tokens),
+                scheduled_tokens_by_request=dict(scheduler_output.num_scheduled_tokens),
+                pcp_size=self.parallel_config.prefill_context_parallel_size,
+                tp_size=self.parallel_config.tensor_parallel_size,
+                dp_size=self.parallel_config.data_parallel_size,
             )
+            with pcp_performance_trace.region("input.prepare"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
@@ -1758,8 +1779,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with pcp_performance_trace.region("connector.pre_forward"):
+                self.kv_connector.pre_forward(scheduler_output)
+            with pcp_performance_trace.region("model.forward"):
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1781,18 +1804,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
-                self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                with pcp_performance_trace.region("connector.pre_forward"):
+                    self.kv_connector.pre_forward(scheduler_output)
+                with pcp_performance_trace.region("model.forward"):
+                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                        # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                        # PIECEWISE after the cudagraph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1829,6 +1854,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            pcp_performance_trace.end_step(status="pp_intermediate")
             return output_intermediate_tensors
         return None
 
@@ -1873,13 +1899,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
-        )
+        with pcp_performance_trace.region("pcp.restore_hidden_states"):
+            hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+                self.pcp_manager, hidden_states, input_batch
+            )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with pcp_performance_trace.region("sampling"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1986,9 +2014,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        with pcp_performance_trace.region("connector.post_forward"):
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
+        pcp_performance_trace.end_step(status="ok")
 
         return async_output
 
@@ -2009,17 +2039,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        with pcp_performance_trace.region("connector.post_forward"):
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            pcp_performance_trace.end_step(status="pp_intermediate")
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         assert self.pooling_runner is not None
-        pooler_output, finished_mask = self.pooling_runner.pool(
-            hidden_states, input_batch, self.req_states
-        )
+        with pcp_performance_trace.region("pooling"):
+            pooler_output, finished_mask = self.pooling_runner.pool(
+                hidden_states, input_batch, self.req_states
+            )
 
         # Build the model runner output.
         model_runner_output = ModelRunnerOutput(
@@ -2037,6 +2070,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.postprocess_num_computed_tokens(input_batch)
+        pcp_performance_trace.end_step(status="ok")
         return async_output
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:

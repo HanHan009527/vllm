@@ -46,6 +46,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_shard,
 )
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.sequence import IntermediateTensors
 
 from .glm52_low_latency_gemm import enable_glm52_low_latency_gemm
@@ -163,7 +164,10 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
             )
 
         # self_attn's o_proj runs reduce_results=False; reduce before RMSNorm.
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        with pcp_performance_trace.region("layer.attention", layer_idx=self.layer_idx):
+            hidden_states = self.self_attn(
+                positions=positions, hidden_states=hidden_states
+            )
         if self.use_sequence_parallel:
             hidden_states = sp_reduce_scatter(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(
@@ -187,10 +191,15 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
                 self.layer_idx, "mlp_input", capture_positions, hidden_states
             )
 
-        if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
-            hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        with pcp_performance_trace.region(
+            "layer.mlp",
+            layer_idx=self.layer_idx,
+            routed_moe=isinstance(self.mlp, DeepseekV2MoE),
+        ):
+            if self.use_sequence_parallel and isinstance(self.mlp, DeepseekV2MoE):
+                hidden_states = self.mlp(hidden_states, already_sequence_parallel=True)
+            else:
+                hidden_states = self.mlp(hidden_states)
         if pcp_boundary_capture.enabled:
             pcp_boundary_capture.capture(
                 self.layer_idx,

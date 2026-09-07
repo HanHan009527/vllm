@@ -13,6 +13,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_pcp_group
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_one_sided,
     has_flashinfer_nvlink_two_sided,
@@ -88,11 +89,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        with pcp_performance_trace.region(
+            "moe.agrs_dispatch",
+            variant="router_logits",
+            local_tokens=hidden_states.shape[0],
+            local_payload_bytes=sum(
+                tensor.numel() * tensor.element_size() for tensor in tensors_to_gather
+            ),
+            group_size=dist_group.world_size,
+        ):
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -120,11 +130,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        with pcp_performance_trace.region(
+            "moe.agrs_dispatch",
+            variant="topk",
+            local_tokens=hidden_states.shape[0],
+            local_payload_bytes=sum(
+                tensor.numel() * tensor.element_size() for tensor in tensors_to_gather
+            ),
+            group_size=dist_group.world_size,
+        ):
+            gathered_tensors = dist_group.all_gatherv(
+                tensors_to_gather,
+                dim=0,
+                sizes=sizes,
+            )
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]
@@ -146,7 +165,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        with pcp_performance_trace.region(
+            "moe.agrs_combine",
+            global_tokens=hidden_states.shape[0],
+            local_payload_bytes=(hidden_states.numel() * hidden_states.element_size()),
+            output_payload_bytes=(
+                hidden_states.numel()
+                * hidden_states.element_size()
+                // dist_group.world_size
+            ),
+            group_size=dist_group.world_size,
+        ):
+            hidden_states = dist_group.reduce_scatterv(
+                hidden_states, dim=0, sizes=sizes
+            )
         return hidden_states
 
     def destroy(self):

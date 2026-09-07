@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     flashinfer_trtllm_fused_allreduce_norm,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.pcp_performance import pcp_performance_trace
 
 
 def fused_allreduce_rms_norm(
@@ -44,20 +45,52 @@ def fused_allreduce_rms_norm(
             # With norm_out provided, the kernel writes the new residual
             # (all_reduce(hidden_states) + residual) into the hidden_states
             # buffer and the normalized result into norm_out.
-            flashinfer_trtllm_fused_allreduce_norm(
-                allreduce_in=hidden_states,
-                residual=residual,
-                rms_gamma=norm.weight,
-                rms_eps=norm.variance_epsilon,
-                world_size=tp_size,
-                weight_bias=0.0,  # standard RMSNorm (Gemma would use 1.0)
-                launch_with_pdl=True,
-                fp32_acc=True,
-                max_token_num=max_token_num,
-                pattern_code=_AR_RESIDUAL_RMS_NORM,
-                norm_out=norm_out,
-            )
+            if not pcp_performance_trace.enabled:
+                flashinfer_trtllm_fused_allreduce_norm(
+                    allreduce_in=hidden_states,
+                    residual=residual,
+                    rms_gamma=norm.weight,
+                    rms_eps=norm.variance_epsilon,
+                    world_size=tp_size,
+                    weight_bias=0.0,
+                    launch_with_pdl=True,
+                    fp32_acc=True,
+                    max_token_num=max_token_num,
+                    pattern_code=_AR_RESIDUAL_RMS_NORM,
+                    norm_out=norm_out,
+                )
+                return norm_out, hidden_states
+            with pcp_performance_trace.region(
+                "tp.fused_allreduce_rms_norm",
+                backend="flashinfer_trtllm",
+                local_payload_bytes=(
+                    hidden_states.numel() * hidden_states.element_size()
+                ),
+                group_size=tp_size,
+            ):
+                flashinfer_trtllm_fused_allreduce_norm(
+                    allreduce_in=hidden_states,
+                    residual=residual,
+                    rms_gamma=norm.weight,
+                    rms_eps=norm.variance_epsilon,
+                    world_size=tp_size,
+                    weight_bias=0.0,
+                    launch_with_pdl=True,
+                    fp32_acc=True,
+                    max_token_num=max_token_num,
+                    pattern_code=_AR_RESIDUAL_RMS_NORM,
+                    norm_out=norm_out,
+                )
             return norm_out, hidden_states
 
-    reduced = tensor_model_parallel_all_reduce(hidden_states)
-    return norm(reduced, residual)
+    if not pcp_performance_trace.enabled:
+        reduced = tensor_model_parallel_all_reduce(hidden_states)
+        return norm(reduced, residual)
+    with pcp_performance_trace.region(
+        "tp.fused_allreduce_rms_norm",
+        backend="fallback",
+        local_payload_bytes=hidden_states.numel() * hidden_states.element_size(),
+        group_size=tp_size,
+    ):
+        reduced = tensor_model_parallel_all_reduce(hidden_states)
+        return norm(reduced, residual)

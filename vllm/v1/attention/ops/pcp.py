@@ -6,6 +6,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.pcp_performance import pcp_performance_trace
 
 
 def _gather_prefill_cache_inputs(
@@ -22,10 +23,23 @@ def _gather_prefill_cache_inputs(
         return tensors, slot_mapping[:num_decode_tokens]
 
     pcp_group = get_pcp_group()
-    gathered_prefills = tuple(
-        pcp_group.all_gather(tensor[num_decode_tokens:].contiguous(), dim=0)
-        for tensor in tensors
+    local_prefill_tensors = tuple(
+        tensor[num_decode_tokens:].contiguous() for tensor in tensors
     )
+    local_payload_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in local_prefill_tensors
+    )
+    with pcp_performance_trace.region(
+        "pcp.kv_gather",
+        tensor_count=len(tensors),
+        local_prefill_tokens=local_num_tokens - num_decode_tokens,
+        local_payload_bytes=local_payload_bytes,
+        gathered_payload_bytes=local_payload_bytes * pcp_group.world_size,
+        group_size=pcp_group.world_size,
+    ):
+        gathered_prefills = tuple(
+            pcp_group.all_gather(tensor, dim=0) for tensor in local_prefill_tensors
+        )
     pcp_size = pcp_group.world_size
     gathered_slot_mapping = slot_mapping[: pcp_size * local_num_tokens]
     if num_decode_tokens == 0:

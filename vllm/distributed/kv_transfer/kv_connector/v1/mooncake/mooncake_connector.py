@@ -47,6 +47,7 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.pcp_performance import pcp_performance_trace
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
@@ -982,6 +983,13 @@ class MooncakeConnectorWorker:
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
         self.pcp_rank = get_pcp_group().rank_in_group
+        pcp_performance_trace.set_identity(
+            dp_rank=self.dp_rank,
+            pcp_rank=self.pcp_rank,
+            pp_rank=self.pp_rank,
+            tp_rank=self.tp_rank,
+            kv_role=kv_transfer_config.kv_role,
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1351,14 +1359,22 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks,
-                    remote_session,
-                    src_ptrs,
-                    dst_ptrs,
-                    lengths,
-                )
+                with pcp_performance_trace.host_region(
+                    "mooncake.send_batch",
+                    request_ids=[req_id for req_id, _ in ok_ready_reqs],
+                    transfer_ids=[
+                        send_meta.transfer_id for _, send_meta in ok_ready_reqs
+                    ],
+                    remote_tp_rank=meta.remote_tp_rank,
+                ):
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                    )
 
                 if ret_value != 0:
                     transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
@@ -1639,11 +1655,23 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        started_ns = time.time_ns()
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
+        ended_ns = time.time_ns()
+        pcp_performance_trace.record_host_event(
+            "mooncake.transfer",
+            duration_ms=duration * 1000.0,
+            started_ns=started_ns,
+            ended_ns=ended_ns,
+            remote_session=remote_session,
+            total_bytes=sum(lengths),
+            num_descriptors=len(src_ptrs),
+            return_code=ret_value,
+        )
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
