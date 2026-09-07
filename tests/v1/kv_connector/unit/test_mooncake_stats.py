@@ -267,10 +267,11 @@ def test_send_blocks_preserves_contract_and_records_performance_event(monkeypatc
 
     assert result == 7
     trace.record_host_event.assert_called_once()
-    name, duration_ms = trace.record_host_event.call_args.args
+    (name,) = trace.record_host_event.call_args.args
     assert name == "mooncake.transfer"
+    metadata = dict(trace.record_host_event.call_args.kwargs)
+    duration_ms = metadata.pop("duration_ms")
     assert duration_ms >= 0
-    metadata = trace.record_host_event.call_args.kwargs
     assert metadata.pop("started_ns") <= metadata.pop("ended_ns")
     assert metadata == {
         "remote_session": "host:1234",
