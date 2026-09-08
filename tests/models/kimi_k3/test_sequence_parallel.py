@@ -112,23 +112,37 @@ def test_sp_padding_mask_marks_added_rows(
 
 
 @pytest.mark.parametrize(
-    ("data_parallel_size", "expected"),
+    (
+        "tensor_parallel_size",
+        "data_parallel_size",
+        "prefill_context_parallel_size",
+        "all2all_backend",
+        "expected",
+    ),
     [
-        (1, False),
-        (2, True),
+        (2, 1, 1, "allgather_reducescatter", False),
+        (2, 2, 1, "allgather_reducescatter", True),
+        (2, 1, 2, "allgather_reducescatter", True),
+        (1, 1, 2, "allgather_reducescatter", False),
+        (2, 1, 2, "flashinfer_nvlink_two_sided", False),
     ],
 )
-def test_moe_sequence_parallel_requires_data_parallel(
+def test_moe_sequence_parallel_requires_replicated_parallel_axis(
     monkeypatch,
+    tensor_parallel_size: int,
     data_parallel_size: int,
+    prefill_context_parallel_size: int,
+    all2all_backend: str,
     expected: bool,
 ):
-    monkeypatch.setattr(current_platform, "device_count", lambda: 2)
+    """Shard replicated MoE tokens only on supported TP collectives."""
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
     parallel_config = ParallelConfig(
-        tensor_parallel_size=2,
+        tensor_parallel_size=tensor_parallel_size,
         data_parallel_size=data_parallel_size,
+        prefill_context_parallel_size=prefill_context_parallel_size,
         enable_expert_parallel=True,
-        all2all_backend="allgather_reducescatter",
+        all2all_backend=all2all_backend,
     )
 
     assert parallel_config.use_sequence_parallel_moe is expected
