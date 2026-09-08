@@ -146,3 +146,63 @@ def test_mtp_projects_sequence_shard_and_restores_full_output(monkeypatch):
     torch.testing.assert_close(hidden_states, expected)
     torch.testing.assert_close(recycled_hidden_states, expected)
     norm.assert_called_once()
+
+
+def test_non_sp_norm_follows_effective_moe_reduction(monkeypatch):
+    """An already-reduced MoE output must not be summed again by its consumer."""
+    producer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
+    consumer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
+    for layer in (producer, consumer):
+        nn.Module.__init__(layer)
+        layer.use_sequence_parallel = False
+    moe = object.__new__(deepseek_v32_model.DeepseekV2MoE)
+    nn.Module.__init__(moe)
+    config = SimpleNamespace(skip_final_all_reduce=False)
+    object.__setattr__(moe, "experts", SimpleNamespace(moe_config=config))
+    producer.mlp = moe
+    consumer.mlp = _RecordingModule()
+    consumer.mlp.down_proj = SimpleNamespace(reduce_results=True)
+    consumer.input_layernorm = _IdentityNorm()
+    consumer.post_attention_layernorm = _IdentityNorm()
+    consumer.self_attn = _RecordingModule()
+    layers = nn.ModuleList([producer, consumer])
+    fused_norm = Mock(
+        side_effect=lambda hidden_states, residual, norm: norm(hidden_states, residual)
+    )
+    monkeypatch.setattr(deepseek_v32_model, "fused_allreduce_rms_norm", fused_norm)
+
+    for deferred in (False, True):
+        config.skip_final_all_reduce = deferred
+        final_deferred = deepseek_v32_model._configure_cross_layer_allreduce(
+            layers, 0, 2
+        )
+        assert final_deferred is False
+        fused_norm.reset_mock()
+        consumer(torch.arange(3), torch.ones(3, 2), torch.zeros(3, 2))
+        norms = [call.args[2] for call in fused_norm.call_args_list]
+        expected = [consumer.input_layernorm] if deferred else []
+        # Attention's o_proj remains partial in both cases.
+        assert norms == [*expected, consumer.post_attention_layernorm]
+
+
+def test_aux_capture_consumes_pending_reduction(monkeypatch):
+    layer = object.__new__(deepseek_v32_model.DeepseekV32DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_sequence_parallel = False
+    layer.fuse_input_allreduce = True
+    layer.input_layernorm = _IdentityNorm()
+    layer.post_attention_layernorm = _IdentityNorm()
+    layer.self_attn = _RecordingModule()
+    layer.mlp = _RecordingModule()
+
+    def fused_norm(hidden_states, residual, norm):
+        if norm is layer.input_layernorm:
+            combined = hidden_states * 8 + residual
+            return combined, combined
+        return norm(hidden_states, residual)
+
+    monkeypatch.setattr(deepseek_v32_model, "fused_allreduce_rms_norm", fused_norm)
+    _, _, aux = layer(
+        torch.arange(3), torch.ones(3, 2), torch.full((3, 2), 10.0), capture_aux=True
+    )
+    torch.testing.assert_close(aux, torch.full((3, 2), 18.0))

@@ -148,12 +148,12 @@ class DeepseekV32MultiTokenPredictorLayer(nn.Module):
         if is_sequence_parallel:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
-        else:
-            # The MoE output is left un-reduced; fuse its all-reduce into the
-            # final norm, as the main model does at layer boundaries.
+        elif self.mtp_block.ffn_all_reduce_deferred:
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.shared_head.norm
             )
+        else:
+            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states, hidden_states
 
 
