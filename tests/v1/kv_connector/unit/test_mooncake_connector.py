@@ -452,6 +452,73 @@ def test_prompt_less_than_block_size():
     assert len(scheduler_output.scheduled_new_reqs) == 0
 
 
+def test_remote_prefill_respects_producer_token_count_at_block_boundary():
+    """Only transfer the prefix whose KV was produced remotely.
+
+    A disaggregated router may append the token sampled by the prefill worker
+    to the decode prompt.  When the original prompt ends exactly on a block
+    boundary, the appended token must be computed locally instead of causing
+    the consumer to request a block that the producer never allocated.
+    """
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    scheduler = create_scheduler(vllm_config)
+
+    block_size = vllm_config.cache_config.block_size
+    request = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=block_size + 1,
+        do_remote_prefill=True,
+        num_remote_blocks=1,
+    )
+    request.kv_transfer_params.update(
+        {
+            "transfer_id": request.request_id,
+            "remote_bootstrap_addr": 54321,
+            "remote_num_tokens": block_size,
+        }
+    )
+
+    connector = scheduler.get_kv_connector().connector_scheduler
+    assert connector.get_num_new_matched_tokens(request, 0) == (block_size, True)
+
+    scheduler.add_request(request)
+    scheduler_output = scheduler.schedule()
+
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == block_size
+    assert scheduler_output.num_scheduled_tokens == {}
+
+    metadata = scheduler_output.kv_connector_metadata
+    assert isinstance(metadata, MooncakeConnectorMetadata)
+    req_meta = metadata.reqs_to_recv["my-engine-id"][request.request_id]
+    assert [len(group) for group in req_meta.local_block_ids] == [1]
+
+
+@pytest.mark.parametrize(
+    "remote_num_tokens",
+    [True, -1, 18, 1.5, "16"],
+)
+def test_remote_prefill_rejects_invalid_producer_token_count(remote_num_tokens):
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    scheduler = create_scheduler(vllm_config)
+    connector = scheduler.get_kv_connector().connector_scheduler
+    request = create_request(
+        request_id=1,
+        block_size=16,
+        num_tokens=17,
+        do_remote_prefill=True,
+    )
+    request.kv_transfer_params["remote_num_tokens"] = remote_num_tokens
+
+    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
 @pytest.fixture
 def bootstrap_server():
     """Fixture to launch and cleanup a Mooncake Bootstrap HTTP Server."""

@@ -689,9 +689,35 @@ class MooncakeConnectorScheduler:
             for i, blocks in enumerate(block_ids)
         ]
 
-    def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
+    def _get_remote_prefill_token_count(
+        self, num_prompt_tokens: int, params: dict[str, Any]
+    ) -> int:
+        """Return the prompt prefix whose KV exists on the producer.
+
+        ``remote_num_tokens`` is optional for compatibility with existing
+        routers.  When present, it lets a router append a token sampled by the
+        producer to the consumer prompt without claiming that the appended
+        token's KV was also produced remotely.
+        """
+        remote_num_tokens = params.get("remote_num_tokens")
+        if remote_num_tokens is not None:
+            if (
+                isinstance(remote_num_tokens, bool)
+                or not isinstance(remote_num_tokens, int)
+                or not 0 <= remote_num_tokens <= num_prompt_tokens
+            ):
+                logger.warning(
+                    "Ignoring invalid remote_num_tokens=%r for a %d-token "
+                    "Mooncake consumer prompt",
+                    remote_num_tokens,
+                    num_prompt_tokens,
+                )
+                return 0
+            return remote_num_tokens
+
+        # Legacy Mamba routers do not provide the producer's actual token
+        # count. Their producer truncates one prompt token, so retain the
+        # existing inferred N-1 behavior when the explicit count is absent.
         if self._has_mamba and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
@@ -759,7 +785,7 @@ class MooncakeConnectorScheduler:
             # Remote prefill: get all prompt blocks from remote.
             assert not self.is_kv_producer
             token_ids = request.prompt_token_ids or []
-            count = self._get_remote_prefill_token_count(len(token_ids)) - (
+            count = self._get_remote_prefill_token_count(len(token_ids), params) - (
                 num_computed_tokens
             )
             if count > 0:
